@@ -886,12 +886,13 @@ std::unique_ptr<Expr> Parser::parsePostfixExpr(std::unique_ptr<Expr> lhs) {
             lhs = parseCallExpr(std::move(lhs));
         } else if (check(TokenKind::BANG)) {
             // Error propagation: expr!
-            // NOTE: The AST does not have a dedicated ErrorPropExpr node.
-            // We consume the '!' but the error-propagation semantics are
-            // deferred to semantic analysis. The expression is returned
-            // unchanged as a placeholder.
+            // Wrap in a UnaryExpr::Not so semantic analysis can detect
+            // error-type propagation (the semantic analyzer distinguishes
+            // logical-NOT from error-propagation based on the operand type).
             advance(); // consume '!'
-            // TODO: Create ErrorPropExpr when AST supports it.
+            SourceLocation bang_loc = locFrom(previous());
+            lhs = std::make_unique<UnaryExpr>(
+                std::move(bang_loc), UnaryOp::Not, std::move(lhs));
         } else {
             break;
         }
@@ -1310,7 +1311,7 @@ TypeId Parser::parseType() {
 
     // Primitive type identifiers
     if (check(TokenKind::IDENTIFIER)) {
-        const std::string& name = peek().text();
+        std::string name = peek().text();
 
         // Primitives
         if (name == "u8")    { advance(); return type_table_.getU8(); }

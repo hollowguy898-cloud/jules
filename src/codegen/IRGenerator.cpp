@@ -983,7 +983,6 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     case NodeKind::BinaryExpr: {
         auto& bin = cast<BinaryExpr>(*expr);
         BinaryOp op = bin.op();
-        TypeId ty = expr->getType();
 
         // ---- Assignment operators ----
         if (op == BinaryOp::Assign) {
@@ -1602,9 +1601,9 @@ void IRGenerator::emitBinaryOp(const std::string& result_reg,
                                TypeId result_type) {
     // Determine if we're working with integers, floats, or bools
     bool is_float = result_type && result_type->isFloat();
-    bool is_bool  = result_type && result_type->isBool();
+    [[maybe_unused]] bool is_bool  = result_type && result_type->isBool();
     bool is_signed = result_type && result_type->isSigned();
-    bool is_unsigned = result_type && result_type->isUnsigned();
+    [[maybe_unused]] bool is_unsigned = result_type && result_type->isUnsigned();
 
     switch (op) {
         // ---- Arithmetic ----

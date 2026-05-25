@@ -5,3 +5,9 @@ julesc
 jules
 test.ll
 *.a
+build/
+*.o
+julesc
+benchmark_runner
+*.ll
+.d
