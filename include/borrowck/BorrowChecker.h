@@ -11,7 +11,7 @@
 #include <memory>
 #include <cstdint>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // BorrowError - represents a borrow-checking violation
@@ -233,4 +233,4 @@ private:
     std::unordered_map<CFGNode::NodeId, LiveBorrowSet> kill_sets_;
 };
 
-} // namespace jules
+} // namespace tether

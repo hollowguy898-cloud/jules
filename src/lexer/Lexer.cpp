@@ -3,7 +3,7 @@
 #include <cctype>
 #include <cstring>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Constructor
@@ -327,6 +327,7 @@ TokenKind Lexer::lookupKeyword(const std::string& text) const {
         if (text == "val") return TokenKind::KW_VAL;
         if (text == "var") return TokenKind::KW_VAR;
         if (text == "mut") return TokenKind::KW_MUT;
+        if (text == "soa") return TokenKind::KW_SOA;
         return TokenKind::IDENTIFIER;
     }
     if (text.size() == 4) {
@@ -552,4 +553,4 @@ Token Lexer::errorToken(const std::string& msg) {
                  token_start_col_, filename_);
 }
 
-} // namespace jules
+} // namespace tether

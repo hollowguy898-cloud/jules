@@ -5,7 +5,7 @@
 #include <iostream>
 #include <cassert>
 
-using namespace jules;
+using namespace tether;
 
 void test_lexer() {
     std::cout << "=== Lexer Tests ===" << std::endl;

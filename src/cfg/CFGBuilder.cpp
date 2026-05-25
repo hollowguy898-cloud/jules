@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cassert>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // CFGBuilder::build - main entry point
@@ -599,4 +599,4 @@ void CFGBuilder::trackStatement(Stmt& stmt, CFGNode* node) {
     }
 }
 
-} // namespace jules
+} // namespace tether

@@ -13,7 +13,7 @@
 #include <optional>
 #include <functional>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Diagnostic - represents a semantic error or warning
@@ -272,4 +272,4 @@ private:
     std::unordered_set<const ASTNode*> resolved_nodes_;
 };
 
-} // namespace jules
+} // namespace tether

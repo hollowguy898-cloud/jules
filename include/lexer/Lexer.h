@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Diagnostic reported by the lexer
@@ -97,4 +97,4 @@ private:
     bool has_errors_;
 };
 
-} // namespace jules
+} // namespace tether

@@ -11,7 +11,7 @@
 #include <cassert>
 #include <utility>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // SymbolKind - classification of symbols
@@ -631,4 +631,4 @@ inline std::string symbolKindToString(SymbolKind kind) {
     }
 }
 
-} // namespace jules
+} // namespace tether

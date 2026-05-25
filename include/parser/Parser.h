@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Parse Error
@@ -182,4 +182,4 @@ private:
     std::unordered_map<std::string, std::string> param_type_annotations_;
 };
 
-} // namespace jules
+} // namespace tether

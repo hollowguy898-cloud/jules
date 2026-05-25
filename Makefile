@@ -1,5 +1,5 @@
 # ============================================================================
-# Makefile for the Jules Compiler
+# Makefile for the Tether Compiler
 # ============================================================================
 
 # Compiler and flags
@@ -16,7 +16,7 @@ RUNTIMEDIR = runtime
 TESTDIR   = tests
 
 # Target executable
-TARGET    = julesc
+TARGET    = tetherc
 
 # ============================================================================
 # Discover source files
@@ -27,11 +27,11 @@ CXX_SRCS  = $(shell find $(SRCDIR) -name '*.cpp')
 CXX_OBJS  = $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(CXX_SRCS))
 
 # C sources (runtime library)
-C_SRCS    = $(RUNTIMEDIR)/jules_runtime.c
-C_OBJ     = $(BUILDDIR)/runtime/jules_runtime.o
+C_SRCS    = $(RUNTIMEDIR)/tether_runtime.c
+C_OBJ     = $(BUILDDIR)/runtime/tether_runtime.o
 
 # Runtime static library
-RUNTIME_LIB = $(BUILDDIR)/libjules_runtime.a
+RUNTIME_LIB = $(BUILDDIR)/libtether_runtime.a
 
 # ============================================================================
 # Default target
@@ -92,8 +92,8 @@ clean:
 test: $(TARGET)
 	@echo "=== Testing compiler on examples ==="
 	@for f in examples/*.jl; do \
-		echo "  Compiling $$f ..."; \
-		./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
+	        echo "  Compiling $$f ..."; \
+	        ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
 	done
 	@echo "=== Tests complete ==="
 
@@ -106,11 +106,11 @@ PREFIX ?= /usr/local
 .PHONY: install
 install: $(TARGET) $(RUNTIME_LIB)
 	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/julesc
+	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/tetherc
 	install -d $(DESTDIR)$(PREFIX)/lib
-	install -m 644 $(RUNTIME_LIB) $(DESTDIR)$(PREFIX)/lib/libjules_runtime.a
-	install -d $(DESTDIR)$(PREFIX)/include/jules
-	install -m 644 $(RUNTIMEDIR)/jules_runtime.h $(DESTDIR)$(PREFIX)/include/jules/jules_runtime.h
+	install -m 644 $(RUNTIME_LIB) $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
+	install -d $(DESTDIR)$(PREFIX)/include/tether
+	install -m 644 $(RUNTIMEDIR)/tether_runtime.h $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
 
 # ============================================================================
 # Uninstall
@@ -118,9 +118,9 @@ install: $(TARGET) $(RUNTIME_LIB)
 
 .PHONY: uninstall
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/julesc
-	rm -f $(DESTDIR)$(PREFIX)/lib/libjules_runtime.a
-	rm -f $(DESTDIR)$(PREFIX)/include/jules/jules_runtime.h
+	rm -f $(DESTDIR)$(PREFIX)/bin/tetherc
+	rm -f $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
+	rm -f $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
 
 # ============================================================================
 # Help
@@ -128,7 +128,7 @@ uninstall:
 
 .PHONY: help
 help:
-	@echo "Jules Compiler Build System"
+	@echo "Tether Compiler Build System"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all       - Build the compiler and runtime (default)"

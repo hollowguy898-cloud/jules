@@ -3,7 +3,7 @@
 #include <string>
 #include <cstdint>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Token Kind Enumeration
@@ -32,6 +32,7 @@ enum class TokenKind : uint16_t {
     KW_MUT,
     KW_SIZEOF,
     KW_IMPORT,
+    KW_SOA,
 
     // Literals
     INT_LITERAL,
@@ -126,6 +127,7 @@ inline const char* tokenKindToString(TokenKind kind) {
         case TokenKind::KW_MUT:         return "mut";
         case TokenKind::KW_SIZEOF:      return "sizeof";
         case TokenKind::KW_IMPORT:      return "import";
+        case TokenKind::KW_SOA:         return "soa";
 
         // Literals
         case TokenKind::INT_LITERAL:    return "integer literal";
@@ -222,7 +224,7 @@ public:
     bool isNot(TokenKind k) const { return kind_ != k; }
 
     bool isKeyword() const {
-        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_IMPORT;
+        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_SOA;
     }
 
     bool isLiteral() const {
@@ -297,4 +299,4 @@ private:
     std::string filename_;
 };
 
-} // namespace jules
+} // namespace tether

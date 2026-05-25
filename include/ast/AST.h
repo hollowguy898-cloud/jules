@@ -10,7 +10,7 @@
 #include <cassert>
 #include <utility>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Source Location
@@ -1176,6 +1176,7 @@ public:
 
     const std::string& name() const { return name_; }
     const std::vector<StructFieldDecl>& fields() const { return fields_; }
+    std::vector<StructFieldDecl>& fields() { return fields_; }
     size_t fieldCount() const { return fields_.size(); }
 
     const StructFieldDecl* findField(const std::string& fname) const {
@@ -1189,12 +1190,16 @@ public:
         return n->getKind() == NodeKind::StructDecl;
     }
 
+    void setSoA(bool v) { is_soa_ = v; }
+    bool isSoA() const { return is_soa_; }
+
     void accept(ASTVisitor& visitor) override;
     void accept(ConstASTVisitor& visitor) const override;
 
 private:
     std::string name_;
     std::vector<StructFieldDecl> fields_;
+    bool is_soa_ = false;
 };
 
 // ---- EnumDecl ----
@@ -1451,4 +1456,4 @@ inline void EnumDecl::accept(ConstASTVisitor& v) const { v.visitEnumDecl(*this);
 inline void ImportDecl::accept(ASTVisitor& v) { v.visitImportDecl(*this); }
 inline void ImportDecl::accept(ConstASTVisitor& v) const { v.visitImportDecl(*this); }
 
-} // namespace jules
+} // namespace tether

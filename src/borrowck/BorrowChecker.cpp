@@ -4,7 +4,7 @@
 #include <cassert>
 #include <sstream>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Main entry point: check a single function's CFG
@@ -429,4 +429,4 @@ const LiveBorrowSet& BorrowChecker::liveOut(CFGNode::NodeId id) const {
     return empty_set;
 }
 
-} // namespace jules
+} // namespace tether

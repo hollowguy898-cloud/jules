@@ -5,7 +5,7 @@
 #include <iostream>
 #include <cassert>
 
-using namespace jules;
+using namespace tether;
 
 int main() {
     // Test 1: Simple function

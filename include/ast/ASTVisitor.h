@@ -4,7 +4,7 @@
 
 #include <type_traits>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // RecursiveASTVisitor - CRTP-based visitor template with default traversal
@@ -480,4 +480,4 @@ public:
     // Override specific visitXxx methods as needed
 };
 
-} // namespace jules
+} // namespace tether

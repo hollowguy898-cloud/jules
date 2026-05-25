@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <cassert>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // BorrowKind - classification of a borrow tracked in the CFG
@@ -326,4 +326,4 @@ inline std::string borrowKindToString(BorrowKind kind) {
     }
 }
 
-} // namespace jules
+} // namespace tether

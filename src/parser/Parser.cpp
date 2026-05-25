@@ -4,7 +4,7 @@
 #include <cstring>
 #include <sstream>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Constructor
@@ -197,7 +197,7 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
     if (check(TokenKind::KW_FN)) {
         return parseFnDecl(std::move(directives));
     }
-    if (check(TokenKind::KW_STRUCT)) {
+    if (check(TokenKind::KW_STRUCT) || check(TokenKind::KW_SOA)) {
         return parseStructDecl();
     }
     if (check(TokenKind::KW_ENUM)) {
@@ -293,6 +293,7 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
 
 std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     SourceLocation struct_loc = loc();
+    bool is_soa = match(TokenKind::KW_SOA);
     consume(TokenKind::KW_STRUCT, "expected 'struct'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected struct name");
@@ -315,8 +316,10 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     }
 
     consume(TokenKind::RBRACE, "expected '}' after struct fields");
-    return std::make_unique<StructDecl>(
+    auto decl = std::make_unique<StructDecl>(
         std::move(struct_loc), std::move(struct_name), std::move(fields));
+    decl->setSoA(is_soa);
+    return decl;
 }
 
 std::unique_ptr<EnumDecl> Parser::parseEnumDecl() {
@@ -1473,7 +1476,7 @@ std::vector<DesignatedInit> Parser::parseDesignatedInits() {
 
         init.value = parseExpr();
         inits.push_back(std::move(init));
-    } while (match(TokenKind::COMMA));
+    } while (match(TokenKind::COMMA) && !check(TokenKind::RBRACE));
 
     return inits;
 }
@@ -1548,4 +1551,4 @@ BinaryOp Parser::tokenToCompoundAssignOp(TokenKind kind) const {
     }
 }
 
-} // namespace jules
+} // namespace tether
