@@ -13,7 +13,7 @@
 #include <memory>
 #include <unordered_map>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // EmitType - what kind of output the compiler should produce
@@ -152,4 +152,4 @@ private:
     std::vector<BorrowError> borrowck_errors_;
 };
 
-} // namespace jules
+} // namespace tether

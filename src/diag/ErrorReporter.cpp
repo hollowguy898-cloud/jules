@@ -4,7 +4,7 @@
 #include <sstream>
 #include <algorithm>
 
-namespace jules {
+namespace tether {
 
 void ErrorReporter::error(const SourceSpan& span, const std::string& msg, const std::string& code) {
     diagnostics_.emplace_back(DiagLevel::Error, span, msg, code);
@@ -174,4 +174,4 @@ void ErrorReporter::clear() {
     warning_count_ = 0;
 }
 
-} // namespace jules
+} // namespace tether

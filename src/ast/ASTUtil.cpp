@@ -1,6 +1,6 @@
 #include "ast/AST.h"
 
-namespace jules {
+namespace tether {
 
 std::string binaryOpToString(BinaryOp op) {
     switch (op) {
@@ -57,4 +57,4 @@ std::string compilerDirectiveToString(CompilerDirective d) {
     }
 }
 
-} // namespace jules
+} // namespace tether

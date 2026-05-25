@@ -9,7 +9,7 @@
 #include <limits>
 #include <set>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Constructor
@@ -2200,4 +2200,4 @@ int IRGenerator::emitSimdLoopMetadata() {
     return loop_id;
 }
 
-} // namespace jules
+} // namespace tether

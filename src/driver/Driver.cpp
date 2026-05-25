@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <filesystem>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Constructor
@@ -684,4 +684,4 @@ bool Driver::removeFile(const std::string& path) {
     return !ec;
 }
 
-} // namespace jules
+} // namespace tether

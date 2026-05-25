@@ -58,8 +58,7 @@ enum class TypeKind : uint8_t {
     SmartPointer,
     Poison,
     Error,
-    Allocator,
-    Poison
+    Allocator
 };
 
 // ============================================================================
@@ -114,7 +113,6 @@ class SmartPointerType;
 class PoisonType;
 class ErrorType;
 class AllocatorType;
-class PoisonType;
 
 // ============================================================================
 // Type base class
@@ -687,24 +685,6 @@ public:
 };
 
 // ============================================================================
-// PoisonType - error recovery type to prevent cascading errors
-// ============================================================================
-class PoisonType : public Type {
-public:
-    static bool classof(const Type* t) {
-        return t->getKind() == TypeKind::Poison;
-    }
-
-    PoisonType() : Type(TypeKind::Poison) {}
-
-    std::string toString() const override {
-        return "<poison>";
-    }
-
-    bool isError() const override { return true; }
-};
-
-// ============================================================================
 // Type casting helpers (LLVM-style RTTI)
 // ============================================================================
 template<typename T>
@@ -770,13 +750,6 @@ public:
             type_map_[std::move(key)] = std::move(type);
         }
 
-        // Pre-intern the poison type
-        {
-            auto type = std::make_unique<PoisonType>();
-            poison_type_ = type.get();
-            type_map_[type->toString()] = std::move(type);
-        }
-
         // Pre-intern the allocator type
         {
             auto type = std::make_unique<AllocatorType>();
@@ -825,7 +798,7 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Poison type accessor
+    // Poison type accessor (for error-resilient compilation)
     // -----------------------------------------------------------------------
     TypeId getPoison() const { return TypeId(poison_type_); }
 
@@ -833,11 +806,6 @@ public:
     // Allocator type accessor
     // -----------------------------------------------------------------------
     TypeId getAllocator() const { return TypeId(allocator_type_); }
-
-    // -----------------------------------------------------------------------
-    // Poison type accessor (for error recovery)
-    // -----------------------------------------------------------------------
-    TypeId getPoison() const { return TypeId(poison_type_); }
 
     // -----------------------------------------------------------------------
     // Intern a struct type
@@ -1037,7 +1005,6 @@ private:
     const Type* primitive_cache_[static_cast<uint8_t>(PrimitiveKind::Count)] = {};
     const Type* poison_type_ = nullptr;
     const Type* allocator_type_ = nullptr;
-    const Type* poison_type_ = nullptr;
 };
 
 } // namespace tether

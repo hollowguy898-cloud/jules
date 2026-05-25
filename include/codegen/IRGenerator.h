@@ -11,7 +11,7 @@
 #include <sstream>
 #include <cstdint>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // IRGenerator - walks the typed AST and emits LLVM IR as text (.ll format)
@@ -205,4 +205,4 @@ private:
     int emitSimdLoopMetadata();
 };
 
-} // namespace jules
+} // namespace tether

@@ -6,7 +6,7 @@
 #include <sstream>
 #include <algorithm>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Diagnostic Level
@@ -132,4 +132,4 @@ private:
     const std::string* source_;  // Non-owning pointer to source text
 };
 
-} // namespace jules
+} // namespace tether

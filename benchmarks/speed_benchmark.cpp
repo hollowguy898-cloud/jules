@@ -29,7 +29,7 @@
 #include <algorithm>
 #include <numeric>
 
-using namespace jules;
+using namespace tether;
 using hrclock_t = std::chrono::high_resolution_clock;
 using ms_t = std::chrono::duration<double, std::milli>;
 

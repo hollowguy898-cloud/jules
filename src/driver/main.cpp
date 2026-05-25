@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdlib>
 
-using namespace jules;
+using namespace tether;
 
 // ============================================================================
 // Print usage information

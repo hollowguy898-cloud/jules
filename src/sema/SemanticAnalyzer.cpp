@@ -3,7 +3,7 @@
 #include <sstream>
 #include <algorithm>
 
-namespace jules {
+namespace tether {
 
 // ============================================================================
 // Constructor
@@ -1648,4 +1648,4 @@ TypeId SemanticAnalyzer::analyzePoisonExpr(PoisonExpr& pe) {
     return result;
 }
 
-} // namespace jules
+} // namespace tether
