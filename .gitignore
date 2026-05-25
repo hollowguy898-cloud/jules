@@ -1,4 +1,7 @@
 build/
 *.o
-bench_speed
-tetherc
+*.d
+julesc
+jules
+test.ll
+*.a
