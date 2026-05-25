@@ -151,6 +151,10 @@ void Parser::synchronize() {
             case TokenKind::KW_RETURN:
             case TokenKind::KW_BREAK:
             case TokenKind::KW_CONTINUE:
+            case TokenKind::KW_ERRDEFER:
+            case TokenKind::KW_ATOMIC:
+            case TokenKind::KW_YIELD:
+            case TokenKind::KW_TRY:
             case TokenKind::RBRACE:
                 return;
             default:
@@ -205,6 +209,18 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
     }
     if (check(TokenKind::KW_IMPORT)) {
         return parseImportDecl();
+    }
+    if (check(TokenKind::KW_OPAQUE)) {
+        SourceLocation opaque_loc = loc();
+        consume(TokenKind::KW_OPAQUE, "expected 'opaque'");
+        Token name_tok = consume(TokenKind::IDENTIFIER, "expected opaque type name");
+        consume(TokenKind::SEMI, "expected ';' after opaque type declaration");
+        // We represent opaque types as a special struct with no fields and alignment info
+        // Semantic analysis will register it as an OpaqueType
+        auto decl = std::make_unique<StructDecl>(
+            std::move(opaque_loc), name_tok.text(), std::vector<StructFieldDecl>{});
+        decl->setSoA(false);
+        return decl;
     }
 
     SourceLocation err_loc = loc();
@@ -296,6 +312,15 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     bool is_soa = match(TokenKind::KW_SOA);
     consume(TokenKind::KW_STRUCT, "expected 'struct'");
 
+    // Check for alignment specifier: align(N)
+    uint32_t alignment = 0;
+    if (match(TokenKind::KW_ALIGN)) {
+        consume(TokenKind::LPAREN, "expected '(' after 'align'");
+        Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
+        alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
+        consume(TokenKind::RPAREN, "expected ')' after alignment value");
+    }
+
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected struct name");
     std::string struct_name = name_tok.text();
 
@@ -319,6 +344,7 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     auto decl = std::make_unique<StructDecl>(
         std::move(struct_loc), std::move(struct_name), std::move(fields));
     decl->setSoA(is_soa);
+    decl->setAlignment(alignment);
     return decl;
 }
 
@@ -429,6 +455,12 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
             return parseContinueStmt();
         case TokenKind::LBRACE:
             return parseBlockStmt();
+        case TokenKind::KW_ERRDEFER:
+            return parseErrdeferStmt();
+        case TokenKind::KW_ATOMIC:
+            return parseAtomicStmt();
+        case TokenKind::KW_YIELD:
+            return parseYieldStmt();
         case TokenKind::KW_UNSAFE: {
             // unsafe at statement level
             SourceLocation unsafe_loc = loc();
@@ -460,6 +492,16 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
         }
         default:
             break;
+    }
+
+    // try expression at statement level
+    if (check(TokenKind::KW_TRY)) {
+        SourceLocation try_loc = loc();
+        advance(); // consume 'try'
+        auto operand = parseExpr();
+        auto try_expr = std::make_unique<TryExpr>(std::move(try_loc), std::move(operand));
+        consume(TokenKind::SEMI, "expected ';' after try expression");
+        return std::make_unique<ExprStmt>(SourceLocation(try_loc), std::move(try_expr));
     }
 
     // Expression statement or assignment
@@ -665,6 +707,84 @@ std::unique_ptr<Stmt> Parser::parseDeferStmt() {
         SourceLocation(defer_loc), std::move(lhs));
     return std::make_unique<DeferStmt>(
         std::move(defer_loc), std::move(expr_stmt));
+}
+
+std::unique_ptr<Stmt> Parser::parseErrdeferStmt() {
+    SourceLocation errdefer_loc = loc();
+    consume(TokenKind::KW_ERRDEFER, "expected 'errdefer'");
+
+    // Parse expression, which may be followed by an assignment
+    auto lhs = parseExpr();
+    if (match(TokenKind::EQ)) {
+        auto rhs = parseExpr();
+        consume(TokenKind::SEMI, "expected ';' after errdefer assignment");
+        auto assign = std::make_unique<AssignStmt>(
+            SourceLocation(errdefer_loc), std::move(lhs), std::move(rhs));
+        return std::make_unique<ErrdeferStmt>(
+            std::move(errdefer_loc), std::move(assign));
+    }
+    if (peek().isCompoundAssignment()) {
+        Token op_tok = advance();
+        auto rhs = parseExpr();
+        consume(TokenKind::SEMI, "expected ';' after errdefer assignment");
+        BinaryOp op = tokenToCompoundAssignOp(op_tok.kind());
+        auto bin_expr = std::make_unique<BinaryExpr>(
+            locFrom(op_tok), op, std::move(lhs), std::move(rhs));
+        auto expr_stmt = std::make_unique<ExprStmt>(
+            SourceLocation(errdefer_loc), std::move(bin_expr));
+        return std::make_unique<ErrdeferStmt>(
+            std::move(errdefer_loc), std::move(expr_stmt));
+    }
+    consume(TokenKind::SEMI, "expected ';' after errdefer expression");
+    auto expr_stmt = std::make_unique<ExprStmt>(
+        SourceLocation(errdefer_loc), std::move(lhs));
+    return std::make_unique<ErrdeferStmt>(
+        std::move(errdefer_loc), std::move(expr_stmt));
+}
+
+std::unique_ptr<Stmt> Parser::parseAtomicStmt() {
+    SourceLocation atomic_loc = loc();
+    consume(TokenKind::KW_ATOMIC, "expected 'atomic'");
+
+    // Default to SeqCst ordering
+    auto ordering = AtomicStmt::Ordering::SeqCst;
+
+    // Check for optional ordering specifier: atomic(relaxed), atomic(acquire), atomic(release), atomic(acqrel), atomic(seqcst)
+    if (match(TokenKind::LPAREN)) {
+        Token ordering_tok = consume(TokenKind::IDENTIFIER, "expected atomic ordering (relaxed, acquire, release, acqrel, seqcst)");
+        std::string ordering_text = ordering_tok.text();
+        if (ordering_text == "relaxed") ordering = AtomicStmt::Ordering::Relaxed;
+        else if (ordering_text == "acquire") ordering = AtomicStmt::Ordering::Acquire;
+        else if (ordering_text == "release") ordering = AtomicStmt::Ordering::Release;
+        else if (ordering_text == "acqrel") ordering = AtomicStmt::Ordering::AcqRel;
+        else if (ordering_text == "seqcst") ordering = AtomicStmt::Ordering::SeqCst;
+        else errorAt(ordering_tok, "unknown atomic ordering '" + ordering_text + "'");
+        consume(TokenKind::RPAREN, "expected ')' after atomic ordering");
+    }
+
+    // Parse the inner statement (usually an assignment or compound assignment)
+    auto inner = parseStmt();
+    if (!inner) {
+        SourceLocation poison_loc = loc();
+        auto poison = std::make_unique<PoisonExpr>(poison_loc, "failed to parse atomic statement body");
+        inner = std::make_unique<ExprStmt>(poison_loc, std::move(poison));
+    }
+
+    return std::make_unique<AtomicStmt>(
+        std::move(atomic_loc), std::move(inner), ordering);
+}
+
+std::unique_ptr<YieldStmt> Parser::parseYieldStmt() {
+    SourceLocation yield_loc = loc();
+    consume(TokenKind::KW_YIELD, "expected 'yield'");
+
+    std::unique_ptr<Expr> value;
+    if (!check(TokenKind::SEMI) && !check(TokenKind::RBRACE)) {
+        value = parseExpr();
+    }
+
+    consume(TokenKind::SEMI, "expected ';' after yield");
+    return std::make_unique<YieldStmt>(std::move(yield_loc), std::move(value));
 }
 
 std::unique_ptr<ReturnStmt> Parser::parseReturnStmt() {
@@ -1138,6 +1258,13 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
             return expr;
         }
 
+        case TokenKind::KW_TRY: {
+            SourceLocation try_loc = loc();
+            advance(); // consume 'try'
+            auto operand = parseExpr();
+            return std::make_unique<TryExpr>(std::move(try_loc), std::move(operand));
+        }
+
         // select(cond, a, b)
         case TokenKind::KW_SELECT:
             return parseSelectExpr();
@@ -1311,6 +1438,16 @@ std::unique_ptr<Expr> Parser::parseSizeofExpr() {
 // Type parsing
 // ============================================================================
 TypeId Parser::parseType() {
+    // Check for alignment qualifier: align(N) type
+    if (match(TokenKind::KW_ALIGN)) {
+        consume(TokenKind::LPAREN, "expected '(' after 'align'");
+        Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
+        uint32_t alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
+        consume(TokenKind::RPAREN, "expected ')' after alignment value");
+        TypeId inner = parseType();
+        return type_table_.getAligned(inner, alignment);
+    }
+
     // Pointer type: *T
     if (match(TokenKind::STAR)) {
         TypeId inner = parseType();

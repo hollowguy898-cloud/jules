@@ -395,6 +395,15 @@ void SemanticAnalyzer::analyzeStmt(Stmt& stmt) {
         case NodeKind::BlockStmt:
             analyzeBlockStmt(static_cast<BlockStmt&>(stmt));
             break;
+        case NodeKind::ErrdeferStmt:
+            analyzeErrdeferStmt(static_cast<ErrdeferStmt&>(stmt));
+            break;
+        case NodeKind::AtomicStmt:
+            analyzeAtomicStmt(static_cast<AtomicStmt&>(stmt));
+            break;
+        case NodeKind::YieldStmt:
+            analyzeYieldStmt(static_cast<YieldStmt&>(stmt));
+            break;
         default:
             emitError(stmt.sourceLoc(), "unknown statement kind");
             break;
@@ -669,6 +678,8 @@ TypeId SemanticAnalyzer::analyzeExpr(Expr& expr) {
             return analyzeUnsafeExpr(static_cast<UnsafeExpr&>(expr));
         case NodeKind::PoisonExpr:
             return analyzePoisonExpr(static_cast<PoisonExpr&>(expr));
+        case NodeKind::TryExpr:
+            return analyzeTryExpr(static_cast<TryExpr&>(expr));
         default:
             emitError(expr.sourceLoc(), "unknown expression kind");
             return type_table_.getPoison();
@@ -1646,6 +1657,61 @@ TypeId SemanticAnalyzer::analyzePoisonExpr(PoisonExpr& pe) {
     auto result = type_table_.getPoison();
     pe.setType(result);
     return result;
+}
+
+// ============================================================================
+// New AST node analysis methods
+// ============================================================================
+
+TypeId SemanticAnalyzer::analyzeTryExpr(TryExpr& te) {
+    // Analyze the operand expression
+    TypeId operand_type = analyzeExpr(*te.operand());
+
+    // The operand must be an error-returning expression (ErrorType)
+    if (!operand_type.isNull() && !isPoisonType(operand_type)) {
+        if (!isErrorType(operand_type)) {
+            emitError(te.sourceLoc(), "'try' can only be applied to error-returning expressions");
+        } else {
+            // Unwrap the error type to get the success type
+            TypeId success_type = unwrapErrorType(operand_type);
+            te.setType(success_type);
+            return success_type;
+        }
+    }
+
+    // On error, propagate poison type
+    te.setType(type_table_.getPoison());
+    return type_table_.getPoison();
+}
+
+void SemanticAnalyzer::analyzeErrdeferStmt(ErrdeferStmt& es) {
+    // errdefer can only appear in error-returning functions
+    if (current_fn_ && !current_fn_->canError()) {
+        emitWarning(es.sourceLoc(), "errdefer in non-error-returning function will never execute");
+    }
+
+    // Analyze the inner statement
+    analyzeStmt(*es.stmt());
+}
+
+void SemanticAnalyzer::analyzeAtomicStmt(AtomicStmt& as) {
+    // Analyze the inner statement
+    analyzeStmt(*as.inner());
+
+    // Validate that the inner statement is a simple assignment or compound assignment
+    // (complex control flow inside atomic blocks is forbidden)
+    auto kind = as.inner()->getKind();
+    if (kind != NodeKind::AssignStmt && kind != NodeKind::ExprStmt) {
+        emitError(as.sourceLoc(), "atomic block must contain a simple assignment or expression");
+    }
+}
+
+void SemanticAnalyzer::analyzeYieldStmt(YieldStmt& ys) {
+    if (ys.hasValue()) {
+        TypeId val_type = analyzeExpr(*ys.value());
+        // yield can only be used in functions with appropriate return context
+        (void)val_type; // Type checking happens at a higher level
+    }
 }
 
 } // namespace tether

@@ -116,6 +116,7 @@ enum class NodeKind : uint16_t {
     SizeofExpr,
     UnsafeExpr,
     PoisonExpr,
+    TryExpr,
     // Statements
     VarDeclStmt,
     ValDeclStmt,
@@ -128,6 +129,9 @@ enum class NodeKind : uint16_t {
     ContinueStmt,
     ExprStmt,
     BlockStmt,
+    ErrdeferStmt,
+    AtomicStmt,
+    YieldStmt,
     // Top-level declarations
     FnDecl,
     StructDecl,
@@ -215,7 +219,7 @@ public:
 
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::IntLiteral && k <= NodeKind::PoisonExpr;
+        return k >= NodeKind::IntLiteral && k <= NodeKind::TryExpr;
     }
 
 protected:
@@ -233,7 +237,7 @@ class Stmt : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::VarDeclStmt && k <= NodeKind::BlockStmt;
+        return k >= NodeKind::VarDeclStmt && k <= NodeKind::YieldStmt;
     }
 
 protected:
@@ -766,6 +770,32 @@ private:
     std::string message_;
 };
 
+// ---- TryExpr ----
+// Zig-style error propagation: try expr
+// If expr evaluates to an error, immediately return it up the stack.
+// Otherwise, evaluates to the success value.
+class TryExpr : public Expr {
+public:
+    TryExpr(SourceLocation loc, std::unique_ptr<Expr> operand)
+        : Expr(NodeKind::TryExpr, std::move(loc))
+        , operand_(std::move(operand))
+    {}
+
+    Expr* operand() { return operand_.get(); }
+    const Expr* operand() const { return operand_.get(); }
+    std::unique_ptr<Expr> takeOperand() { return std::move(operand_); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::TryExpr;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Expr> operand_;
+};
+
 // ============================================================================
 // Statement Nodes
 // ============================================================================
@@ -917,6 +947,96 @@ public:
 
 private:
     std::unique_ptr<Stmt> stmt_;
+};
+
+// ---- ErrdeferStmt ----
+// Error-scoped defer: executes the statement only if the function exits with an error.
+// Like Zig's errdefer: guarantees cleanup on error paths only.
+class ErrdeferStmt : public Stmt {
+public:
+    ErrdeferStmt(SourceLocation loc, std::unique_ptr<Stmt> stmt)
+        : Stmt(NodeKind::ErrdeferStmt, std::move(loc))
+        , stmt_(std::move(stmt))
+    {}
+
+    Stmt* stmt() { return stmt_.get(); }
+    const Stmt* stmt() const { return stmt_.get(); }
+    std::unique_ptr<Stmt> takeStmt() { return std::move(stmt_); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::ErrdeferStmt;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Stmt> stmt_;
+};
+
+// ---- AtomicStmt ----
+// Atomic operation: wraps a statement with CPU-level atomic memory ordering.
+// The inner statement must be a simple assignment or compound assignment.
+// Generates LLVM atomics (e.g., atomicrmw, fence, cmpxchg).
+class AtomicStmt : public Stmt {
+public:
+    enum class Ordering : uint8_t {
+        Relaxed,
+        Acquire,
+        Release,
+        AcqRel,
+        SeqCst
+    };
+
+    AtomicStmt(SourceLocation loc, std::unique_ptr<Stmt> inner, Ordering ordering = Ordering::SeqCst)
+        : Stmt(NodeKind::AtomicStmt, std::move(loc))
+        , inner_(std::move(inner))
+        , ordering_(ordering)
+    {}
+
+    Stmt* inner() { return inner_.get(); }
+    const Stmt* inner() const { return inner_.get(); }
+    std::unique_ptr<Stmt> takeInner() { return std::move(inner_); }
+    Ordering ordering() const { return ordering_; }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::AtomicStmt;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Stmt> inner_;
+    Ordering ordering_;
+};
+
+// ---- YieldStmt ----
+// Cooperative yielding: pauses execution and hands control back to
+// a user-defined scheduler. In bare-metal/fiber contexts, this is
+// a direct context switch costing only a few CPU cycles.
+// May optionally yield a value.
+class YieldStmt : public Stmt {
+public:
+    explicit YieldStmt(SourceLocation loc, std::unique_ptr<Expr> value = nullptr)
+        : Stmt(NodeKind::YieldStmt, std::move(loc))
+        , value_(std::move(value))
+    {}
+
+    Expr* value() { return value_.get(); }
+    const Expr* value() const { return value_.get(); }
+    std::unique_ptr<Expr> takeValue() { return std::move(value_); }
+    bool hasValue() const { return value_ != nullptr; }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::YieldStmt;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Expr> value_;
 };
 
 // ---- IfStmt ----
@@ -1193,6 +1313,9 @@ public:
     void setSoA(bool v) { is_soa_ = v; }
     bool isSoA() const { return is_soa_; }
 
+    void setAlignment(uint32_t a) { alignment_ = a; }
+    uint32_t alignment() const { return alignment_; }
+
     void accept(ASTVisitor& visitor) override;
     void accept(ConstASTVisitor& visitor) const override;
 
@@ -1200,6 +1323,7 @@ private:
     std::string name_;
     std::vector<StructFieldDecl> fields_;
     bool is_soa_ = false;
+    uint32_t alignment_ = 0;
 };
 
 // ---- EnumDecl ----
@@ -1284,6 +1408,7 @@ public:
     virtual void visitSizeofExpr(SizeofExpr&) {}
     virtual void visitUnsafeExpr(UnsafeExpr&) {}
     virtual void visitPoisonExpr(PoisonExpr&) {}
+    virtual void visitTryExpr(TryExpr&) {}
 
     // Statement visitors
     virtual void visitVarDeclStmt(VarDeclStmt&) {}
@@ -1297,6 +1422,9 @@ public:
     virtual void visitContinueStmt(ContinueStmt&) {}
     virtual void visitExprStmt(ExprStmt&) {}
     virtual void visitBlockStmt(BlockStmt&) {}
+    virtual void visitErrdeferStmt(ErrdeferStmt&) {}
+    virtual void visitAtomicStmt(AtomicStmt&) {}
+    virtual void visitYieldStmt(YieldStmt&) {}
 
     // Top-level visitors
     virtual void visitFnDecl(FnDecl&) {}
@@ -1329,6 +1457,7 @@ public:
     virtual void visitSizeofExpr(const SizeofExpr&) {}
     virtual void visitUnsafeExpr(const UnsafeExpr&) {}
     virtual void visitPoisonExpr(const PoisonExpr&) {}
+    virtual void visitTryExpr(const TryExpr&) {}
 
     // Statement visitors
     virtual void visitVarDeclStmt(const VarDeclStmt&) {}
@@ -1342,6 +1471,9 @@ public:
     virtual void visitContinueStmt(const ContinueStmt&) {}
     virtual void visitExprStmt(const ExprStmt&) {}
     virtual void visitBlockStmt(const BlockStmt&) {}
+    virtual void visitErrdeferStmt(const ErrdeferStmt&) {}
+    virtual void visitAtomicStmt(const AtomicStmt&) {}
+    virtual void visitYieldStmt(const YieldStmt&) {}
 
     // Top-level visitors
     virtual void visitFnDecl(const FnDecl&) {}
@@ -1411,6 +1543,9 @@ inline void UnsafeExpr::accept(ConstASTVisitor& v) const { v.visitUnsafeExpr(*th
 inline void PoisonExpr::accept(ASTVisitor& v) { v.visitPoisonExpr(*this); }
 inline void PoisonExpr::accept(ConstASTVisitor& v) const { v.visitPoisonExpr(*this); }
 
+inline void TryExpr::accept(ASTVisitor& v) { v.visitTryExpr(*this); }
+inline void TryExpr::accept(ConstASTVisitor& v) const { v.visitTryExpr(*this); }
+
 inline void VarDeclStmt::accept(ASTVisitor& v) { v.visitVarDeclStmt(*this); }
 inline void VarDeclStmt::accept(ConstASTVisitor& v) const { v.visitVarDeclStmt(*this); }
 
@@ -1422,6 +1557,15 @@ inline void AssignStmt::accept(ConstASTVisitor& v) const { v.visitAssignStmt(*th
 
 inline void DeferStmt::accept(ASTVisitor& v) { v.visitDeferStmt(*this); }
 inline void DeferStmt::accept(ConstASTVisitor& v) const { v.visitDeferStmt(*this); }
+
+inline void ErrdeferStmt::accept(ASTVisitor& v) { v.visitErrdeferStmt(*this); }
+inline void ErrdeferStmt::accept(ConstASTVisitor& v) const { v.visitErrdeferStmt(*this); }
+
+inline void AtomicStmt::accept(ASTVisitor& v) { v.visitAtomicStmt(*this); }
+inline void AtomicStmt::accept(ConstASTVisitor& v) const { v.visitAtomicStmt(*this); }
+
+inline void YieldStmt::accept(ASTVisitor& v) { v.visitYieldStmt(*this); }
+inline void YieldStmt::accept(ConstASTVisitor& v) const { v.visitYieldStmt(*this); }
 
 inline void IfStmt::accept(ASTVisitor& v) { v.visitIfStmt(*this); }
 inline void IfStmt::accept(ConstASTVisitor& v) const { v.visitIfStmt(*this); }

@@ -90,6 +90,13 @@ private:
     void emitStmt(Stmt* stmt);
     void emitBlockStmt(BlockStmt* block);
     void emitDeferBlocks();
+    void emitErrdeferBlocks();
+    std::string emitAtomicRMW(const std::string& result_reg,
+                               const std::string& ll_type,
+                               const std::string& ptr_reg,
+                               const std::string& val_reg,
+                               BinaryOp op,
+                               AtomicStmt::Ordering ordering);
 
     // =======================================================================
     // Smart-pointer emission helpers
@@ -145,6 +152,12 @@ private:
 
     // Defer stack (raw Stmt pointers – owned by the AST, not by us)
     std::vector<Stmt*> defer_stack_;
+
+    // Errdefer stack (similar to defer_stack_ but only runs on error paths)
+    std::vector<Stmt*> errdefer_stack_;
+
+    // Track whether current function can error (for errdefer codegen)
+    bool current_fn_can_error_ = false;
 
     // Runtime functions the generated code references
     std::unordered_set<std::string> needed_runtime_;

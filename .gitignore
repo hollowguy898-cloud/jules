@@ -1,14 +1,7 @@
+# Build artifacts
 build/
 *.o
-*.d
-julesc
-jules
-test.ll
-*.a
-build/
-*.o
-julesc
-benchmark_runner
-*.ll
-.d
 tetherc
+bench_speed
+benchmarks/ecs/tether_ecs
+benchmarks/ecs/rust_ecs/target/

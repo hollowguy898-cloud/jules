@@ -33,6 +33,13 @@ enum class TokenKind : uint16_t {
     KW_SIZEOF,
     KW_IMPORT,
     KW_SOA,
+    KW_ALIGN,
+    KW_OPAQUE,
+    KW_TRY,
+    KW_CATCH,
+    KW_ERRDEFER,
+    KW_ATOMIC,
+    KW_YIELD,
 
     // Literals
     INT_LITERAL,
@@ -128,6 +135,13 @@ inline const char* tokenKindToString(TokenKind kind) {
         case TokenKind::KW_SIZEOF:      return "sizeof";
         case TokenKind::KW_IMPORT:      return "import";
         case TokenKind::KW_SOA:         return "soa";
+        case TokenKind::KW_ALIGN:       return "align";
+        case TokenKind::KW_OPAQUE:      return "opaque";
+        case TokenKind::KW_TRY:         return "try";
+        case TokenKind::KW_CATCH:       return "catch";
+        case TokenKind::KW_ERRDEFER:    return "errdefer";
+        case TokenKind::KW_ATOMIC:      return "atomic";
+        case TokenKind::KW_YIELD:       return "yield";
 
         // Literals
         case TokenKind::INT_LITERAL:    return "integer literal";
@@ -224,7 +238,7 @@ public:
     bool isNot(TokenKind k) const { return kind_ != k; }
 
     bool isKeyword() const {
-        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_SOA;
+        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_YIELD;
     }
 
     bool isLiteral() const {

@@ -70,6 +70,8 @@ public:
                 return derived().visitUnsafeExpr(static_cast<UnsafeExpr&>(node));
             case NodeKind::PoisonExpr:
                 return derived().visitPoisonExpr(static_cast<PoisonExpr&>(node));
+            case NodeKind::TryExpr:
+                return derived().visitTryExpr(static_cast<TryExpr&>(node));
 
             // Statements
             case NodeKind::VarDeclStmt:
@@ -80,6 +82,12 @@ public:
                 return derived().visitAssignStmt(static_cast<AssignStmt&>(node));
             case NodeKind::DeferStmt:
                 return derived().visitDeferStmt(static_cast<DeferStmt&>(node));
+            case NodeKind::ErrdeferStmt:
+                return derived().visitErrdeferStmt(static_cast<ErrdeferStmt&>(node));
+            case NodeKind::AtomicStmt:
+                return derived().visitAtomicStmt(static_cast<AtomicStmt&>(node));
+            case NodeKind::YieldStmt:
+                return derived().visitYieldStmt(static_cast<YieldStmt&>(node));
             case NodeKind::IfStmt:
                 return derived().visitIfStmt(static_cast<IfStmt&>(node));
             case NodeKind::WhileStmt:
@@ -149,6 +157,8 @@ public:
                 return derived().visitUnsafeExpr(static_cast<const UnsafeExpr&>(node));
             case NodeKind::PoisonExpr:
                 return derived().visitPoisonExpr(static_cast<const PoisonExpr&>(node));
+            case NodeKind::TryExpr:
+                return derived().visitTryExpr(static_cast<const TryExpr&>(node));
             case NodeKind::VarDeclStmt:
                 return derived().visitVarDeclStmt(static_cast<const VarDeclStmt&>(node));
             case NodeKind::ValDeclStmt:
@@ -157,6 +167,12 @@ public:
                 return derived().visitAssignStmt(static_cast<const AssignStmt&>(node));
             case NodeKind::DeferStmt:
                 return derived().visitDeferStmt(static_cast<const DeferStmt&>(node));
+            case NodeKind::ErrdeferStmt:
+                return derived().visitErrdeferStmt(static_cast<const ErrdeferStmt&>(node));
+            case NodeKind::AtomicStmt:
+                return derived().visitAtomicStmt(static_cast<const AtomicStmt&>(node));
+            case NodeKind::YieldStmt:
+                return derived().visitYieldStmt(static_cast<const YieldStmt&>(node));
             case NodeKind::IfStmt:
                 return derived().visitIfStmt(static_cast<const IfStmt&>(node));
             case NodeKind::WhileStmt:
@@ -279,6 +295,11 @@ public:
 
     Ret visitPoisonExpr(PoisonExpr&) { return retDefault(); }
 
+    Ret visitTryExpr(TryExpr& node) {
+        traverseExpr(node.operand());
+        return retDefault();
+    }
+
     // --- Statements ---
 
     Ret visitVarDeclStmt(VarDeclStmt& node) {
@@ -303,6 +324,23 @@ public:
 
     Ret visitDeferStmt(DeferStmt& node) {
         traverseStmt(node.stmt());
+        return retDefault();
+    }
+
+    Ret visitErrdeferStmt(ErrdeferStmt& node) {
+        traverseStmt(node.stmt());
+        return retDefault();
+    }
+
+    Ret visitAtomicStmt(AtomicStmt& node) {
+        traverseStmt(node.inner());
+        return retDefault();
+    }
+
+    Ret visitYieldStmt(YieldStmt& node) {
+        if (node.hasValue()) {
+            traverseExpr(node.value());
+        }
         return retDefault();
     }
 
@@ -384,10 +422,15 @@ public:
     Ret visitUnsafeExpr(const UnsafeExpr&) { return retDefault(); }
     Ret visitPoisonExpr(const PoisonExpr&) { return retDefault(); }
 
+    Ret visitTryExpr(const TryExpr&) { return retDefault(); }
+
     Ret visitVarDeclStmt(const VarDeclStmt&) { return retDefault(); }
     Ret visitValDeclStmt(const ValDeclStmt&) { return retDefault(); }
     Ret visitAssignStmt(const AssignStmt&) { return retDefault(); }
     Ret visitDeferStmt(const DeferStmt&) { return retDefault(); }
+    Ret visitErrdeferStmt(const ErrdeferStmt&) { return retDefault(); }
+    Ret visitAtomicStmt(const AtomicStmt&) { return retDefault(); }
+    Ret visitYieldStmt(const YieldStmt&) { return retDefault(); }
     Ret visitIfStmt(const IfStmt&) { return retDefault(); }
     Ret visitWhileStmt(const WhileStmt&) { return retDefault(); }
     Ret visitReturnStmt(const ReturnStmt&) { return retDefault(); }

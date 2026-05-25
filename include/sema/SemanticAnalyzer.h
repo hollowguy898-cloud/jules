@@ -147,6 +147,9 @@ private:
     void analyzeBreakStmt(BreakStmt& bs);
     void analyzeContinueStmt(ContinueStmt& cs);
     void analyzeExprStmt(ExprStmt& es);
+    void analyzeErrdeferStmt(ErrdeferStmt& es);
+    void analyzeAtomicStmt(AtomicStmt& as);
+    void analyzeYieldStmt(YieldStmt& ys);
 
     // -----------------------------------------------------------------------
     // Expression analysis — returns the TypeId of the expression
@@ -172,6 +175,7 @@ private:
     TypeId analyzeSizeofExpr(SizeofExpr& se);
     TypeId analyzeUnsafeExpr(UnsafeExpr& ue);
     TypeId analyzePoisonExpr(PoisonExpr& pe);
+    TypeId analyzeTryExpr(TryExpr& te);
 
     // -----------------------------------------------------------------------
     // Type checking helpers

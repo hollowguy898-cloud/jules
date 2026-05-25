@@ -58,7 +58,9 @@ enum class TypeKind : uint8_t {
     SmartPointer,
     Poison,
     Error,
-    Allocator
+    Allocator,
+    Opaque,
+    Aligned
 };
 
 // ============================================================================
@@ -113,6 +115,8 @@ class SmartPointerType;
 class PoisonType;
 class ErrorType;
 class AllocatorType;
+class OpaqueType;
+class AlignedType;
 
 // ============================================================================
 // Type base class
@@ -685,6 +689,84 @@ public:
 };
 
 // ============================================================================
+// OpaqueType - represents a type whose internal layout is completely hidden
+//
+// Used for FFI/bare-metal drivers where the current compilation unit must not
+// make assumptions about the memory layout of a foreign type. The compiler
+// treats values of opaque type as fixed-size blobs with no accessible fields.
+// ============================================================================
+class OpaqueType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Opaque;
+    }
+
+    explicit OpaqueType(std::string name, uint64_t size_bytes = 0)
+        : Type(TypeKind::Opaque)
+        , name_(std::move(name))
+        , size_bytes_(size_bytes)
+    {}
+
+    const std::string& name() const { return name_; }
+    uint64_t sizeBytes() const { return size_bytes_; }
+
+    std::string toString() const override {
+        return "opaque:" + name_;
+    }
+
+    uint64_t bitWidth() const override { return size_bytes_ * 8; }
+    bool isPointerLike() const override { return size_bytes_ == 8; }
+
+private:
+    std::string name_;
+    uint64_t size_bytes_;
+};
+
+// ============================================================================
+// AlignedType - represents a type with forced alignment
+//
+// Wraps another type and enforces a specific byte alignment. Used for
+// cache-line-aligned structures (e.g., align(64) for L1 cache lines)
+// to enable ultra-fast aligned load/store instructions.
+// ============================================================================
+class AlignedType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Aligned;
+    }
+
+    AlignedType(TypeId inner, uint32_t alignment)
+        : Type(TypeKind::Aligned)
+        , inner_(inner)
+        , alignment_(alignment)
+    {}
+
+    TypeId inner() const { return inner_; }
+    uint32_t alignment() const { return alignment_; }
+
+    std::string toString() const override {
+        return "align(" + std::to_string(alignment_) + "):" + inner_->toString();
+    }
+
+    uint64_t bitWidth() const override { return inner_->bitWidth(); }
+    bool isPointerLike() const override { return inner_->isPointerLike(); }
+
+    bool isInteger() const override { return inner_->isInteger(); }
+    bool isFloat() const override { return inner_->isFloat(); }
+    bool isNumeric() const override { return inner_->isNumeric(); }
+    bool isSigned() const override { return inner_->isSigned(); }
+    bool isUnsigned() const override { return inner_->isUnsigned(); }
+    bool isBool() const override { return inner_->isBool(); }
+    bool isVoid() const override { return inner_->isVoid(); }
+    bool isError() const override { return inner_->isError(); }
+    bool isPoison() const override { return inner_->isPoison(); }
+
+private:
+    TypeId inner_;
+    uint32_t alignment_;
+};
+
+// ============================================================================
 // Type casting helpers (LLVM-style RTTI)
 // ============================================================================
 template<typename T>
@@ -945,6 +1027,32 @@ public:
         }
 
         auto type = std::make_unique<SmartPointerType>(pointee, kind);
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // Intern an opaque type
+    TypeId getOpaque(std::string name, uint64_t size_bytes = 0) {
+        std::string key = "opaque:" + name;
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+        auto type = std::make_unique<OpaqueType>(std::move(name), size_bytes);
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // Intern an aligned type
+    TypeId getAligned(TypeId inner, uint32_t alignment) {
+        std::string key = "align(" + std::to_string(alignment) + "):" + inner->toString();
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+        auto type = std::make_unique<AlignedType>(inner, alignment);
         Type* raw = type.get();
         type_map_[std::move(key)] = std::move(type);
         return TypeId(raw);

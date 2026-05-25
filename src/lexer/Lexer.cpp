@@ -328,6 +328,7 @@ TokenKind Lexer::lookupKeyword(const std::string& text) const {
         if (text == "var") return TokenKind::KW_VAR;
         if (text == "mut") return TokenKind::KW_MUT;
         if (text == "soa") return TokenKind::KW_SOA;
+        if (text == "try") return TokenKind::KW_TRY;
         return TokenKind::IDENTIFIER;
     }
     if (text.size() == 4) {
@@ -344,6 +345,9 @@ TokenKind Lexer::lookupKeyword(const std::string& text) const {
         if (text == "defer")  return TokenKind::KW_DEFER;
         if (text == "break")  return TokenKind::KW_BREAK;
         if (text == "false")  return TokenKind::KW_FALSE;
+        if (text == "align")  return TokenKind::KW_ALIGN;
+        if (text == "catch")  return TokenKind::KW_CATCH;
+        if (text == "yield")  return TokenKind::KW_YIELD;
         return TokenKind::IDENTIFIER;
     }
     if (text.size() == 6) {
@@ -353,10 +357,13 @@ TokenKind Lexer::lookupKeyword(const std::string& text) const {
         if (text == "select") return TokenKind::KW_SELECT;
         if (text == "sizeof") return TokenKind::KW_SIZEOF;
         if (text == "import") return TokenKind::KW_IMPORT;
+        if (text == "atomic") return TokenKind::KW_ATOMIC;
+        if (text == "opaque") return TokenKind::KW_OPAQUE;
         return TokenKind::IDENTIFIER;
     }
     if (text.size() == 8) {
         if (text == "continue") return TokenKind::KW_CONTINUE;
+        if (text == "errdefer") return TokenKind::KW_ERRDEFER;
         return TokenKind::IDENTIFIER;
     }
     return TokenKind::IDENTIFIER;

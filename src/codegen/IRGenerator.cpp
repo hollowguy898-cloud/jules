@@ -211,8 +211,21 @@ std::string IRGenerator::llvmType(TypeId type) const {
         case TypeKind::Poison:
             return "i32";  // stub type for poison – keeps LLVM IR structurally valid
         default:
-            return "ptr";
+            break;
     }
+
+    // Handle AlignedType and OpaqueType (not in the switch above)
+    if (isa<AlignedType>(type)) {
+        auto& at = cast<AlignedType>(type);
+        return llvmType(at.inner());
+    }
+    if (isa<OpaqueType>(type)) {
+        auto& ot = cast<OpaqueType>(type);
+        if (ot.sizeBytes() == 0) return "i8"; // default opaque size
+        return "i" + std::to_string(ot.sizeBytes() * 8);
+    }
+
+    return "ptr";
 }
 
 // ============================================================================
@@ -220,6 +233,11 @@ std::string IRGenerator::llvmType(TypeId type) const {
 // ============================================================================
 std::string IRGenerator::llvmReturnType(TypeId type, bool can_error) const {
     if (can_error) {
+        if (!type || !isa<ErrorType>(type)) {
+            // Defensive: error-returning function but type is not ErrorType
+            // (can happen during error-resilient compilation). Emit a fallback.
+            return "{ i64, i1 }";
+        }
         auto& err = cast<ErrorType>(type);
         std::string vt = llvmType(err.successType());
         return (vt == "void") ? "{ i1 }" : "{ " + vt + ", i1 }";
@@ -397,6 +415,9 @@ void IRGenerator::emitRuntimeDecls() {
     if (needed_runtime_.count("atomic_sub")) {
         module_out_ << "declare i64 @llvm.atomicrmw.sub.i64.p0(ptr, i64)\n"; any = true;
     }
+    if (needed_runtime_.count("tether_yield")) {
+        module_out_ << "declare void @tether_yield(i64)\n"; any = true;
+    }
     if (any) module_out_ << "\n";
 }
 
@@ -501,8 +522,20 @@ void IRGenerator::emitTopLevel(TopLevel* tl) {
 // ============================================================================
 // emitStructDecl – type definitions already emitted by emitTypeDefinitions
 // ============================================================================
-void IRGenerator::emitStructDecl(StructDecl*) {
-    // Type defs are handled in emitTypeDefinitions().
+void IRGenerator::emitStructDecl(StructDecl* sd) {
+    // Type defs are handled in emitTypeDefinitions(), but if the struct has
+    // a non-default alignment, we need to re-emit with the alignment info.
+    if (sd && sd->alignment() > 0) {
+        auto key = sd->name();
+        // Look up the type info - need to construct the key from the struct type
+        std::string body_str;
+        std::string ll_name = "%struct." + sanitizeName(sd->name());
+        for (size_t i = 0; i < sd->fieldCount(); ++i) {
+            if (i > 0) body_str += ", ";
+            body_str += llvmType(sd->fields()[i].type);
+        }
+        module_out_ << ll_name << " = type <{ " << body_str << " }> ; align " << sd->alignment() << "\n";
+    }
 }
 
 // ============================================================================
@@ -528,6 +561,8 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     var_allocas_.clear();
     used_alloca_names_.clear();
     defer_stack_.clear();
+    errdefer_stack_.clear();
+    current_fn_can_error_ = fn->canError();
     terminated_ = false;
     current_return_type_ = fn->returnType();
     current_can_error_ = fn->canError();
@@ -658,6 +693,53 @@ void IRGenerator::emitDeferBlocks() {
     for (int i = static_cast<int>(defer_stack_.size()) - 1; i >= 0; --i) {
         emitStmt(defer_stack_[i]);
     }
+}
+
+// ============================================================================
+// emitErrdeferBlocks
+// ============================================================================
+void IRGenerator::emitErrdeferBlocks() {
+    // Emit errdefer blocks in reverse order (LIFO, like defer)
+    for (auto it = errdefer_stack_.rbegin(); it != errdefer_stack_.rend(); ++it) {
+        emitStmt(*it);
+    }
+}
+
+// ============================================================================
+// emitAtomicRMW
+// ============================================================================
+std::string IRGenerator::emitAtomicRMW(const std::string& result_reg,
+                                        const std::string& ll_type,
+                                        const std::string& ptr_reg,
+                                        const std::string& val_reg,
+                                        BinaryOp op,
+                                        AtomicStmt::Ordering ordering) {
+    std::string ordering_str;
+    switch (ordering) {
+        case AtomicStmt::Ordering::Relaxed: ordering_str = "monotonic"; break;
+        case AtomicStmt::Ordering::Acquire: ordering_str = "acquire"; break;
+        case AtomicStmt::Ordering::Release: ordering_str = "release"; break;
+        case AtomicStmt::Ordering::AcqRel:  ordering_str = "acq_rel"; break;
+        case AtomicStmt::Ordering::SeqCst:  ordering_str = "seq_cst"; break;
+        default: ordering_str = "seq_cst"; break;
+    }
+
+    std::string rmw_op;
+    switch (op) {
+        case BinaryOp::Add: rmw_op = "add"; break;
+        case BinaryOp::Sub: rmw_op = "sub"; break;
+        case BinaryOp::BitAnd: rmw_op = "and"; break;
+        case BinaryOp::BitOr: rmw_op = "or"; break;
+        case BinaryOp::BitXor: rmw_op = "xor"; break;
+        case BinaryOp::Shl: rmw_op = "shl"; break;   // min
+        case BinaryOp::Shr: rmw_op = "shr"; break;    // max
+        default: rmw_op = "add"; break;
+    }
+
+    body_ss_ << "  " << result_reg << " = atomicrmw " << rmw_op << " " << ll_type
+             << " " << ptr_reg << ", " << ll_type << " " << val_reg
+             << " " << ordering_str << "\n";
+    return result_reg;
 }
 
 // ============================================================================
@@ -933,6 +1015,52 @@ void IRGenerator::emitStmt(Stmt* stmt) {
         // ---- block statement ----
         case NodeKind::BlockStmt: {
             emitBlockStmt(&cast<BlockStmt>(*stmt));
+            break;
+        }
+
+        // ---- errdefer ----
+        case NodeKind::ErrdeferStmt: {
+            auto& es = static_cast<ErrdeferStmt&>(*stmt);
+            // Push onto the errdefer stack; will be emitted on error paths only
+            errdefer_stack_.push_back(es.stmt());
+            break;
+        }
+
+        // ---- atomic ----
+        case NodeKind::AtomicStmt: {
+            auto& as = static_cast<AtomicStmt&>(*stmt);
+            // Emit fence before the atomic operation
+            std::string ordering_str;
+            switch (as.ordering()) {
+                case AtomicStmt::Ordering::Relaxed: ordering_str = "monotonic"; break;
+                case AtomicStmt::Ordering::Acquire: ordering_str = "acquire"; break;
+                case AtomicStmt::Ordering::Release: ordering_str = "release"; break;
+                case AtomicStmt::Ordering::AcqRel:  ordering_str = "acq_rel"; break;
+                case AtomicStmt::Ordering::SeqCst:  ordering_str = "seq_cst"; break;
+                default: ordering_str = "seq_cst"; break;
+            }
+            body_ss_ << "  fence " << ordering_str << "\n";
+            // Emit the inner statement
+            emitStmt(as.inner());
+            // Fence after for Acquire/SeqCst
+            if (as.ordering() == AtomicStmt::Ordering::Acquire ||
+                as.ordering() == AtomicStmt::Ordering::SeqCst) {
+                body_ss_ << "  fence " << ordering_str << "\n";
+            }
+            break;
+        }
+
+        // ---- yield ----
+        case NodeKind::YieldStmt: {
+            auto& ys = static_cast<YieldStmt&>(*stmt);
+            // Yield is a cooperative context switch - call the runtime yield function
+            needed_runtime_.insert("tether_yield");
+            if (ys.hasValue()) {
+                std::string val = emitExpr(ys.value());
+                body_ss_ << "  call void @tether_yield(i64 " << val << ")\n";
+            } else {
+                body_ss_ << "  call void @tether_yield(i64 0)\n";
+            }
             break;
         }
 
@@ -1630,6 +1758,51 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         auto reg = nextReg();
         body_ss_ << "  " << reg << " = add i32 0, 0 ; poison stub\n";
         return reg;
+    }
+
+    // ========================================================================
+    // Try expression – Zig-style error propagation
+    // ========================================================================
+    case NodeKind::TryExpr: {
+        auto& te = static_cast<TryExpr&>(*expr);
+        // Emit the operand
+        std::string result = emitExpr(te.operand());
+
+        // Defensive: if the operand type is not a proper ErrorType (e.g., due
+        // to prior semantic errors), treat try as a no-op passthrough.
+        TypeId operand_type = te.operand()->getType();
+        if (!operand_type || !isa<ErrorType>(operand_type)) {
+            // Not a proper error union — just pass through the result
+            return result;
+        }
+
+        // Check the error flag and branch
+        // For ErrorType, the result is a struct { T value, i1 error_flag }
+        // Extract the error flag and if set, do early return
+        std::string value_reg = nextReg();
+        std::string err_flag_reg = nextReg();
+        body_ss_ << "  " << value_reg << " = extractvalue {"
+                 << llvmType(te.getType()) << ", i1} " << result << ", 0\n";
+        body_ss_ << "  " << err_flag_reg << " = extractvalue {"
+                 << llvmType(te.getType()) << ", i1} " << result << ", 1\n";
+
+        std::string err_label = nextLabel("try_err");
+        std::string ok_label = nextLabel("try_ok");
+        body_ss_ << "  br i1 " << err_flag_reg << ", label %" << err_label
+                 << ", label %" << ok_label << "\n";
+
+        body_ss_ << err_label << ":\n";
+        // On error: emit errdefer blocks and return the error
+        emitErrdeferBlocks();
+        emitDeferBlocks();
+        if (!isTerminated()) {
+            body_ss_ << "  ret {" << llvmType(current_return_type_) << ", i1} " << result << "\n";
+        }
+        setTerminated(true);
+
+        body_ss_ << ok_label << ":\n";
+        setTerminated(false);
+        return value_reg;
     }
 
     default: break;

@@ -113,6 +113,9 @@ private:
     std::unique_ptr<BreakStmt> parseBreakStmt();
     std::unique_ptr<ContinueStmt> parseContinueStmt();
     std::unique_ptr<BlockStmt> parseBlockStmt();
+    std::unique_ptr<Stmt> parseErrdeferStmt();
+    std::unique_ptr<Stmt> parseAtomicStmt();
+    std::unique_ptr<YieldStmt> parseYieldStmt();
 
     // -----------------------------------------------------------------------
     // Expression parsing (recursive descent with precedence levels)
