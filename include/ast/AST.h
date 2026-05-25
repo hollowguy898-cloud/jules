@@ -86,7 +86,8 @@ std::string unaryOpToString(UnaryOp op);
 // ============================================================================
 enum class CompilerDirective : uint8_t {
     Superoptimize,
-    Polly
+    Polly,
+    Simd
 };
 
 std::string compilerDirectiveToString(CompilerDirective d);
@@ -114,6 +115,7 @@ enum class NodeKind : uint16_t {
     ArrayInitExpr,
     SizeofExpr,
     UnsafeExpr,
+    PoisonExpr,
     // Statements
     VarDeclStmt,
     ValDeclStmt,
@@ -213,7 +215,7 @@ public:
 
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::IntLiteral && k <= NodeKind::UnsafeExpr;
+        return k >= NodeKind::IntLiteral && k <= NodeKind::PoisonExpr;
     }
 
 protected:
@@ -739,6 +741,31 @@ private:
     std::unique_ptr<Expr> inner_;
 };
 
+// ---- PoisonExpr ----
+// Represents a syntactically or semantically invalid expression.
+// Injected by the error-resilient parser or type-checker so that the rest
+// of the AST remains structurally valid and compilation can continue to
+// collect further errors.
+class PoisonExpr : public Expr {
+public:
+    explicit PoisonExpr(SourceLocation loc, std::string message = "")
+        : Expr(NodeKind::PoisonExpr, std::move(loc))
+        , message_(std::move(message))
+    {}
+
+    const std::string& message() const { return message_; }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::PoisonExpr;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::string message_;
+};
+
 // ============================================================================
 // Statement Nodes
 // ============================================================================
@@ -1251,6 +1278,7 @@ public:
     virtual void visitArrayInitExpr(ArrayInitExpr&) {}
     virtual void visitSizeofExpr(SizeofExpr&) {}
     virtual void visitUnsafeExpr(UnsafeExpr&) {}
+    virtual void visitPoisonExpr(PoisonExpr&) {}
 
     // Statement visitors
     virtual void visitVarDeclStmt(VarDeclStmt&) {}
@@ -1295,6 +1323,7 @@ public:
     virtual void visitArrayInitExpr(const ArrayInitExpr&) {}
     virtual void visitSizeofExpr(const SizeofExpr&) {}
     virtual void visitUnsafeExpr(const UnsafeExpr&) {}
+    virtual void visitPoisonExpr(const PoisonExpr&) {}
 
     // Statement visitors
     virtual void visitVarDeclStmt(const VarDeclStmt&) {}
@@ -1373,6 +1402,9 @@ inline void SizeofExpr::accept(ConstASTVisitor& v) const { v.visitSizeofExpr(*th
 
 inline void UnsafeExpr::accept(ASTVisitor& v) { v.visitUnsafeExpr(*this); }
 inline void UnsafeExpr::accept(ConstASTVisitor& v) const { v.visitUnsafeExpr(*this); }
+
+inline void PoisonExpr::accept(ASTVisitor& v) { v.visitPoisonExpr(*this); }
+inline void PoisonExpr::accept(ConstASTVisitor& v) const { v.visitPoisonExpr(*this); }
 
 inline void VarDeclStmt::accept(ASTVisitor& v) { v.visitVarDeclStmt(*this); }
 inline void VarDeclStmt::accept(ConstASTVisitor& v) const { v.visitVarDeclStmt(*this); }

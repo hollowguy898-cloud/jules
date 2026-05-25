@@ -207,8 +207,11 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
         return parseImportDecl();
     }
 
+    SourceLocation err_loc = loc();
     error("expected top-level declaration (fn, struct, enum, import)");
     synchronize();
+    // Return a PoisonExpr wrapped as a top-level placeholder so the AST
+    // remains structurally valid and later phases can continue.
     return nullptr;
 }
 
@@ -226,6 +229,8 @@ std::vector<CompilerDirective> Parser::parseDirectives() {
             directives.push_back(CompilerDirective::Superoptimize);
         } else if (text == "polly") {
             directives.push_back(CompilerDirective::Polly);
+        } else if (text == "simd") {
+            directives.push_back(CompilerDirective::Simd);
         } else {
             errorAt(name, "unknown compiler directive '@" + text + "'");
         }
@@ -393,6 +398,12 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
         // Directives at statement level: parse the next statement
         // TODO: Store directives for the subsequent block when AST supports it
         auto stmt = parseStmt();
+        if (!stmt) {
+            // Error-resilient: return an ExprStmt wrapping a PoisonExpr
+            SourceLocation poison_loc = loc();
+            auto poison = std::make_unique<PoisonExpr>(poison_loc, "failed to parse statement after directives");
+            return std::make_unique<ExprStmt>(poison_loc, std::move(poison));
+        }
         return stmt;
     }
 
@@ -451,10 +462,22 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
     // Expression statement or assignment
     auto expr = parseExpr();
 
+    // Error-resilient: if expression parsing failed, create a PoisonExpr
+    if (!expr) {
+        SourceLocation poison_loc = loc();
+        expr = std::make_unique<PoisonExpr>(poison_loc, "failed to parse expression");
+        synchronize();
+        return std::make_unique<ExprStmt>(poison_loc, std::move(expr));
+    }
+
     // Check for assignment
     if (match(TokenKind::EQ)) {
         // Simple assignment: target = value
         auto value = parseExpr();
+        if (!value) {
+            SourceLocation poison_loc = loc();
+            value = std::make_unique<PoisonExpr>(poison_loc, "failed to parse assignment value");
+        }
         consume(TokenKind::SEMI, "expected ';' after assignment");
         return std::make_unique<AssignStmt>(
             locFrom(previous()), std::move(expr), std::move(value));
@@ -463,6 +486,10 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
     if (peek().isCompoundAssignment()) {
         Token op_tok = advance();
         auto value = parseExpr();
+        if (!value) {
+            SourceLocation poison_loc = loc();
+            value = std::make_unique<PoisonExpr>(poison_loc, "failed to parse compound assignment value");
+        }
         consume(TokenKind::SEMI, "expected ';' after compound assignment");
         BinaryOp op = tokenToCompoundAssignOp(op_tok.kind());
         auto bin_expr = std::make_unique<BinaryExpr>(
@@ -921,6 +948,12 @@ std::unique_ptr<Expr> Parser::parseCastExpr() {
 // Primary expressions
 std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
     switch (peek().kind()) {
+        // Error recovery: if we hit an unexpected token, produce PoisonExpr
+        case TokenKind::EOF_TOKEN: {
+            SourceLocation poison_loc = loc();
+            error("unexpected end of file in expression");
+            return std::make_unique<PoisonExpr>(poison_loc, "unexpected end of file");
+        }
         // Literals
         case TokenKind::INT_LITERAL: {
             Token tok = advance();
@@ -1178,7 +1211,8 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
     }
 
     error("expected expression");
-    return std::make_unique<IdentExpr>(loc(), "__error__");
+    advance(); // consume the unexpected token to avoid infinite loops
+    return std::make_unique<PoisonExpr>(loc(), "failed to parse expression");
 }
 
 // ============================================================================

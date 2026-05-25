@@ -68,6 +68,8 @@ public:
                 return derived().visitSizeofExpr(static_cast<SizeofExpr&>(node));
             case NodeKind::UnsafeExpr:
                 return derived().visitUnsafeExpr(static_cast<UnsafeExpr&>(node));
+            case NodeKind::PoisonExpr:
+                return derived().visitPoisonExpr(static_cast<PoisonExpr&>(node));
 
             // Statements
             case NodeKind::VarDeclStmt:
@@ -145,6 +147,8 @@ public:
                 return derived().visitSizeofExpr(static_cast<const SizeofExpr&>(node));
             case NodeKind::UnsafeExpr:
                 return derived().visitUnsafeExpr(static_cast<const UnsafeExpr&>(node));
+            case NodeKind::PoisonExpr:
+                return derived().visitPoisonExpr(static_cast<const PoisonExpr&>(node));
             case NodeKind::VarDeclStmt:
                 return derived().visitVarDeclStmt(static_cast<const VarDeclStmt&>(node));
             case NodeKind::ValDeclStmt:
@@ -273,6 +277,8 @@ public:
         return retDefault();
     }
 
+    Ret visitPoisonExpr(PoisonExpr&) { return retDefault(); }
+
     // --- Statements ---
 
     Ret visitVarDeclStmt(VarDeclStmt& node) {
@@ -376,6 +382,7 @@ public:
     Ret visitArrayInitExpr(const ArrayInitExpr&) { return retDefault(); }
     Ret visitSizeofExpr(const SizeofExpr&) { return retDefault(); }
     Ret visitUnsafeExpr(const UnsafeExpr&) { return retDefault(); }
+    Ret visitPoisonExpr(const PoisonExpr&) { return retDefault(); }
 
     Ret visitVarDeclStmt(const VarDeclStmt&) { return retDefault(); }
     Ret visitValDeclStmt(const ValDeclStmt&) { return retDefault(); }

@@ -52,6 +52,7 @@ std::string compilerDirectiveToString(CompilerDirective d) {
     switch (d) {
         case CompilerDirective::Superoptimize: return "@superoptimize";
         case CompilerDirective::Polly:         return "@polly";
+        case CompilerDirective::Simd:           return "@simd";
         default:                               return "@unknown";
     }
 }

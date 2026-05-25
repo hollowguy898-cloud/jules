@@ -24,12 +24,18 @@ Driver::Driver(const std::string& input_file,
                const std::string& output_file,
                int opt_level,
                EmitType emit_type,
-               bool verbose)
+               bool verbose,
+               bool profile_generate,
+               const std::string& profile_use,
+               const std::string& target_triple)
     : input_file_(input_file)
     , output_file_(output_file)
     , opt_level_(std::clamp(opt_level, 0, 3))
     , emit_type_(emit_type)
     , verbose_(verbose)
+    , profile_generate_(profile_generate)
+    , profile_use_(profile_use)
+    , target_triple_(target_triple)
 {
     if (output_file_.empty()) {
         output_file_ = deriveOutputPath();
@@ -41,22 +47,55 @@ Driver::Driver(const std::string& input_file,
 // ============================================================================
 bool Driver::compile() {
     if (verbose_) {
-        std::cerr << "[jules] Compiling: " << input_file_ << std::endl;
+        std::cerr << "[tether] Compiling: " << input_file_ << std::endl;
     }
 
-    if (!readSource())           return false;
-    if (!runLexer())             return false;
-    if (!runParser())            return false;
-    if (!runSemanticAnalysis())  return false;
-    if (!runCFGBuilding())       return false;
-    if (!runBorrowChecking())    return false;
-    if (!runIRGeneration())      return false;
-    if (!writeIRFile())          return false;
+    // Error-resilient compilation: always run all phases to collect
+    // as many errors as possible. Only halt before final linking.
+    readSource();
+    runLexer();
+    runParser();
+    runSemanticAnalysis();
+    runCFGBuilding();
+    runBorrowChecking();
+    runIRGeneration();
+    writeIRFile();
+
+    // Collect all errors from every phase
+    // Note: tokens_ may be empty after being moved to the parser - that's not an error
+    bool has_errors = parser_had_errors_
+        || sema_had_errors_
+        || borrowck_had_errors_
+        || ir_text_.empty();
+
+    // If there were parse errors, report but continue
+    // If there were semantic errors, report but continue
+    if (has_errors) {
+        // Print all collected errors from every phase
+        for (const auto& err : parse_errors_) {
+            std::cerr << err.loc.toString() << ": error: " << err.message << std::endl;
+        }
+        for (const auto& diag : sema_diagnostics_) {
+            if (diag.isError()) {
+                std::cerr << diag.toString() << std::endl;
+            }
+        }
+        for (const auto& err : borrowck_errors_) {
+            std::cerr << err.toString() << std::endl;
+        }
+        if (!error_message_.empty()) {
+            std::cerr << error_message_ << std::endl;
+        }
+        if (verbose_) {
+            std::cerr << "[tether] Compilation failed with errors" << std::endl;
+        }
+        return false;  // Never link or produce output with errors
+    }
 
     // For IR-only output, we are done after writing the .ll file
     if (emit_type_ == EmitType::IR) {
         if (verbose_) {
-            std::cerr << "[jules] IR written to: " << output_file_ << std::endl;
+            std::cerr << "[tether] IR written to: " << output_file_ << std::endl;
         }
         return true;
     }
@@ -66,7 +105,7 @@ bool Driver::compile() {
     // For object and assembly output, we are done after the backend
     if (emit_type_ == EmitType::Object || emit_type_ == EmitType::Assembly) {
         if (verbose_) {
-            std::cerr << "[jules] Output written to: " << output_file_ << std::endl;
+            std::cerr << "[tether] Output written to: " << output_file_ << std::endl;
         }
         return true;
     }
@@ -75,7 +114,7 @@ bool Driver::compile() {
     if (!runLinker())            return false;
 
     if (verbose_) {
-        std::cerr << "[jules] Executable written to: " << output_file_ << std::endl;
+        std::cerr << "[tether] Executable written to: " << output_file_ << std::endl;
     }
 
     return true;
@@ -86,7 +125,7 @@ bool Driver::compile() {
 // ============================================================================
 bool Driver::readSource() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 1: Reading source file..." << std::endl;
+        std::cerr << "[tether] Phase 1: Reading source file..." << std::endl;
     }
 
     std::ifstream file(input_file_);
@@ -107,7 +146,7 @@ bool Driver::readSource() {
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Read " << source_text_.size() << " bytes" << std::endl;
+        std::cerr << "[tether]   Read " << source_text_.size() << " bytes" << std::endl;
     }
 
     return true;
@@ -118,7 +157,7 @@ bool Driver::readSource() {
 // ============================================================================
 bool Driver::runLexer() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 2: Lexical analysis..." << std::endl;
+        std::cerr << "[tether] Phase 2: Lexical analysis..." << std::endl;
     }
 
     Lexer lexer(source_text_, input_file_);
@@ -134,7 +173,7 @@ bool Driver::runLexer() {
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Produced " << tokens_.size() << " tokens" << std::endl;
+        std::cerr << "[tether]   Produced " << tokens_.size() << " tokens" << std::endl;
     }
 
     return true;
@@ -145,7 +184,7 @@ bool Driver::runLexer() {
 // ============================================================================
 bool Driver::runParser() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 3: Parsing..." << std::endl;
+        std::cerr << "[tether] Phase 3: Parsing..." << std::endl;
     }
 
     Parser parser(std::move(tokens_), type_table_);
@@ -153,19 +192,20 @@ bool Driver::runParser() {
     type_annotations_ = parser.typeAnnotations();
     param_type_annotations_ = parser.paramTypeAnnotations();
 
-    if (parser.hasErrors()) {
-        for (const auto& err : parser.errors()) {
-            std::cerr << err.loc.toString() << ": error: " << err.message << std::endl;
-        }
-        error_message_ = "error: parsing failed";
-        return false;
+    // Error-resilient: record errors but don't abort
+    parser_had_errors_ = parser.hasErrors();
+    parse_errors_ = parser.errors();
+
+    if (parser_had_errors_) {
+        // Don't abort - continue with type checking
+        // Errors will be printed at the end of compilation
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Parsed " << program_.size() << " top-level declarations" << std::endl;
+        std::cerr << "[tether]   Parsed " << program_.size() << " top-level declarations" << std::endl;
     }
 
-    return true;
+    return true;  // Always continue for error-resilient compilation
 }
 
 // ============================================================================
@@ -173,34 +213,36 @@ bool Driver::runParser() {
 // ============================================================================
 bool Driver::runSemanticAnalysis() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 4: Semantic analysis..." << std::endl;
+        std::cerr << "[tether] Phase 4: Semantic analysis..." << std::endl;
     }
 
     SemanticAnalyzer analyzer(type_table_);
     analyzer.analyze(program_, type_annotations_, param_type_annotations_);
 
-    if (analyzer.hasErrors()) {
-        for (const auto& diag : analyzer.diagnostics()) {
-            std::cerr << diag.toString() << std::endl;
-        }
-        error_message_ = "error: semantic analysis failed";
-        return false;
+    // Error-resilient: record errors but don't abort
+    sema_had_errors_ = analyzer.hasErrors();
+    sema_diagnostics_ = analyzer.diagnostics();
+
+    if (sema_had_errors_) {
+        // Don't abort - continue with CFG building and borrow checking
     }
 
-    // Also print warnings if verbose
+    // Print warnings immediately (they are not errors)
     if (verbose_) {
-        for (const auto& diag : analyzer.diagnostics()) {
+        for (const auto& diag : sema_diagnostics_) {
             if (diag.isWarning()) {
                 std::cerr << diag.toString() << std::endl;
             }
         }
     }
 
-    if (verbose_) {
-        std::cerr << "[jules]   Semantic analysis passed" << std::endl;
+    if (verbose_ && !sema_had_errors_) {
+        std::cerr << "[tether]   Semantic analysis passed" << std::endl;
+    } else if (verbose_ && sema_had_errors_) {
+        std::cerr << "[tether]   Semantic analysis completed with errors (continuing)" << std::endl;
     }
 
-    return true;
+    return true;  // Always continue for error-resilient compilation
 }
 
 // ============================================================================
@@ -208,7 +250,7 @@ bool Driver::runSemanticAnalysis() {
 // ============================================================================
 bool Driver::runCFGBuilding() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 5: Building CFGs..." << std::endl;
+        std::cerr << "[tether] Phase 5: Building CFGs..." << std::endl;
     }
 
     CFGBuilder builder;
@@ -228,7 +270,7 @@ bool Driver::runCFGBuilding() {
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Built " << cfgs_.size() << " CFGs" << std::endl;
+        std::cerr << "[tether]   Built " << cfgs_.size() << " CFGs" << std::endl;
     }
 
     return true;
@@ -239,25 +281,27 @@ bool Driver::runCFGBuilding() {
 // ============================================================================
 bool Driver::runBorrowChecking() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 6: Borrow checking..." << std::endl;
+        std::cerr << "[tether] Phase 6: Borrow checking..." << std::endl;
     }
 
     BorrowChecker checker;
     checker.checkAll(cfgs_);
 
-    if (checker.hasErrors()) {
-        for (const auto& err : checker.errors()) {
-            std::cerr << err.toString() << std::endl;
-        }
-        error_message_ = "error: borrow checking failed";
-        return false;
+    // Error-resilient: record errors but don't abort
+    borrowck_had_errors_ = checker.hasErrors();
+    borrowck_errors_ = checker.errors();
+
+    if (borrowck_had_errors_) {
+        // Don't abort - continue with IR generation
     }
 
-    if (verbose_) {
-        std::cerr << "[jules]   Borrow checking passed" << std::endl;
+    if (verbose_ && !borrowck_had_errors_) {
+        std::cerr << "[tether]   Borrow checking passed" << std::endl;
+    } else if (verbose_ && borrowck_had_errors_) {
+        std::cerr << "[tether]   Borrow checking completed with errors (continuing)" << std::endl;
     }
 
-    return true;
+    return true;  // Always continue for error-resilient compilation
 }
 
 // ============================================================================
@@ -265,7 +309,7 @@ bool Driver::runBorrowChecking() {
 // ============================================================================
 bool Driver::runIRGeneration() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 7: IR generation..." << std::endl;
+        std::cerr << "[tether] Phase 7: IR generation..." << std::endl;
     }
 
     IRGenerator generator(program_, type_table_);
@@ -278,7 +322,7 @@ bool Driver::runIRGeneration() {
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Generated " << ir_text_.size() << " bytes of LLVM IR" << std::endl;
+        std::cerr << "[tether]   Generated " << ir_text_.size() << " bytes of LLVM IR" << std::endl;
     }
 
     return true;
@@ -289,7 +333,7 @@ bool Driver::runIRGeneration() {
 // ============================================================================
 bool Driver::writeIRFile() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 8: Writing IR file..." << std::endl;
+        std::cerr << "[tether] Phase 8: Writing IR file..." << std::endl;
     }
 
     // Derive the .ll path from the output file
@@ -315,7 +359,7 @@ bool Driver::writeIRFile() {
     out.close();
 
     if (verbose_) {
-        std::cerr << "[jules]   Wrote " << ir_file_path_ << std::endl;
+        std::cerr << "[tether]   Wrote " << ir_file_path_ << std::endl;
     }
 
     return true;
@@ -326,7 +370,7 @@ bool Driver::writeIRFile() {
 // ============================================================================
 bool Driver::runBackend() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 9: Backend compilation..." << std::endl;
+        std::cerr << "[tether] Phase 9: Backend compilation..." << std::endl;
     }
 
     std::string clang = findClang();
@@ -394,7 +438,7 @@ bool Driver::runBackend() {
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Running: " << cmd.str() << std::endl;
+        std::cerr << "[tether]   Running: " << cmd.str() << std::endl;
     }
 
     int ret = std::system(cmd.str().c_str());
@@ -429,7 +473,7 @@ bool Driver::runBackend() {
     }
 
     if (verbose_) {
-        std::cerr << "[jules]   Backend compilation succeeded" << std::endl;
+        std::cerr << "[tether]   Backend compilation succeeded" << std::endl;
     }
 
     return true;
@@ -440,7 +484,7 @@ bool Driver::runBackend() {
 // ============================================================================
 bool Driver::runLinker() {
     if (verbose_) {
-        std::cerr << "[jules] Phase 10: Linking..." << std::endl;
+        std::cerr << "[tether] Phase 10: Linking..." << std::endl;
     }
 
     std::string clang = findClang();
@@ -489,6 +533,20 @@ bool Driver::runLinker() {
     std::ostringstream cmd;
     cmd << clang;
     cmd << " -O" << opt_level_;
+
+    // PGO: profile-generate / profile-use flags
+    if (profile_generate_) {
+        cmd << " -fprofile-generate";
+    }
+    if (!profile_use_.empty()) {
+        cmd << " -fprofile-use=" << profile_use_;
+    }
+
+    // Target triple for cross-compilation
+    if (!target_triple_.empty()) {
+        cmd << " -target " << target_triple_;
+    }
+
     cmd << " " << obj_path;
 
     if (!runtime_lib.empty()) {
@@ -499,7 +557,7 @@ bool Driver::runLinker() {
     cmd << " -o " << output_file_;
 
     if (verbose_) {
-        std::cerr << "[jules]   Running: " << cmd.str() << std::endl;
+        std::cerr << "[tether]   Running: " << cmd.str() << std::endl;
     }
 
     int ret = std::system(cmd.str().c_str());
@@ -514,7 +572,7 @@ bool Driver::runLinker() {
     removeFile(obj_path);
 
     if (verbose_) {
-        std::cerr << "[jules]   Linking succeeded" << std::endl;
+        std::cerr << "[tether]   Linking succeeded" << std::endl;
     }
 
     return true;

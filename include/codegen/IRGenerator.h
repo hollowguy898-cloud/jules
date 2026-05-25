@@ -166,6 +166,7 @@ private:
     // =======================================================================
     TypeId      current_return_type_;
     bool        current_can_error_   = false;
+    bool        current_fn_has_simd_ = false;
     std::string current_fn_name_;
     std::string current_ret_alloca_; // alloca for the aggregate return value
 
@@ -198,6 +199,10 @@ private:
 
     // Returns the metadata-id for the given key, allocating one if needed.
     int getMetadataId(const std::string& key);
+
+    // Emits @simd loop vectorization metadata and returns the metadata ID
+    // for the loop annotation node (e.g. !llvm.loop !N).
+    int emitSimdLoopMetadata();
 };
 
 } // namespace jules

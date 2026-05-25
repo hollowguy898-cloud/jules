@@ -4,7 +4,9 @@
 #include "ast/AST.h"
 #include "parser/Parser.h"
 #include "sema/Type.h"
+#include "sema/SemanticAnalyzer.h"
 #include "cfg/CFG.h"
+#include "borrowck/BorrowChecker.h"
 
 #include <string>
 #include <vector>
@@ -50,12 +52,18 @@ public:
     // opt_level:   optimization level 0-3
     // emit_type:   what to emit (object, assembly, IR, executable)
     // verbose:     print each compilation phase as it runs
+    // profile_generate: pass -fprofile-generate to clang for PGO
+    // profile_use: path to profile data for -fprofile-use
+    // target_triple: cross-compilation target (x86_64, aarch64, riscv64, wasm32)
     // -----------------------------------------------------------------------
     Driver(const std::string& input_file,
            const std::string& output_file,
            int opt_level,
            EmitType emit_type,
-           bool verbose);
+           bool verbose,
+           bool profile_generate = false,
+           const std::string& profile_use = "",
+           const std::string& target_triple = "");
 
     // -----------------------------------------------------------------------
     // Run the full compilation pipeline.
@@ -110,6 +118,9 @@ private:
     int opt_level_;            // 0-3
     EmitType emit_type_;
     bool verbose_;
+    bool profile_generate_;    // -fprofile-generate
+    std::string profile_use_;  // -fprofile-use=path
+    std::string target_triple_; // cross-compilation target
 
     // -----------------------------------------------------------------------
     // Intermediate data (populated during compilation)
@@ -131,6 +142,14 @@ private:
     // Error state
     // -----------------------------------------------------------------------
     std::string error_message_;
+
+    // Error-resilient compilation: track errors from each phase
+    bool parser_had_errors_ = false;
+    bool sema_had_errors_ = false;
+    bool borrowck_had_errors_ = false;
+    std::vector<ParseError> parse_errors_;
+    std::vector<Diagnostic> sema_diagnostics_;
+    std::vector<BorrowError> borrowck_errors_;
 };
 
 } // namespace jules

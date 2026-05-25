@@ -55,6 +55,8 @@ bool IRGenerator::isAggregateType(TypeId type) const {
         }
         case TypeKind::Error:
             return true;
+        case TypeKind::Poison:
+            return false;
         default:
             return false;
     }
@@ -105,6 +107,7 @@ uint64_t IRGenerator::typeSizeBytes(TypeId type) const {
             return vs + 1;
         }
         case TypeKind::Fn: return 8;
+        case TypeKind::Poison: return 0;
         default: return 8;
     }
 }
@@ -133,6 +136,7 @@ uint64_t IRGenerator::typeAlignmentBytes(TypeId type) const {
         case TypeKind::SmartPointer: return 8;
         case TypeKind::Error:        return 8;
         case TypeKind::Fn:           return 8;
+        case TypeKind::Poison:        return 1;
         default:                     return 8;
     }
 }
@@ -204,6 +208,8 @@ std::string IRGenerator::llvmType(TypeId type) const {
         }
         case TypeKind::Fn:
             return "ptr";
+        case TypeKind::Poison:
+            return "i32";  // stub type for poison – keeps LLVM IR structurally valid
         default:
             return "ptr";
     }
@@ -320,6 +326,8 @@ void IRGenerator::collectNeededTypes(TypeId type) {
             if (ft.canError()) collectNeededTypes(ft.errorType());
             break;
         }
+        case TypeKind::Poison:
+            break;  // nothing to collect for poison types
         default: break;
     }
 }
@@ -525,6 +533,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     current_can_error_ = fn->canError();
     current_fn_name_ = fn->name();
     current_ret_alloca_.clear();
+    current_fn_has_simd_ = fn->hasDirective(CompilerDirective::Simd);
 
     alloca_ss_.str("");
     body_ss_.str("");
@@ -539,13 +548,21 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     for (size_t i = 0; i < fn->paramCount(); ++i) {
         const auto& p = fn->params()[i];
         if (i > 0) sig += ", ";
-        sig += llvmParamType(p.type) + " %" + sanitizeName(p.name);
+        sig += llvmParamType(p.type);
+        // Automatic noalias on &mut parameters
+        if (p.type && isa<MutReferenceType>(p.type)) {
+            sig += " noalias";
+        }
+        sig += " %" + sanitizeName(p.name);
     }
     sig += ")";
 
     // Function-level attributes
     if (fn->isPure()) {
         sig += " memory(none) nounwind";
+    } else if (!fn->canError()) {
+        // Add nounwind to functions that can't throw errors
+        sig += " nounwind";
     }
 
     // Metadata for directives
@@ -555,6 +572,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         switch (d) {
             case CompilerDirective::Superoptimize: key = "jules.superoptimize"; break;
             case CompilerDirective::Polly:         key = "jules.polly"; break;
+            case CompilerDirective::Simd:          key = "jules.simd"; break;
         }
         int id = getMetadataId(key);
         metadata_suffix += " !" + std::to_string(id);
@@ -567,9 +585,14 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             const auto& p = fn->params()[i];
             if (i > 0) module_out_ << ", ";
             module_out_ << llvmParamType(p.type);
+            // Automatic noalias on &mut parameters
+            if (p.type && isa<MutReferenceType>(p.type)) {
+                module_out_ << " noalias";
+            }
         }
         module_out_ << ")";
         if (fn->isPure()) module_out_ << " memory(none) nounwind";
+        else if (!fn->canError()) module_out_ << " nounwind";
         module_out_ << "\n\n";
         return;
     }
@@ -797,7 +820,13 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             emitBlockStmt(ws.body());
             if (!isTerminated()) {
                 if (ws.hasIncrement()) emitExpr(ws.increment());
-                body_ss_ << "  br label %" << cond_l << "\n";
+                // @simd loop vectorization metadata
+                if (current_fn_has_simd_) {
+                    int loop_md_id = emitSimdLoopMetadata();
+                    body_ss_ << "  br label %" << cond_l << ", !llvm.loop !" << loop_md_id << "\n";
+                } else {
+                    body_ss_ << "  br label %" << cond_l << "\n";
+                }
             }
             setTerminated(false);
 
@@ -916,6 +945,14 @@ void IRGenerator::emitStmt(Stmt* stmt) {
 // ============================================================================
 std::string IRGenerator::emitExpr(Expr* expr) {
     if (!expr) return "0";
+
+    // If the expression's type is PoisonType, emit a stub value instead of
+    // trying to generate real code for a type that doesn't exist in LLVM.
+    if (expr->hasType() && expr->getType() && isa<PoisonType>(expr->getType())) {
+        auto reg = nextReg();
+        body_ss_ << "  " << reg << " = add i32 0, 0 ; poison type stub\n";
+        return reg;
+    }
 
     switch (expr->getKind()) {
 
@@ -1584,6 +1621,17 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         return emitExpr(us.inner());
     }
 
+    // ========================================================================
+    // Poison expression – stub lowering
+    // ========================================================================
+    case NodeKind::PoisonExpr: {
+        // Stub lowering: emit a dummy 0 value so LLVM IR stays valid.
+        // This allows the rest of the function to be compiled and analyzed.
+        auto reg = nextReg();
+        body_ss_ << "  " << reg << " = add i32 0, 0 ; poison stub\n";
+        return reg;
+    }
+
     default: break;
     }
 
@@ -2118,6 +2166,38 @@ std::string IRGenerator::emitAllocatorCall(Expr* allocator_expr, TypeId alloc_ty
     std::string result = nextReg();
     body_ss_ << "  " << result << " = call ptr " << afn << "(i64 " << ts << ")\n";
     return result;
+}
+
+// ============================================================================
+// emitSimdLoopMetadata – create @simd loop vectorization metadata
+// ============================================================================
+int IRGenerator::emitSimdLoopMetadata() {
+    // Check if we already have a cached SIMD loop metadata node
+    auto it = metadata_map_.find("llvm.loop.simd");
+    if (it != metadata_map_.end()) return it->second;
+
+    // Create individual metadata entries for each vectorization hint
+    int enable_id    = metadata_counter_++;
+    int width_id     = metadata_counter_++;
+    int interleave_id = metadata_counter_++;
+
+    metadata_entries_.push_back({enable_id,
+        "!{!\"llvm.loop.vectorize.enable\", i32 1}"});
+    metadata_entries_.push_back({width_id,
+        "!{!\"llvm.loop.vectorize.width\", i32 4}"});
+    metadata_entries_.push_back({interleave_id,
+        "!{!\"llvm.loop.interleave.count\", i32 2}"});
+
+    // Create the loop metadata grouping node (distinct, self-referencing)
+    int loop_id = metadata_counter_++;
+    std::string content = "distinct !{!" + std::to_string(loop_id)
+        + ", !" + std::to_string(enable_id)
+        + ", !" + std::to_string(width_id)
+        + ", !" + std::to_string(interleave_id) + "}";
+    metadata_entries_.push_back({loop_id, content});
+
+    metadata_map_["llvm.loop.simd"] = loop_id;
+    return loop_id;
 }
 
 } // namespace jules

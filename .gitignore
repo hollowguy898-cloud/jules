@@ -11,3 +11,4 @@ julesc
 benchmark_runner
 *.ll
 .d
+tetherc

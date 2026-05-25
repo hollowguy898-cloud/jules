@@ -414,6 +414,14 @@ void SemanticAnalyzer::analyzeVarDeclStmt(VarDeclStmt& vd) {
         init_type = analyzeExpr(*vd.init());
     }
 
+    // If the initializer is Poison, use Poison as the variable type
+    // without emitting a new error
+    if (isPoisonType(init_type)) {
+        TypeId poison = type_table_.getPoison();
+        symtab_.declareVar(vd.name(), poison, vd.sourceLoc());
+        return;
+    }
+
     TypeId var_type = vd.declaredType();
     if (var_type.isNull()) {
         // Infer type from initializer
@@ -453,6 +461,14 @@ void SemanticAnalyzer::analyzeValDeclStmt(ValDeclStmt& vd) {
         init_type = analyzeExpr(*vd.init());
     }
 
+    // If the initializer is Poison, use Poison as the value type
+    // without emitting a new error
+    if (isPoisonType(init_type)) {
+        TypeId poison = type_table_.getPoison();
+        symtab_.declareVal(vd.name(), poison, vd.sourceLoc());
+        return;
+    }
+
     TypeId var_type = vd.declaredType();
     if (var_type.isNull()) {
         if (init_type.isNull()) {
@@ -482,6 +498,11 @@ void SemanticAnalyzer::analyzeValDeclStmt(ValDeclStmt& vd) {
 void SemanticAnalyzer::analyzeAssignStmt(AssignStmt& as) {
     TypeId target_type = analyzeExpr(*as.target());
     TypeId value_type = analyzeExpr(*as.value());
+
+    // If either side is Poison, suppress further errors
+    if (isPoisonType(target_type) || isPoisonType(value_type)) {
+        return;
+    }
 
     if (target_type.isNull() || value_type.isNull()) {
         return; // errors already reported
@@ -523,7 +544,9 @@ void SemanticAnalyzer::analyzeDeferStmt(DeferStmt& ds) {
 
 void SemanticAnalyzer::analyzeIfStmt(IfStmt& is) {
     TypeId cond_type = analyzeExpr(*is.condition());
-    if (!cond_type.isNull() && !cond_type->isBool()) {
+    if (isPoisonType(cond_type)) {
+        // Poison: still analyze branches but suppress condition error
+    } else if (!cond_type.isNull() && !cond_type->isBool()) {
         emitError(is.sourceLoc(),
                   "if condition must be 'bool', got '" + cond_type->toString() + "'");
     }
@@ -536,7 +559,9 @@ void SemanticAnalyzer::analyzeIfStmt(IfStmt& is) {
 
 void SemanticAnalyzer::analyzeWhileStmt(WhileStmt& ws) {
     TypeId cond_type = analyzeExpr(*ws.condition());
-    if (!cond_type.isNull() && !cond_type->isBool()) {
+    if (isPoisonType(cond_type)) {
+        // Poison: still analyze body but suppress condition error
+    } else if (!cond_type.isNull() && !cond_type->isBool()) {
         emitError(ws.sourceLoc(),
                   "while condition must be 'bool', got '" + cond_type->toString() + "'");
     }
@@ -560,6 +585,10 @@ void SemanticAnalyzer::analyzeReturnStmt(ReturnStmt& rs) {
     TypeId ret_type = current_fn_->returnType();
     if (rs.hasValue()) {
         TypeId value_type = analyzeExpr(*rs.value());
+        // If return value is Poison, suppress further errors
+        if (isPoisonType(value_type)) {
+            return;
+        }
         if (!value_type.isNull() && !ret_type.isNull() && !typesCompatible(ret_type, value_type)) {
             emitError(rs.sourceLoc(),
                       "return type mismatch: expected '" + ret_type->toString() +
@@ -596,6 +625,11 @@ void SemanticAnalyzer::analyzeExprStmt(ExprStmt& es) {
 // ============================================================================
 
 TypeId SemanticAnalyzer::analyzeExpr(Expr& expr) {
+    // Handle PoisonExpr: propagate Poison type without emitting a new error
+    if (expr.getKind() == NodeKind::PoisonExpr) {
+        return analyzePoisonExpr(static_cast<PoisonExpr&>(expr));
+    }
+
     switch (expr.getKind()) {
         case NodeKind::IntLiteral:
             return analyzeIntLiteral(static_cast<IntLiteral&>(expr));
@@ -633,9 +667,11 @@ TypeId SemanticAnalyzer::analyzeExpr(Expr& expr) {
             return analyzeSizeofExpr(static_cast<SizeofExpr&>(expr));
         case NodeKind::UnsafeExpr:
             return analyzeUnsafeExpr(static_cast<UnsafeExpr&>(expr));
+        case NodeKind::PoisonExpr:
+            return analyzePoisonExpr(static_cast<PoisonExpr&>(expr));
         default:
             emitError(expr.sourceLoc(), "unknown expression kind");
-            return TypeId();
+            return type_table_.getPoison();
     }
 }
 
@@ -689,6 +725,13 @@ TypeId SemanticAnalyzer::analyzeIdentExpr(IdentExpr& ie) {
 TypeId SemanticAnalyzer::analyzeBinaryExpr(BinaryExpr& be) {
     TypeId lhs_type = analyzeExpr(*be.left());
     TypeId rhs_type = analyzeExpr(*be.right());
+
+    // If either operand is Poison, propagate without emitting a new error
+    if (isPoisonType(lhs_type) || isPoisonType(rhs_type)) {
+        auto result = type_table_.getPoison();
+        be.setType(result);
+        return result;
+    }
 
     if (lhs_type.isNull() || rhs_type.isNull()) {
         // Propagate error type
@@ -814,6 +857,13 @@ TypeId SemanticAnalyzer::analyzeBinaryExpr(BinaryExpr& be) {
 TypeId SemanticAnalyzer::analyzeUnaryExpr(UnaryExpr& ue) {
     TypeId operand_type = analyzeExpr(*ue.operand());
 
+    // If the operand is Poison, propagate without emitting a new error
+    if (isPoisonType(operand_type)) {
+        auto result = type_table_.getPoison();
+        ue.setType(result);
+        return result;
+    }
+
     if (operand_type.isNull()) {
         ue.setType(TypeId());
         return TypeId();
@@ -910,6 +960,13 @@ TypeId SemanticAnalyzer::analyzeCallExpr(CallExpr& ce) {
         arg_types.push_back(analyzeExpr(*arg));
     }
 
+    // If callee is Poison, propagate without emitting a new error
+    if (isPoisonType(callee_type)) {
+        auto result = type_table_.getPoison();
+        ce.setType(result);
+        return result;
+    }
+
     if (callee_type.isNull()) {
         ce.setType(TypeId());
         return TypeId();
@@ -981,6 +1038,13 @@ TypeId SemanticAnalyzer::analyzeCallExpr(CallExpr& ce) {
 TypeId SemanticAnalyzer::analyzeMemberExpr(MemberExpr& me) {
     TypeId obj_type = analyzeExpr(*me.object());
 
+    // If the object is Poison, propagate without emitting a new error
+    if (isPoisonType(obj_type)) {
+        auto result = type_table_.getPoison();
+        me.setType(result);
+        return result;
+    }
+
     if (obj_type.isNull()) {
         me.setType(TypeId());
         return TypeId();
@@ -1021,6 +1085,13 @@ TypeId SemanticAnalyzer::analyzeMemberExpr(MemberExpr& me) {
 TypeId SemanticAnalyzer::analyzeIndexExpr(IndexExpr& ie) {
     TypeId obj_type = analyzeExpr(*ie.object());
     TypeId idx_type = analyzeExpr(*ie.index());
+
+    // If either operand is Poison, propagate without emitting a new error
+    if (isPoisonType(obj_type) || isPoisonType(idx_type)) {
+        auto result = type_table_.getPoison();
+        ie.setType(result);
+        return result;
+    }
 
     if (obj_type.isNull()) {
         ie.setType(TypeId());
@@ -1567,6 +1638,14 @@ std::optional<std::string> SemanticAnalyzer::getLValueName(Expr& expr) const {
         return getLValueName(*index->object());
     }
     return std::nullopt;
+}
+
+TypeId SemanticAnalyzer::analyzePoisonExpr(PoisonExpr& pe) {
+    // PoisonExpr represents a previously reported error.
+    // Return the Poison type without emitting a new error to avoid cascading.
+    auto result = type_table_.getPoison();
+    pe.setType(result);
+    return result;
 }
 
 } // namespace jules

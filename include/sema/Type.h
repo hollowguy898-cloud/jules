@@ -56,6 +56,7 @@ enum class TypeKind : uint8_t {
     Slice,
     Fn,
     SmartPointer,
+    Poison,
     Error,
     Allocator
 };
@@ -109,6 +110,7 @@ class MutReferenceType;
 class SliceType;
 class FnType;
 class SmartPointerType;
+class PoisonType;
 class ErrorType;
 class AllocatorType;
 
@@ -153,6 +155,9 @@ public:
 
     // Check if this is an error type
     virtual bool isError() const { return false; }
+
+    // Check if this is a poison type (from erroneous expressions)
+    virtual bool isPoison() const { return false; }
 
     // LLVM-style RTTI support
     static bool classof(const Type*) { return true; }
@@ -612,6 +617,30 @@ private:
 };
 
 // ============================================================================
+// PoisonType - represents an erroneous/unresolvable type
+//
+// When the parser or type-checker encounters an invalid piece of code, it
+// replaces the type with PoisonType instead of aborting. This allows the
+// compiler to continue analyzing the rest of the file and collect all errors
+// in a single pass (error-resilient compilation).
+// ============================================================================
+class PoisonType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Poison;
+    }
+
+    PoisonType() : Type(TypeKind::Poison) {}
+
+    std::string toString() const override {
+        return "<poison>";
+    }
+
+    bool isError() const override { return true; }
+    bool isPoison() const override { return true; }
+};
+
+// ============================================================================
 // ErrorType - represents T! or !T (error union type)
 // ============================================================================
 class ErrorType : public Type {
@@ -721,6 +750,13 @@ public:
             type_map_[std::move(key)] = std::move(type);
         }
 
+        // Pre-intern the poison type
+        {
+            auto type = std::make_unique<PoisonType>();
+            poison_type_ = type.get();
+            type_map_[type->toString()] = std::move(type);
+        }
+
         // Pre-intern the allocator type
         {
             auto type = std::make_unique<AllocatorType>();
@@ -760,6 +796,11 @@ public:
     TypeId getPrimitive(PrimitiveKind kind) const {
         return TypeId(primitive_cache_[static_cast<uint8_t>(kind)]);
     }
+
+    // -----------------------------------------------------------------------
+    // Poison type accessor
+    // -----------------------------------------------------------------------
+    TypeId getPoison() const { return TypeId(poison_type_); }
 
     // -----------------------------------------------------------------------
     // Allocator type accessor
@@ -962,6 +1003,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Type>> type_map_;
     std::unordered_map<std::string, TypeId> name_aliases_;
     const Type* primitive_cache_[static_cast<uint8_t>(PrimitiveKind::Count)] = {};
+    const Type* poison_type_ = nullptr;
     const Type* allocator_type_ = nullptr;
 };
 

@@ -171,6 +171,7 @@ private:
     TypeId analyzeArrayInitExpr(ArrayInitExpr& aie);
     TypeId analyzeSizeofExpr(SizeofExpr& se);
     TypeId analyzeUnsafeExpr(UnsafeExpr& ue);
+    TypeId analyzePoisonExpr(PoisonExpr& pe);
 
     // -----------------------------------------------------------------------
     // Type checking helpers
@@ -211,6 +212,11 @@ private:
 
     // Check if a type is or wraps an error type
     bool isErrorType(TypeId t) const;
+
+    // Check if a TypeId points to a PoisonType (error-resilient compilation)
+    bool isPoisonType(TypeId tid) const {
+        return tid && isa<PoisonType>(*tid.raw());
+    }
 
     // -----------------------------------------------------------------------
     // Pure function validation

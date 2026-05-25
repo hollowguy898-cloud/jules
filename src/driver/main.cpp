@@ -24,6 +24,9 @@ static void printUsage(const char* prog_name) {
         << "  --emit-asm        Emit assembly (.s)\n"
         << "  --emit-ir         Emit LLVM IR (.ll)\n"
         << "  --emit-exe        Emit an executable (default)\n"
+        << "  --profile-generate  Generate PGO profile data (-fprofile-generate)\n"
+        << "  --profile-use <path> Use PGO profile data (-fprofile-use)\n"
+        << "  --target <triple>  Cross-compilation target (x86_64, aarch64, riscv64, wasm32)\n"
         << "  -v                Verbose mode (print each phase)\n"
         << "  --help            Show this help message\n"
         << "\n"
@@ -32,6 +35,8 @@ static void printUsage(const char* prog_name) {
         << "  " << prog_name << " -O2 -o hello hello.jl         # Compile with -O2\n"
         << "  " << prog_name << " --emit-ir hello.jl            # Emit LLVM IR to hello.ll\n"
         << "  " << prog_name << " --emit-asm -v hello.jl        # Emit assembly with verbose output\n"
+        << "  " << prog_name << " --profile-generate hello.jl   # Generate PGO profile\n"
+        << "  " << prog_name << " --target aarch64 hello.jl     # Cross-compile for AArch64\n"
         << std::endl;
 }
 
@@ -49,6 +54,9 @@ int main(int argc, char* argv[]) {
     int opt_level = 0;
     EmitType emit_type = EmitType::Executable;  // default: produce an executable
     bool verbose = false;
+    bool profile_generate = false;
+    std::string profile_use;
+    std::string target_triple;
 
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -89,6 +97,23 @@ int main(int argc, char* argv[]) {
         else if (arg == "--emit-exe") {
             emit_type = EmitType::Executable;
         }
+        else if (arg == "--profile-generate") {
+            profile_generate = true;
+        }
+        else if (arg == "--profile-use") {
+            if (i + 1 >= argc) {
+                std::cerr << "error: --profile-use requires an argument" << std::endl;
+                return 1;
+            }
+            profile_use = argv[++i];
+        }
+        else if (arg == "--target") {
+            if (i + 1 >= argc) {
+                std::cerr << "error: --target requires an argument" << std::endl;
+                return 1;
+            }
+            target_triple = argv[++i];
+        }
         else if (arg == "-v") {
             verbose = true;
         }
@@ -115,8 +140,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Validate target triple if specified
+    if (!target_triple.empty()) {
+        if (target_triple != "x86_64" && target_triple != "aarch64" &&
+            target_triple != "riscv64" && target_triple != "wasm32") {
+            std::cerr << "warning: unrecognized target triple '" << target_triple
+                      << "'; passing to clang as-is" << std::endl;
+        }
+    }
+
     // Create the driver and run the compilation pipeline
-    Driver driver(input_file, output_file, opt_level, emit_type, verbose);
+    Driver driver(input_file, output_file, opt_level, emit_type, verbose,
+                  profile_generate, profile_use, target_triple);
 
     bool success = driver.compile();
     if (!success) {
