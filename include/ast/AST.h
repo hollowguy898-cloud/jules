@@ -117,6 +117,9 @@ enum class NodeKind : uint16_t {
     UnsafeExpr,
     PoisonExpr,
     TryExpr,
+    // v0.2 expansion expressions
+    ComptimeExpr,     // Compile-time evaluation: comptime expr
+    ReduceExpr,       // Parallel reduction: reduce(op, expr, axis=N)
     // Statements
     VarDeclStmt,
     ValDeclStmt,
@@ -132,11 +135,17 @@ enum class NodeKind : uint16_t {
     ErrdeferStmt,
     AtomicStmt,
     YieldStmt,
+    // v0.2 expansion statements
+    SwitchStmt,       // Exhaustive pattern matching on enums
+    SpawnStmt,        // Structured async task dispatch
     // Top-level declarations
     FnDecl,
     StructDecl,
     EnumDecl,
     ImportDecl,
+    // v0.2 expansion top-level declarations
+    TraitDecl,        // Shared behavior contracts
+    ImplDecl,         // Trait/behavior implementation
 };
 
 // ============================================================================
@@ -219,7 +228,7 @@ public:
 
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::IntLiteral && k <= NodeKind::TryExpr;
+        return k >= NodeKind::IntLiteral && k <= NodeKind::ReduceExpr;
     }
 
 protected:
@@ -237,7 +246,7 @@ class Stmt : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::VarDeclStmt && k <= NodeKind::YieldStmt;
+        return k >= NodeKind::VarDeclStmt && k <= NodeKind::SpawnStmt;
     }
 
 protected:
@@ -252,7 +261,7 @@ class TopLevel : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::FnDecl && k <= NodeKind::ImportDecl;
+        return k >= NodeKind::FnDecl && k <= NodeKind::ImplDecl;
     }
 
 protected:
@@ -796,6 +805,80 @@ private:
     std::unique_ptr<Expr> operand_;
 };
 
+// ---- ComptimeExpr ----
+// Compile-time evaluation: comptime expr or comptime { block }
+// Forces the enclosed expression or block to be fully evaluated during compilation.
+// If evaluation fails or depends on runtime values, the compiler emits an error.
+// This is the Zig-style secret weapon: eliminates macro languages entirely.
+class ComptimeExpr : public Expr {
+public:
+    // comptime can wrap either a single expression or a block
+    ComptimeExpr(SourceLocation loc, std::unique_ptr<Expr> inner)
+        : Expr(NodeKind::ComptimeExpr, std::move(loc))
+        , inner_(std::move(inner))
+    {}
+
+    Expr* inner() { return inner_.get(); }
+    const Expr* inner() const { return inner_.get(); }
+    std::unique_ptr<Expr> takeInner() { return std::move(inner_); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::ComptimeExpr;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Expr> inner_;
+};
+
+// ---- ReduceExpr ----
+// Hardware-native parallel reduction: reduce(op, iterable, axis=N)
+// Emits optimized vector reduction trees (tree-reduction for SIMD lanes)
+// without branch penalty. The op is a reduction operation (add, max, min, etc.)
+// and axis specifies the reduction dimension for multi-dimensional data.
+class ReduceExpr : public Expr {
+public:
+    enum class ReduceOp : uint8_t {
+        Add,    // Sum reduction
+        Mul,    // Product reduction
+        Max,    // Maximum reduction
+        Min,    // Minimum reduction
+        And,    // Logical AND reduction
+        Or,     // Logical OR reduction
+        BitAnd, // Bitwise AND reduction
+        BitOr   // Bitwise OR reduction
+    };
+
+    ReduceExpr(SourceLocation loc, ReduceOp op, std::unique_ptr<Expr> iterable,
+               std::unique_ptr<Expr> axis = nullptr)
+        : Expr(NodeKind::ReduceExpr, std::move(loc))
+        , op_(op)
+        , iterable_(std::move(iterable))
+        , axis_(std::move(axis))
+    {}
+
+    ReduceOp op() const { return op_; }
+    Expr* iterable() { return iterable_.get(); }
+    const Expr* iterable() const { return iterable_.get(); }
+    Expr* axis() { return axis_.get(); }
+    const Expr* axis() const { return axis_.get(); }
+    bool hasAxis() const { return axis_ != nullptr; }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::ReduceExpr;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    ReduceOp op_;
+    std::unique_ptr<Expr> iterable_;
+    std::unique_ptr<Expr> axis_;
+};
+
 // ============================================================================
 // Statement Nodes
 // ============================================================================
@@ -1039,6 +1122,68 @@ private:
     std::unique_ptr<Expr> value_;
 };
 
+// ---- SwitchStmt ----
+// Exhaustive pattern matching on enums: switch (expr) { pattern => body, ... }
+// Compiles into highly optimized hardware jump tables or branchless cascades.
+// The compiler enforces exhaustive checking: every enum variant must be handled.
+struct SwitchArm {
+    std::unique_ptr<Expr> pattern;  // Pattern to match (enum variant, literal, or _)
+    std::unique_ptr<BlockStmt> body;
+};
+
+class SwitchStmt : public Stmt {
+public:
+    SwitchStmt(SourceLocation loc, std::unique_ptr<Expr> subject,
+               std::vector<SwitchArm> arms)
+        : Stmt(NodeKind::SwitchStmt, std::move(loc))
+        , subject_(std::move(subject))
+        , arms_(std::move(arms))
+    {}
+
+    Expr* subject() { return subject_.get(); }
+    const Expr* subject() const { return subject_.get(); }
+    const std::vector<SwitchArm>& arms() const { return arms_; }
+    std::vector<SwitchArm>& arms() { return arms_; }
+    size_t armCount() const { return arms_.size(); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::SwitchStmt;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Expr> subject_;
+    std::vector<SwitchArm> arms_;
+};
+
+// ---- SpawnStmt ----
+// Structured async task dispatch: spawn expr;
+// Schedules a function directly onto a lock-free work-stealing thread pool.
+// Returns a handle that can be awaited for the result.
+class SpawnStmt : public Stmt {
+public:
+    SpawnStmt(SourceLocation loc, std::unique_ptr<Expr> task)
+        : Stmt(NodeKind::SpawnStmt, std::move(loc))
+        , task_(std::move(task))
+    {}
+
+    Expr* task() { return task_.get(); }
+    const Expr* task() const { return task_.get(); }
+    std::unique_ptr<Expr> takeTask() { return std::move(task_); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::SpawnStmt;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Expr> task_;
+};
+
 // ---- IfStmt ----
 class IfStmt : public Stmt {
 public:
@@ -1233,6 +1378,8 @@ public:
         , return_type_(return_type)
         , body_(std::move(body))
         , is_pure_(is_pure)
+        , is_inline_(false)
+        , is_noalloc_(false)
         , error_type_(error_type)
         , directives_(std::move(directives))
     {}
@@ -1247,6 +1394,10 @@ public:
     const BlockStmt* body() const { return body_.get(); }
     std::unique_ptr<BlockStmt> takeBody() { return std::move(body_); }
     bool isPure() const { return is_pure_; }
+    bool isInline() const { return is_inline_; }
+    void setInline(bool v) { is_inline_ = v; }
+    bool isNoalloc() const { return is_noalloc_; }
+    void setNoalloc(bool v) { is_noalloc_ = v; }
     TypeId errorType() const { return error_type_; }
     bool canError() const { return !error_type_.isNull(); }
     const std::vector<CompilerDirective>& directives() const { return directives_; }
@@ -1281,6 +1432,8 @@ private:
     TypeId return_type_;
     std::unique_ptr<BlockStmt> body_;
     bool is_pure_;
+    bool is_inline_;
+    bool is_noalloc_;
     TypeId error_type_;
     std::vector<CompilerDirective> directives_;
 };
@@ -1381,6 +1534,79 @@ private:
     std::string path_;
 };
 
+// ---- TraitMethodDecl - method signature in a trait ----
+struct TraitMethodDecl {
+    std::string name;
+    std::vector<FnParam> params;
+    TypeId return_type;
+    TypeId error_type;
+    SourceLocation loc;
+};
+
+// ---- TraitDecl ----
+// Shared behavior contract: trait Name { fn method(...); ... }
+// Enables zero-overhead polymorphism through compile-time monomorphization
+// rather than traditional v-tables. Traits define interface contracts that
+// structs can implement via `impl`.
+class TraitDecl : public TopLevel {
+public:
+    TraitDecl(SourceLocation loc, std::string name,
+              std::vector<TraitMethodDecl> methods)
+        : TopLevel(NodeKind::TraitDecl, std::move(loc))
+        , name_(std::move(name))
+        , methods_(std::move(methods))
+    {}
+
+    const std::string& name() const { return name_; }
+    const std::vector<TraitMethodDecl>& methods() const { return methods_; }
+    size_t methodCount() const { return methods_.size(); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::TraitDecl;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::string name_;
+    std::vector<TraitMethodDecl> methods_;
+};
+
+// ---- ImplDecl ----
+// Trait/behavior implementation: impl TraitName for StructName { ... }
+// or: impl StructName { ... } (inherent impl)
+// Cleanly couples methods and layout traits to data paradigms without
+// structural coupling — keeping data declarations separated from behavior.
+class ImplDecl : public TopLevel {
+public:
+    ImplDecl(SourceLocation loc, std::string trait_name, std::string struct_name,
+             std::vector<std::unique_ptr<FnDecl>> methods)
+        : TopLevel(NodeKind::ImplDecl, std::move(loc))
+        , trait_name_(std::move(trait_name))
+        , struct_name_(std::move(struct_name))
+        , methods_(std::move(methods))
+    {}
+
+    const std::string& traitName() const { return trait_name_; }
+    bool hasTrait() const { return !trait_name_.empty(); }
+    const std::string& structName() const { return struct_name_; }
+    const std::vector<std::unique_ptr<FnDecl>>& methods() const { return methods_; }
+    size_t methodCount() const { return methods_.size(); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::ImplDecl;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::string trait_name_;    // Empty for inherent impl (impl StructName { })
+    std::string struct_name_;
+    std::vector<std::unique_ptr<FnDecl>> methods_;
+};
+
 // ============================================================================
 // Visitor base classes (abstract, for dynamic dispatch)
 // ============================================================================
@@ -1410,6 +1636,8 @@ public:
     virtual void visitUnsafeExpr(UnsafeExpr&) {}
     virtual void visitPoisonExpr(PoisonExpr&) {}
     virtual void visitTryExpr(TryExpr&) {}
+    virtual void visitComptimeExpr(ComptimeExpr&) {}
+    virtual void visitReduceExpr(ReduceExpr&) {}
 
     // Statement visitors
     virtual void visitVarDeclStmt(VarDeclStmt&) {}
@@ -1426,12 +1654,16 @@ public:
     virtual void visitErrdeferStmt(ErrdeferStmt&) {}
     virtual void visitAtomicStmt(AtomicStmt&) {}
     virtual void visitYieldStmt(YieldStmt&) {}
+    virtual void visitSwitchStmt(SwitchStmt&) {}
+    virtual void visitSpawnStmt(SpawnStmt&) {}
 
     // Top-level visitors
     virtual void visitFnDecl(FnDecl&) {}
     virtual void visitStructDecl(StructDecl&) {}
     virtual void visitEnumDecl(EnumDecl&) {}
     virtual void visitImportDecl(ImportDecl&) {}
+    virtual void visitTraitDecl(TraitDecl&) {}
+    virtual void visitImplDecl(ImplDecl&) {}
 };
 
 class ConstASTVisitor {
@@ -1459,6 +1691,8 @@ public:
     virtual void visitUnsafeExpr(const UnsafeExpr&) {}
     virtual void visitPoisonExpr(const PoisonExpr&) {}
     virtual void visitTryExpr(const TryExpr&) {}
+    virtual void visitComptimeExpr(const ComptimeExpr&) {}
+    virtual void visitReduceExpr(const ReduceExpr&) {}
 
     // Statement visitors
     virtual void visitVarDeclStmt(const VarDeclStmt&) {}
@@ -1475,12 +1709,16 @@ public:
     virtual void visitErrdeferStmt(const ErrdeferStmt&) {}
     virtual void visitAtomicStmt(const AtomicStmt&) {}
     virtual void visitYieldStmt(const YieldStmt&) {}
+    virtual void visitSwitchStmt(const SwitchStmt&) {}
+    virtual void visitSpawnStmt(const SpawnStmt&) {}
 
     // Top-level visitors
     virtual void visitFnDecl(const FnDecl&) {}
     virtual void visitStructDecl(const StructDecl&) {}
     virtual void visitEnumDecl(const EnumDecl&) {}
     virtual void visitImportDecl(const ImportDecl&) {}
+    virtual void visitTraitDecl(const TraitDecl&) {}
+    virtual void visitImplDecl(const ImplDecl&) {}
 };
 
 // ============================================================================
@@ -1547,6 +1785,12 @@ inline void PoisonExpr::accept(ConstASTVisitor& v) const { v.visitPoisonExpr(*th
 inline void TryExpr::accept(ASTVisitor& v) { v.visitTryExpr(*this); }
 inline void TryExpr::accept(ConstASTVisitor& v) const { v.visitTryExpr(*this); }
 
+inline void ComptimeExpr::accept(ASTVisitor& v) { v.visitComptimeExpr(*this); }
+inline void ComptimeExpr::accept(ConstASTVisitor& v) const { v.visitComptimeExpr(*this); }
+
+inline void ReduceExpr::accept(ASTVisitor& v) { v.visitReduceExpr(*this); }
+inline void ReduceExpr::accept(ConstASTVisitor& v) const { v.visitReduceExpr(*this); }
+
 inline void VarDeclStmt::accept(ASTVisitor& v) { v.visitVarDeclStmt(*this); }
 inline void VarDeclStmt::accept(ConstASTVisitor& v) const { v.visitVarDeclStmt(*this); }
 
@@ -1567,6 +1811,12 @@ inline void AtomicStmt::accept(ConstASTVisitor& v) const { v.visitAtomicStmt(*th
 
 inline void YieldStmt::accept(ASTVisitor& v) { v.visitYieldStmt(*this); }
 inline void YieldStmt::accept(ConstASTVisitor& v) const { v.visitYieldStmt(*this); }
+
+inline void SwitchStmt::accept(ASTVisitor& v) { v.visitSwitchStmt(*this); }
+inline void SwitchStmt::accept(ConstASTVisitor& v) const { v.visitSwitchStmt(*this); }
+
+inline void SpawnStmt::accept(ASTVisitor& v) { v.visitSpawnStmt(*this); }
+inline void SpawnStmt::accept(ConstASTVisitor& v) const { v.visitSpawnStmt(*this); }
 
 inline void IfStmt::accept(ASTVisitor& v) { v.visitIfStmt(*this); }
 inline void IfStmt::accept(ConstASTVisitor& v) const { v.visitIfStmt(*this); }
@@ -1600,5 +1850,11 @@ inline void EnumDecl::accept(ConstASTVisitor& v) const { v.visitEnumDecl(*this);
 
 inline void ImportDecl::accept(ASTVisitor& v) { v.visitImportDecl(*this); }
 inline void ImportDecl::accept(ConstASTVisitor& v) const { v.visitImportDecl(*this); }
+
+inline void TraitDecl::accept(ASTVisitor& v) { v.visitTraitDecl(*this); }
+inline void TraitDecl::accept(ConstASTVisitor& v) const { v.visitTraitDecl(*this); }
+
+inline void ImplDecl::accept(ASTVisitor& v) { v.visitImplDecl(*this); }
+inline void ImplDecl::accept(ConstASTVisitor& v) const { v.visitImplDecl(*this); }
 
 } // namespace tether

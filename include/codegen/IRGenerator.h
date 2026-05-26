@@ -363,6 +363,13 @@ private:
                 collectAssignedVarsImpl(es.stmt(), result);
                 break;
             }
+            case NodeKind::SwitchStmt: {
+                auto& sw = cast<SwitchStmt>(*stmt);
+                for (const auto& arm : sw.arms()) {
+                    if (arm.body) collectAssignedVarsImpl(arm.body.get(), result);
+                }
+                break;
+            }
             default: break;
         }
     }
@@ -385,6 +392,17 @@ private:
                 auto& call = cast<CallExpr>(*expr);
                 for (const auto& arg : call.args())
                     collectAssignedVarsImpl(arg.get(), result);
+                break;
+            }
+            case NodeKind::ComptimeExpr: {
+                auto& ce = cast<ComptimeExpr>(*expr);
+                collectAssignedVarsImpl(ce.inner(), result);
+                break;
+            }
+            case NodeKind::ReduceExpr: {
+                auto& re = cast<ReduceExpr>(*expr);
+                collectAssignedVarsImpl(re.iterable(), result);
+                if (re.hasAxis()) collectAssignedVarsImpl(re.axis(), result);
                 break;
             }
             default: break;

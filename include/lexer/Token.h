@@ -42,6 +42,19 @@ enum class TokenKind : uint16_t {
     KW_ATOMIC,
     KW_YIELD,
 
+    // General-purpose & domain-specific keywords (v0.2 expansion)
+    KW_SWITCH,      // Exhaustive pattern matching on enums / data
+    KW_TRAIT,       // Shared behavior contracts (zero-overhead polymorphism)
+    KW_IMPL,        // Attach trait impls / methods to structs
+    KW_INLINE,      // Force function/loop inlining at call site
+    KW_NOALLOC,     // Compile-time guarantee: no heap allocation in fn
+    KW_RESTRICT,    // Pointer no-alias qualifier (enables max vectorization)
+    KW_COMPTIME,    // Force compile-time evaluation of expr/block
+    KW_SHAPE,       // Multi-dimensional tensor boundary property
+    KW_STRIDE,      // Physical memory stride for tensor layouts
+    KW_REDUCE,      // Hardware-native parallel reduction tree
+    KW_SPAWN,       // Structured async task dispatch (work-stealing pool)
+
     // Literals
     INT_LITERAL,
     FLOAT_LITERAL,
@@ -143,6 +156,19 @@ inline constexpr const char* tokenKindToString(TokenKind kind) {
         case TokenKind::KW_ERRDEFER:    return "errdefer";
         case TokenKind::KW_ATOMIC:      return "atomic";
         case TokenKind::KW_YIELD:       return "yield";
+
+        // General-purpose & domain-specific keywords (v0.2 expansion)
+        case TokenKind::KW_SWITCH:      return "switch";
+        case TokenKind::KW_TRAIT:       return "trait";
+        case TokenKind::KW_IMPL:        return "impl";
+        case TokenKind::KW_INLINE:      return "inline";
+        case TokenKind::KW_NOALLOC:     return "noalloc";
+        case TokenKind::KW_RESTRICT:    return "restrict";
+        case TokenKind::KW_COMPTIME:    return "comptime";
+        case TokenKind::KW_SHAPE:       return "shape";
+        case TokenKind::KW_STRIDE:      return "stride";
+        case TokenKind::KW_REDUCE:      return "reduce";
+        case TokenKind::KW_SPAWN:       return "spawn";
 
         // Literals
         case TokenKind::INT_LITERAL:    return "integer literal";
@@ -263,7 +289,7 @@ public:
     bool isNot(TokenKind k) const { return kind_ != k; }
 
     bool isKeyword() const {
-        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_YIELD;
+        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_SPAWN;
     }
 
     bool isLiteral() const {

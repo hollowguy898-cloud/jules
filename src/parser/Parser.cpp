@@ -174,6 +174,12 @@ void Parser::synchronize() {
             case TokenKind::KW_ERRDEFER:
             case TokenKind::KW_ATOMIC:
             case TokenKind::KW_YIELD:
+            case TokenKind::KW_SWITCH:
+            case TokenKind::KW_TRAIT:
+            case TokenKind::KW_IMPL:
+            case TokenKind::KW_COMPTIME:
+            case TokenKind::KW_SPAWN:
+            case TokenKind::KW_REDUCE:
             case TokenKind::KW_TRY:
             case TokenKind::RBRACE:
                 return;
@@ -220,6 +226,11 @@ SourceLocation Parser::locFrom(const Token& token) const {
 std::unique_ptr<TopLevel> Parser::parseTopLevel() {
     auto directives = parseDirectives();
 
+    // Handle fn modifiers: inline, noalloc — these prefix fn declarations
+    if (check(TokenKind::KW_INLINE) || check(TokenKind::KW_NOALLOC)) {
+        return parseFnDecl(std::move(directives));
+    }
+
     if (check(TokenKind::KW_FN)) {
         return parseFnDecl(std::move(directives));
     }
@@ -232,6 +243,12 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
     }
     if (check(TokenKind::KW_ENUM)) {
         return parseEnumDecl();
+    }
+    if (check(TokenKind::KW_TRAIT)) {
+        return parseTraitDecl();
+    }
+    if (check(TokenKind::KW_IMPL)) {
+        return parseImplDecl();
     }
     if (check(TokenKind::KW_IMPORT)) {
         return parseImportDecl();
@@ -286,6 +303,9 @@ std::vector<CompilerDirective> Parser::parseDirectives() {
 std::unique_ptr<FnDecl> Parser::parseFnDecl(
         std::vector<CompilerDirective> directives) {
     SourceLocation fn_loc = loc();
+    // Handle fn modifiers: inline, noalloc
+    bool is_inline = match(TokenKind::KW_INLINE);
+    bool is_noalloc = match(TokenKind::KW_NOALLOC);
     consume(TokenKind::KW_FN, "expected 'fn'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected function name");
@@ -329,11 +349,14 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
     // Parse body
     auto body = parseBlockStmt();
 
-    return std::make_unique<FnDecl>(
+    auto result = std::make_unique<FnDecl>(
         std::move(fn_loc), std::move(fn_name),
         std::move(params), return_type,
         std::move(body), is_pure, error_type,
         std::move(directives));
+    result->setInline(is_inline);
+    result->setNoalloc(is_noalloc);
+    return result;
 }
 
 std::unique_ptr<StructDecl> Parser::parseStructDecl() {
@@ -516,6 +539,10 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
             return parseAtomicStmt();
         case TokenKind::KW_YIELD:
             return parseYieldStmt();
+        case TokenKind::KW_SWITCH:
+            return parseSwitchStmt();
+        case TokenKind::KW_SPAWN:
+            return parseSpawnStmt();
         case TokenKind::KW_UNSAFE: {
             // unsafe at statement level
             SourceLocation unsafe_loc = loc();
@@ -579,6 +606,26 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
         }
         default:
             break;
+    }
+
+    // comptime expression at statement level
+    if (check(TokenKind::KW_COMPTIME)) {
+        SourceLocation comptime_loc = loc();
+        advance(); // consume 'comptime'
+        std::unique_ptr<Expr> inner;
+        if (check(TokenKind::LBRACE)) {
+            // comptime { block } - wrap block as an expression statement
+            auto block = parseBlockStmt();
+            // Create an ExprStmt wrapping a PoisonExpr temporarily for the block
+            // (blocks-as-expressions aren't fully supported yet, use first stmt)
+            auto poison = std::make_unique<PoisonExpr>(comptime_loc, "comptime block not yet supported in expression context");
+            inner = std::move(poison);
+        } else {
+            inner = parseExpr();
+        }
+        auto comptime_expr = std::make_unique<ComptimeExpr>(std::move(comptime_loc), std::move(inner));
+        consume(TokenKind::SEMI, "expected ';' after comptime expression");
+        return std::make_unique<ExprStmt>(SourceLocation(comptime_loc), std::move(comptime_expr));
     }
 
     // try expression at statement level
@@ -1796,6 +1843,148 @@ BinaryOp Parser::tokenToCompoundAssignOp(TokenKind kind) const {
         case TokenKind::SHR_EQ:     return BinaryOp::ShrAssign;
         default:                    return BinaryOp::AddAssign; // fallback
     }
+}
+
+std::unique_ptr<Stmt> Parser::parseSwitchStmt() {
+    SourceLocation switch_loc = loc();
+    consume(TokenKind::KW_SWITCH, "expected 'switch'");
+
+    consume(TokenKind::LPAREN, "expected '(' after 'switch'");
+    auto subject = parseExpr();
+    consume(TokenKind::RPAREN, "expected ')' after switch subject");
+
+    consume(TokenKind::LBRACE, "expected '{' after switch subject");
+
+    std::vector<SwitchArm> arms;
+    while (!check(TokenKind::RBRACE) && !isAtEnd()) {
+        SwitchArm arm;
+        if (check(TokenKind::KW_VAL) || check(TokenKind::KW_VAR)) {
+            // val/var pattern binding
+            arm.pattern = parseExpr();
+        } else {
+            arm.pattern = parseExpr();
+        }
+        consume(TokenKind::ARROW, "expected '=>' in switch arm");
+        arm.body = parseBlockStmt();
+        arms.push_back(std::move(arm));
+        if (!match(TokenKind::COMMA)) {
+            break;
+        }
+    }
+
+    consume(TokenKind::RBRACE, "expected '}' after switch arms");
+    return std::make_unique<SwitchStmt>(std::move(switch_loc), std::move(subject), std::move(arms));
+}
+
+std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
+    SourceLocation spawn_loc = loc();
+    consume(TokenKind::KW_SPAWN, "expected 'spawn'");
+
+    auto task = parseExpr();
+    consume(TokenKind::SEMI, "expected ';' after spawn expression");
+    return std::make_unique<SpawnStmt>(std::move(spawn_loc), std::move(task));
+}
+
+std::unique_ptr<TraitDecl> Parser::parseTraitDecl() {
+    SourceLocation trait_loc = loc();
+    consume(TokenKind::KW_TRAIT, "expected 'trait'");
+
+    Token name_tok = consume(TokenKind::IDENTIFIER, "expected trait name");
+    std::string trait_name(name_tok.text());
+
+    consume(TokenKind::LBRACE, "expected '{' after trait name");
+
+    std::vector<TraitMethodDecl> methods;
+    while (!check(TokenKind::RBRACE) && !isAtEnd()) {
+        SourceLocation method_loc = loc();
+        // Parse: fn name(params) ReturnType or fn name(params) !ReturnType
+        consume(TokenKind::KW_FN, "expected 'fn' in trait method");
+        Token method_name = consume(TokenKind::IDENTIFIER, "expected method name");
+        consume(TokenKind::LPAREN, "expected '(' after method name");
+        auto params = parseFnParams();
+        consume(TokenKind::RPAREN, "expected ')' after method parameters");
+
+        TypeId error_type;
+        bool can_error = match(TokenKind::BANG);
+
+        TypeId return_type;
+        if (!check(TokenKind::SEMI) && !check(TokenKind::COMMA) && !check(TokenKind::RBRACE)) {
+            return_type = parseType();
+        } else {
+            return_type = type_table_.getVoid();
+        }
+
+        if (can_error) {
+            error_type = type_table_.getError(return_type);
+        }
+
+        methods.emplace_back(TraitMethodDecl{
+            std::string(method_name.text()),
+            std::move(params),
+            return_type,
+            error_type,
+            std::move(method_loc)
+        });
+
+        match(TokenKind::SEMI);
+        if (!match(TokenKind::COMMA)) {
+            break;
+        }
+    }
+
+    consume(TokenKind::RBRACE, "expected '}' after trait methods");
+    return std::make_unique<TraitDecl>(
+        std::move(trait_loc), std::move(trait_name), std::move(methods));
+}
+
+std::unique_ptr<ImplDecl> Parser::parseImplDecl() {
+    SourceLocation impl_loc = loc();
+    consume(TokenKind::KW_IMPL, "expected 'impl'");
+
+    Token first_name = consume(TokenKind::IDENTIFIER, "expected name after 'impl'");
+    std::string name1(first_name.text());
+
+    std::string trait_name;
+    std::string struct_name;
+
+    // Check for "impl TraitName for StructName" vs "impl StructName"
+    if (check(TokenKind::IDENTIFIER) && peekNext().kind() != TokenKind::LBRACE) {
+        // Look for "for" keyword (treat as identifier since it's not a keyword)
+        // Actually peek for 'for' - it could be an identifier
+        // If next token is an identifier that matches "for", consume it
+        if (peek().text() == "for" && peek().kind() == TokenKind::IDENTIFIER) {
+            advance(); // consume 'for'
+            trait_name = std::move(name1);
+            Token struct_tok = consume(TokenKind::IDENTIFIER, "expected struct name after 'for'");
+            struct_name = std::string(struct_tok.text());
+        } else {
+            struct_name = std::move(name1);
+        }
+    } else {
+        struct_name = std::move(name1);
+    }
+
+    consume(TokenKind::LBRACE, "expected '{' after impl declaration");
+
+    std::vector<std::unique_ptr<FnDecl>> methods;
+    while (!check(TokenKind::RBRACE) && !isAtEnd()) {
+        auto directives = parseDirectives();
+        if (check(TokenKind::KW_FN)) {
+            auto fn = parseFnDecl(std::move(directives));
+            if (fn) {
+                methods.push_back(std::move(fn));
+            }
+        } else {
+            error("expected 'fn' in impl block");
+            break;
+        }
+    }
+
+    consume(TokenKind::RBRACE, "expected '}' after impl methods");
+
+    return std::make_unique<ImplDecl>(
+        std::move(impl_loc), std::move(trait_name), std::move(struct_name),
+        std::move(methods));
 }
 
 } // namespace tether

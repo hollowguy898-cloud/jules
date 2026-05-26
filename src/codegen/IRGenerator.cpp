@@ -528,6 +528,14 @@ std::string IRGenerator::generate() {
         } else if (isa<StructDecl>(*tl)) {
             auto& sd = cast<StructDecl>(*tl);
             for (const auto& f : sd.fields()) collectNeededTypes(f.type);
+        } else if (isa<ImplDecl>(*tl)) {
+            // ImplDecl methods are regular functions — collect their types too
+            auto& impl = cast<ImplDecl>(*tl);
+            for (const auto& method : impl.methods()) {
+                for (const auto& p : method->params()) collectNeededTypes(p.type);
+                collectNeededTypes(method->returnType());
+                if (method->canError()) collectNeededTypes(method->errorType());
+            }
         }
     }
 
@@ -563,6 +571,19 @@ void IRGenerator::emitTopLevel(TopLevel* tl) {
         case NodeKind::StructDecl: emitStructDecl(&cast<StructDecl>(*tl)); break;
         case NodeKind::EnumDecl:   emitEnumDecl(&cast<EnumDecl>(*tl)); break;
         case NodeKind::ImportDecl: break;
+
+        // ---- TraitDecl: compile-time only, no codegen ----
+        case NodeKind::TraitDecl: break;
+
+        // ---- ImplDecl: emit each method as a regular function ----
+        case NodeKind::ImplDecl: {
+            auto& impl = cast<ImplDecl>(*tl);
+            for (const auto& method : impl.methods()) {
+                emitFnDecl(method.get());
+            }
+            break;
+        }
+
         default: break;
     }
 }
@@ -1402,6 +1423,69 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             } else {
                 body_ss_ << "  call void @tether_yield(i64 0)\n";
             }
+            break;
+        }
+
+        // ---- switch (exhaustive pattern matching on enums) ----
+        case NodeKind::SwitchStmt: {
+            auto& sw = cast<SwitchStmt>(*stmt);
+            // Emit as an if-else chain (basic implementation)
+            // TODO: Optimize with jump tables for dense enum discriminants
+            std::string subject_val = emitExpr(sw.subject());
+            TypeId subject_type = sw.subject()->getType();
+            std::string ll_subject = llvmType(subject_type);
+
+            // Take a snapshot before the switch for phi node emission
+            SSASnapshot entry_snap = takeSnapshot();
+
+            std::string merge_label = nextLabel("switch_merge");
+            std::vector<std::string> arm_labels;
+            for (size_t i = 0; i < sw.armCount(); ++i) {
+                arm_labels.push_back(nextLabel("switch_arm"));
+            }
+
+            for (size_t i = 0; i < sw.armCount(); ++i) {
+                const auto& arm = sw.arms()[i];
+                if (!isTerminated()) {
+                    emitBlockLabel(arm_labels[i]);
+                }
+
+                // Emit comparison: subject == pattern
+                std::string pattern_val = emitExpr(arm.pattern.get());
+                std::string cmp_reg = nextReg();
+                body_ss_ << "  " << cmp_reg << " = icmp eq " << ll_subject
+                         << " " << subject_val << ", " << pattern_val << "\n";
+
+                std::string next_arm_label = (i + 1 < sw.armCount())
+                    ? arm_labels[i + 1] : merge_label;
+                std::string body_label = arm_labels[i] + ".body";
+
+                body_ss_ << "  br i1 " << cmp_reg << ", label %" << body_label
+                         << ", label %" << next_arm_label << "\n";
+
+                emitBlockLabel(body_label);
+                setTerminated(false);
+                pushScope();
+                emitBlockStmt(arm.body.get());
+                popScope();
+                if (!isTerminated()) {
+                    body_ss_ << "  br label %" << merge_label << "\n";
+                    setTerminated(true);
+                }
+            }
+
+            // Merge point
+            emitBlockLabel(merge_label);
+            setTerminated(false);
+            break;
+        }
+
+        // ---- spawn (async task dispatch) ----
+        case NodeKind::SpawnStmt: {
+            auto& sp = cast<SpawnStmt>(*stmt);
+            // TODO: Emit as async runtime call once we have a task system.
+            // For now, emit as a regular call expression (synchronous stub).
+            emitExpr(sp.task());
             break;
         }
 
@@ -2277,6 +2361,59 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         setTerminated(false);
         if (vt == "void") return "";  // no value to extract
         return value_reg;
+    }
+
+    // ========================================================================
+    // Comptime expression – compile-time enforcement (passthrough at codegen)
+    // ========================================================================
+    case NodeKind::ComptimeExpr: {
+        auto& ce = cast<ComptimeExpr>(*expr);
+        // comptime enforcement is a compile-time concern, not a codegen concern.
+        // The semantic analyzer already verified this evaluates at compile time.
+        // Just emit the inner expression.
+        return emitExpr(ce.inner());
+    }
+
+    // ========================================================================
+    // Reduce expression – parallel reduction (sequential stub for now)
+    // ========================================================================
+    case NodeKind::ReduceExpr: {
+        auto& re = cast<ReduceExpr>(*expr);
+        // TODO: Emit optimized parallel reduction tree (SIMD-aware).
+        // For now, emit as a simple sequential loop over the iterable.
+        // The iterable must be an array/slice; we iterate and accumulate.
+        TypeId result_type = expr->getType();
+        std::string ll_result = llvmType(result_type);
+
+        // Emit the iterable (should produce a pointer to the data)
+        std::string iterable_reg = emitExpr(re.iterable());
+
+        // Determine the neutral element based on the reduction op
+        std::string identity;
+        switch (re.op()) {
+            case ReduceExpr::ReduceOp::Add:
+            case ReduceExpr::ReduceOp::BitOr:
+            case ReduceExpr::ReduceOp::Or:
+                identity = "0"; break;
+            case ReduceExpr::ReduceOp::Mul:
+                identity = "1"; break;
+            case ReduceExpr::ReduceOp::And:
+            case ReduceExpr::ReduceOp::BitAnd:
+                identity = "1"; break;
+            case ReduceExpr::ReduceOp::Max:
+                identity = "0"; break;  // TODO: use MIN for type
+            case ReduceExpr::ReduceOp::Min:
+                identity = "0"; break;  // TODO: use MAX for type
+            default:
+                identity = "0"; break;
+        }
+
+        // For now, just return the identity value as a stub.
+        // Full loop-based reduction will be implemented later.
+        // Emit the iterable for side effects (e.g., function calls in the iterable)
+        // and return the identity.
+        body_ss_ << "  ; TODO: reduce loop for " << iterable_reg << "\n";
+        return identity;
     }
 
     default: break;

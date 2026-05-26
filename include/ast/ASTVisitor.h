@@ -72,6 +72,10 @@ public:
                 return derived().visitPoisonExpr(static_cast<PoisonExpr&>(node));
             case NodeKind::TryExpr:
                 return derived().visitTryExpr(static_cast<TryExpr&>(node));
+            case NodeKind::ComptimeExpr:
+                return derived().visitComptimeExpr(static_cast<ComptimeExpr&>(node));
+            case NodeKind::ReduceExpr:
+                return derived().visitReduceExpr(static_cast<ReduceExpr&>(node));
 
             // Statements
             case NodeKind::VarDeclStmt:
@@ -102,6 +106,10 @@ public:
                 return derived().visitExprStmt(static_cast<ExprStmt&>(node));
             case NodeKind::BlockStmt:
                 return derived().visitBlockStmt(static_cast<BlockStmt&>(node));
+            case NodeKind::SwitchStmt:
+                return derived().visitSwitchStmt(static_cast<SwitchStmt&>(node));
+            case NodeKind::SpawnStmt:
+                return derived().visitSpawnStmt(static_cast<SpawnStmt&>(node));
 
             // Top-level declarations
             case NodeKind::FnDecl:
@@ -112,6 +120,10 @@ public:
                 return derived().visitEnumDecl(static_cast<EnumDecl&>(node));
             case NodeKind::ImportDecl:
                 return derived().visitImportDecl(static_cast<ImportDecl&>(node));
+            case NodeKind::TraitDecl:
+                return derived().visitTraitDecl(static_cast<TraitDecl&>(node));
+            case NodeKind::ImplDecl:
+                return derived().visitImplDecl(static_cast<ImplDecl&>(node));
         }
         return retDefault();
     }
@@ -159,6 +171,10 @@ public:
                 return derived().visitPoisonExpr(static_cast<const PoisonExpr&>(node));
             case NodeKind::TryExpr:
                 return derived().visitTryExpr(static_cast<const TryExpr&>(node));
+            case NodeKind::ComptimeExpr:
+                return derived().visitComptimeExpr(static_cast<const ComptimeExpr&>(node));
+            case NodeKind::ReduceExpr:
+                return derived().visitReduceExpr(static_cast<const ReduceExpr&>(node));
             case NodeKind::VarDeclStmt:
                 return derived().visitVarDeclStmt(static_cast<const VarDeclStmt&>(node));
             case NodeKind::ValDeclStmt:
@@ -187,6 +203,10 @@ public:
                 return derived().visitExprStmt(static_cast<const ExprStmt&>(node));
             case NodeKind::BlockStmt:
                 return derived().visitBlockStmt(static_cast<const BlockStmt&>(node));
+            case NodeKind::SwitchStmt:
+                return derived().visitSwitchStmt(static_cast<const SwitchStmt&>(node));
+            case NodeKind::SpawnStmt:
+                return derived().visitSpawnStmt(static_cast<const SpawnStmt&>(node));
             case NodeKind::FnDecl:
                 return derived().visitFnDecl(static_cast<const FnDecl&>(node));
             case NodeKind::StructDecl:
@@ -195,6 +215,10 @@ public:
                 return derived().visitEnumDecl(static_cast<const EnumDecl&>(node));
             case NodeKind::ImportDecl:
                 return derived().visitImportDecl(static_cast<const ImportDecl&>(node));
+            case NodeKind::TraitDecl:
+                return derived().visitTraitDecl(static_cast<const TraitDecl&>(node));
+            case NodeKind::ImplDecl:
+                return derived().visitImplDecl(static_cast<const ImplDecl&>(node));
         }
         return retDefault();
     }
@@ -300,6 +324,17 @@ public:
         return retDefault();
     }
 
+    Ret visitComptimeExpr(ComptimeExpr& node) {
+        traverseExpr(node.inner());
+        return retDefault();
+    }
+
+    Ret visitReduceExpr(ReduceExpr& node) {
+        traverseExpr(node.iterable());
+        if (node.hasAxis()) traverseExpr(node.axis());
+        return retDefault();
+    }
+
     // --- Statements ---
 
     Ret visitVarDeclStmt(VarDeclStmt& node) {
@@ -384,6 +419,20 @@ public:
         return retDefault();
     }
 
+    Ret visitSwitchStmt(SwitchStmt& node) {
+        traverseExpr(node.subject());
+        for (auto& arm : node.arms()) {
+            traverseExpr(arm.pattern.get());
+            traverseStmt(arm.body.get());
+        }
+        return retDefault();
+    }
+
+    Ret visitSpawnStmt(SpawnStmt& node) {
+        traverseExpr(node.task());
+        return retDefault();
+    }
+
     // --- Top-level declarations ---
 
     Ret visitFnDecl(FnDecl& node) {
@@ -396,6 +445,15 @@ public:
     Ret visitStructDecl(StructDecl&) { return retDefault(); }
     Ret visitEnumDecl(EnumDecl&) { return retDefault(); }
     Ret visitImportDecl(ImportDecl&) { return retDefault(); }
+
+    Ret visitTraitDecl(TraitDecl&) { return retDefault(); }
+
+    Ret visitImplDecl(ImplDecl& node) {
+        for (auto& method : node.methods()) {
+            traverseTopLevel(method.get());
+        }
+        return retDefault();
+    }
 
     // -----------------------------------------------------------------------
     // Const visit overloads (traverse const AST)
@@ -423,6 +481,8 @@ public:
     Ret visitPoisonExpr(const PoisonExpr&) { return retDefault(); }
 
     Ret visitTryExpr(const TryExpr&) { return retDefault(); }
+    Ret visitComptimeExpr(const ComptimeExpr&) { return retDefault(); }
+    Ret visitReduceExpr(const ReduceExpr&) { return retDefault(); }
 
     Ret visitVarDeclStmt(const VarDeclStmt&) { return retDefault(); }
     Ret visitValDeclStmt(const ValDeclStmt&) { return retDefault(); }
@@ -438,11 +498,15 @@ public:
     Ret visitContinueStmt(const ContinueStmt&) { return retDefault(); }
     Ret visitExprStmt(const ExprStmt&) { return retDefault(); }
     Ret visitBlockStmt(const BlockStmt&) { return retDefault(); }
+    Ret visitSwitchStmt(const SwitchStmt&) { return retDefault(); }
+    Ret visitSpawnStmt(const SpawnStmt&) { return retDefault(); }
 
     Ret visitFnDecl(const FnDecl&) { return retDefault(); }
     Ret visitStructDecl(const StructDecl&) { return retDefault(); }
     Ret visitEnumDecl(const EnumDecl&) { return retDefault(); }
     Ret visitImportDecl(const ImportDecl&) { return retDefault(); }
+    Ret visitTraitDecl(const TraitDecl&) { return retDefault(); }
+    Ret visitImplDecl(const ImplDecl&) { return retDefault(); }
 
 protected:
     // -----------------------------------------------------------------------

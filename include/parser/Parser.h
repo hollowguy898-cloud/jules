@@ -116,6 +116,10 @@ private:
     std::unique_ptr<Stmt> parseErrdeferStmt();
     std::unique_ptr<Stmt> parseAtomicStmt();
     std::unique_ptr<YieldStmt> parseYieldStmt();
+    std::unique_ptr<Stmt> parseSwitchStmt();
+    std::unique_ptr<Stmt> parseSpawnStmt();
+    std::unique_ptr<TraitDecl> parseTraitDecl();
+    std::unique_ptr<ImplDecl> parseImplDecl();
 
     // -----------------------------------------------------------------------
     // Expression parsing (recursive descent with precedence levels)
