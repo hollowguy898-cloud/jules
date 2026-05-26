@@ -9,10 +9,29 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
-#include <sstream>
 #include <cstdint>
 
 namespace tether {
+
+// ============================================================================
+// FastBuf — append-only string buffer, avoids ostringstream overhead
+// ============================================================================
+class FastBuf {
+    std::string buf_;
+public:
+    FastBuf() { buf_.reserve(4096); }
+    void clear() { buf_.clear(); }
+    std::string str() const { return buf_; }
+    FastBuf& operator<<(char c) { buf_ += c; return *this; }
+    FastBuf& operator<<(const char* s) { buf_.append(s); return *this; }
+    FastBuf& operator<<(const std::string& s) { buf_.append(s); return *this; }
+    FastBuf& operator<<(int v) { buf_ += std::to_string(v); return *this; }
+    FastBuf& operator<<(unsigned int v) { buf_ += std::to_string(v); return *this; }
+    FastBuf& operator<<(long v) { buf_ += std::to_string(v); return *this; }
+    FastBuf& operator<<(unsigned long v) { buf_ += std::to_string(v); return *this; }
+    FastBuf& operator<<(long long v) { buf_ += std::to_string(v); return *this; }
+    FastBuf& operator<<(unsigned long long v) { buf_ += std::to_string(v); return *this; }
+};
 
 // ============================================================================
 // IRGenerator - walks the typed AST and emits LLVM IR as text (.ll format)
@@ -145,9 +164,9 @@ private:
     //   alloca_ss_  – current-function alloca instructions  (entry block)
     //   body_ss_    – current-function body instructions
     // =======================================================================
-    std::ostringstream module_out_;
-    std::ostringstream alloca_ss_;
-    std::ostringstream body_ss_;
+    FastBuf module_out_;
+    FastBuf alloca_ss_;
+    FastBuf body_ss_;
 
     // =======================================================================
     // Code-generation state
@@ -226,6 +245,8 @@ private:
     bool        current_fn_has_simd_ = false;
     std::string current_fn_name_;
     std::string current_ret_alloca_; // alloca for the aggregate return value
+    std::string current_err_slot_;   // callee-side: name of the ptr %err_slot parameter
+    std::string caller_err_slot_;    // caller-side: alloca name of the i32 err_slot for the most recent error-returning call
 
     // =======================================================================
     // Loop context (for break / continue)

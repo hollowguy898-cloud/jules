@@ -325,6 +325,23 @@ int64_t tether_rc_count(TetherRc* rc) {
  * Arc operations (atomic reference counting)
  *
  * Memory layout:  { _Atomic int64_t refcount; char data[data_size]; }
+ *
+ * Memory ordering choices (following Rust's std::sync::Arc):
+ *
+ *   - arc_new:   Relaxed store — we are the sole owner at creation time;
+ *                no other thread can observe the refcount yet.
+ *
+ *   - arc_clone: Relaxed fetch_add — incrementing only needs atomicity, not
+ *                ordering; we don't need to synchronise any other memory.
+ *
+ *   - arc_drop:  AcqRel fetch_sub — the Release part ensures all prior writes
+ *                (to the data) are visible to the thread that frees the block;
+ *                the Acquire part ensures the last dropper sees all prior
+ *                accesses from every clone/drop that preceded it.
+ *
+ *   - arc_count: Relaxed load — this is a diagnostic-only read with no
+ *                synchronisation requirements; the value is inherently
+ *                approximate since another thread may change it immediately.
  * ============================================================================ */
 
 TetherArc tether_arc_new(const void* data, int64_t size) {
@@ -343,9 +360,9 @@ TetherArc tether_arc_new(const void* data, int64_t size) {
         return arc;
     }
 
-    /* Set refcount to 1 (atomic store) */
+    /* Set refcount to 1 — Relaxed: sole owner, no other thread can observe */
     _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)block;
-    __atomic_store_n(refcount_ptr, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(refcount_ptr, 1, __ATOMIC_RELAXED);
 
     /* Copy data after the refcount */
     char* data_ptr = (char*)block + sizeof(_Atomic int64_t);
@@ -363,9 +380,9 @@ TetherArc tether_arc_clone(TetherArc* arc) {
 
     if (!arc || !arc->ptr) return result;
 
-    /* Atomically increment the refcount */
+    /* Atomically increment the refcount — Relaxed: only atomicity needed */
     _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)arc->ptr;
-    __atomic_fetch_add(refcount_ptr, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(refcount_ptr, 1, __ATOMIC_RELAXED);
 
     result.ptr       = arc->ptr;
     result.data_size = arc->data_size;
@@ -375,9 +392,9 @@ TetherArc tether_arc_clone(TetherArc* arc) {
 void tether_arc_drop(TetherArc* arc) {
     if (!arc || !arc->ptr) return;
 
-    /* Atomically decrement the refcount */
+    /* Atomically decrement the refcount — AcqRel: must synchronise with last dropper */
     _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)arc->ptr;
-    int64_t old_count = __atomic_fetch_sub(refcount_ptr, 1, __ATOMIC_SEQ_CST);
+    int64_t old_count = __atomic_fetch_sub(refcount_ptr, 1, __ATOMIC_ACQ_REL);
 
     if (old_count <= 1) {
         /* This was the last reference; free the block */
@@ -396,7 +413,7 @@ void* tether_arc_deref(TetherArc* arc) {
 int64_t tether_arc_count(TetherArc* arc) {
     if (!arc || !arc->ptr) return 0;
     _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)arc->ptr;
-    return __atomic_load_n(refcount_ptr, __ATOMIC_SEQ_CST);
+    return __atomic_load_n(refcount_ptr, __ATOMIC_RELAXED);
 }
 
 /* ============================================================================

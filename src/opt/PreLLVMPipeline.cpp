@@ -8,6 +8,7 @@
 #include "opt/YieldPointInserter.h"
 #include "opt/OpaqueBarrier.h"
 #include "opt/HotColdSplitter.h"
+#include "opt/EscapeAnalysis.h"
 
 #include <sstream>
 
@@ -87,6 +88,9 @@ PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table)
     if (level_ == PreLLVMOptLevel::Aggressive) {
         // Allocator lowering - inlines arena bump allocation
         addPass(std::make_unique<AllocatorLowererPass>());
+
+        // Escape analysis - stack-allocate Box/Rc/Arc that don't escape
+        addPass(std::make_unique<EscapeAnalysisPass>());
 
         // Prefetch insertion - uses alignment hints
         addPass(std::make_unique<PrefetchInserterPass>());

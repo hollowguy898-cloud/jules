@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 #include <set>
 
 namespace tether {
@@ -265,17 +266,19 @@ std::string IRGenerator::llvmType(TypeId type) const {
 
 // ============================================================================
 // llvmReturnType
+//   Returns the LLVM IR return type for a function.
+//   Zig-style: error-returning functions return just the success type;
+//   the error code is communicated via an out-parameter (ptr %err_slot).
 // ============================================================================
 std::string IRGenerator::llvmReturnType(TypeId type, bool can_error) const {
     if (can_error) {
         if (!type || !isa<ErrorType>(type)) {
             // Defensive: error-returning function but type is not ErrorType
             // (can happen during error-resilient compilation). Emit a fallback.
-            return "{ i64, i1 }";
+            return "i64";
         }
         auto& err = cast<ErrorType>(type);
-        std::string vt = llvmType(err.successType());
-        return (vt == "void") ? "{ i1 }" : "{ " + vt + ", i1 }";
+        return llvmType(err.successType());
     }
     return llvmType(type);
 }
@@ -637,18 +640,32 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     current_fn_error_type_ = fn->errorType();
     current_fn_name_ = fn->name();
     current_ret_alloca_.clear();
+    current_err_slot_.clear();
+    caller_err_slot_.clear();
     current_fn_has_simd_ = fn->hasDirective(CompilerDirective::Simd);
 
-    alloca_ss_.str("");
-    body_ss_.str("");
+    alloca_ss_.clear();
+    body_ss_.clear();
 
     // Build return type
-    std::string ret_type = fn->canError()
-        ? llvmReturnType(fn->errorType(), true)
-        : llvmType(fn->returnType());
+    // Zig-style: error-returning functions return just the success type,
+    // with error code communicated via an out-parameter (ptr %err_slot).
+    std::string ret_type = llvmType(fn->returnType());
 
     // Build function signature
-    std::string sig = "define linkonce_odr dso_local " + ret_type + " @" + sanitizeName(fn->name()) + "(";
+    // Linkage heuristic:
+    //   main      → external (must be visible to the linker entry point)
+    //   pure      → linkonce_odr (safe to deduplicate across modules)
+    //   otherwise → internal (allows aggressive inlining by LLVM)
+    std::string linkage;
+    if (fn->name() == "main") {
+        linkage = "";  // external: define dso_local
+    } else if (fn->isPure()) {
+        linkage = "linkonce_odr ";
+    } else {
+        linkage = "internal ";
+    }
+    std::string sig = "define " + linkage + "dso_local " + ret_type + " @" + sanitizeName(fn->name()) + "(";
     for (size_t i = 0; i < fn->paramCount(); ++i) {
         const auto& p = fn->params()[i];
         if (i > 0) sig += ", ";
@@ -658,6 +675,11 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             sig += " noalias";
         }
         sig += " %" + sanitizeName(p.name);
+    }
+    // Zig-style: error-returning functions get an extra ptr %err_slot parameter
+    if (fn->canError()) {
+        if (fn->paramCount() > 0) sig += ", ";
+        sig += "ptr %__err_slot";
     }
     sig += ")";
 
@@ -692,9 +714,9 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         metadata_suffix += " !" + std::to_string(id);
     }
 
-    // No body → declaration only
+    // No body → declaration only (use dso_local for all declarations)
     if (!fn->body()) {
-        module_out_ << "declare " << ret_type << " @" << sanitizeName(fn->name()) << "(";
+        module_out_ << "declare dso_local " << ret_type << " @" << sanitizeName(fn->name()) << "(";
         for (size_t i = 0; i < fn->paramCount(); ++i) {
             const auto& p = fn->params()[i];
             if (i > 0) module_out_ << ", ";
@@ -703,6 +725,11 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             if (p.type && isa<MutReferenceType>(p.type)) {
                 module_out_ << " noalias";
             }
+        }
+        // Zig-style: error-returning function declarations also have the err_slot param
+        if (fn->canError()) {
+            if (fn->paramCount() > 0) module_out_ << ", ";
+            module_out_ << "ptr";
         }
         module_out_ << ")";
         if (fn->isPure()) module_out_ << " memory(none) nounwind";
@@ -722,10 +749,12 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         var_allocas_[p.name] = aname;
     }
 
-    // For error-returning functions, alloca the result struct
+    // For error-returning functions, store the err_slot parameter name
+    // so error-return paths can write the error code to it.
+    // No need to alloca a result struct — the function returns just the
+    // success type directly.
     if (fn->canError()) {
-        current_ret_alloca_ = nextReg();
-        alloca_ss_ << "  " << current_ret_alloca_ << " = alloca " << ret_type << "\n";
+        current_err_slot_ = "%__err_slot";
     }
 
     // Emit the body
@@ -735,18 +764,12 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     if (!isTerminated()) {
         emitDeferBlocks();
         if (current_can_error_) {
-            // BUG FIX: Use the stored error type (current_fn_error_type_) to build
-            // the return struct, NOT llvmReturnType(current_return_type_, true).
-            // Using current_return_type_ with can_error=true hits the fallback path
-            // in llvmReturnType() which returns "{ i64, i1 }" — wrong for i32 etc.
-            std::string rt = current_fn_error_type_.isNull()
-                ? llvmReturnType(current_return_type_, true)
-                : llvmReturnType(current_fn_error_type_, true);
+            // Zig-style: no error on the default fallthrough path.
+            // The err_slot was zero-initialized by the caller, so we just
+            // return the zero-initialized success value (or void).
             std::string ll_val = llvmType(current_return_type_);
             if (ll_val == "void") {
-                std::string zero = nextReg();
-                body_ss_ << "  " << zero << " = insertvalue { i1 } undef, i1 false, 0\n";
-                body_ss_ << "  ret { i1 } " << zero << "\n";
+                body_ss_ << "  ret void\n";
             } else if (isAggregateType(current_return_type_)) {
                 // Aggregate: zero-initialize via memset, then load and return
                 std::string zero = nextReg();
@@ -757,21 +780,9 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
                          << ", i1 false)\n";
                 std::string loaded = nextReg();
                 body_ss_ << "  " << loaded << " = load " << ll_val << ", ptr " << zero << "\n";
-                std::string i1 = nextReg();
-                body_ss_ << "  " << i1 << " = insertvalue " << rt
-                         << " undef, " << ll_val << " " << loaded << ", 0\n";
-                std::string i2 = nextReg();
-                body_ss_ << "  " << i2 << " = insertvalue " << rt
-                         << " " << i1 << ", i1 false, 1\n";
-                body_ss_ << "  ret " << rt << " " << i2 << "\n";
+                body_ss_ << "  ret " << ll_val << " " << loaded << "\n";
             } else {
-                std::string zero = nextReg();
-                body_ss_ << "  " << zero << " = insertvalue " << rt
-                         << " undef, " << ll_val << " 0, 0\n";
-                std::string z2 = nextReg();
-                body_ss_ << "  " << z2 << " = insertvalue " << rt
-                         << " " << zero << ", i1 false, 1\n";
-                body_ss_ << "  ret " << rt << " " << z2 << "\n";
+                body_ss_ << "  ret " << ll_val << " 0\n";
             }
         } else if (current_return_type_ && current_return_type_->isVoid()) {
             body_ss_ << "  ret void\n";
@@ -1047,49 +1058,26 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             emitDeferBlocks();
 
             if (current_can_error_) {
-                // BUG FIX: Use current_fn_error_type_ for correct return struct type
-                std::string rt = current_fn_error_type_.isNull()
-                    ? llvmReturnType(current_return_type_, true)
-                    : llvmReturnType(current_fn_error_type_, true);
+                // Zig-style: return just the success value directly.
+                // No struct wrapping needed — the err_slot stays at 0 (no error),
+                // as initialized by the caller.  Success value returns in a register!
                 std::string vt = llvmType(current_return_type_);
                 if (rs.hasValue()) {
                     std::string val = emitExpr(rs.value());
                     if (isAggregateType(current_return_type_)) {
                         std::string loaded = nextReg();
                         body_ss_ << "  " << loaded << " = load " << vt << ", ptr " << val << "\n";
-                        std::string i1 = nextReg();
-                        body_ss_ << "  " << i1 << " = insertvalue " << rt
-                                 << " undef, " << vt << " " << loaded << ", 0\n";
-                        std::string i2 = nextReg();
-                        body_ss_ << "  " << i2 << " = insertvalue " << rt
-                                 << " " << i1 << ", i1 false, 1\n";
-                        body_ss_ << "  ret " << rt << " " << i2 << "\n";
+                        body_ss_ << "  ret " << vt << " " << loaded << "\n";
                     } else if (vt == "void") {
-                        std::string i1 = nextReg();
-                        body_ss_ << "  " << i1 << " = insertvalue { i1 } undef, i1 false, 0\n";
-                        body_ss_ << "  ret { i1 } " << i1 << "\n";
+                        body_ss_ << "  ret void\n";
                     } else {
-                        std::string i1 = nextReg();
-                        body_ss_ << "  " << i1 << " = insertvalue " << rt
-                                 << " undef, " << vt << " " << val << ", 0\n";
-                        std::string i2 = nextReg();
-                        body_ss_ << "  " << i2 << " = insertvalue " << rt
-                                 << " " << i1 << ", i1 false, 1\n";
-                        body_ss_ << "  ret " << rt << " " << i2 << "\n";
+                        body_ss_ << "  ret " << vt << " " << val << "\n";
                     }
                 } else {
                     if (vt == "void") {
-                        std::string i1 = nextReg();
-                        body_ss_ << "  " << i1 << " = insertvalue { i1 } undef, i1 false, 0\n";
-                        body_ss_ << "  ret { i1 } " << i1 << "\n";
+                        body_ss_ << "  ret void\n";
                     } else {
-                        std::string i1 = nextReg();
-                        body_ss_ << "  " << i1 << " = insertvalue " << rt
-                                 << " undef, " << vt << " 0, 0\n";
-                        std::string i2 = nextReg();
-                        body_ss_ << "  " << i2 << " = insertvalue " << rt
-                                 << " " << i1 << ", i1 false, 1\n";
-                        body_ss_ << "  ret " << rt << " " << i2 << "\n";
+                        body_ss_ << "  ret " << vt << " 0\n";
                     }
                 }
             } else {
@@ -1490,23 +1478,40 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         // Determine return type
         TypeId ret_type = expr->getType();
+        bool callee_can_error = ret_type && isa<ErrorType>(ret_type);
         TypeId actual_ret = ret_type;
-        if (ret_type && isa<ErrorType>(ret_type)) {
+        std::string caller_err_slot_alloc;
+        if (callee_can_error) {
             actual_ret = cast<ErrorType>(ret_type).successType();
+            // Zig-style: allocate an i32 err_slot on the caller's stack
+            caller_err_slot_alloc = nextReg();
+            alloca_ss_ << "  " << caller_err_slot_alloc << " = alloca i32\n";
+            body_ss_ << "  store i32 0, ptr " << caller_err_slot_alloc << "\n";
         }
         std::string ret_ll = llvmType(actual_ret);
 
-        std::string result = nextReg();
+        std::string result;
 
         // --- Pre-LLVM optimization: opaque barrier fence (before call) ---
         if (call_has_opaque_barrier) {
             body_ss_ << "  fence acquire ; [opaque barrier] before FFI call\n";
         }
 
-        body_ss_ << "  " << result << " = call " << ret_ll << " " << callee << "(";
+        // Emit the call — for void returns, don't assign to a register
+        if (ret_ll == "void") {
+            body_ss_ << "  call void " << callee << "(";
+        } else {
+            result = nextReg();
+            body_ss_ << "  " << result << " = call " << ret_ll << " " << callee << "(";
+        }
         for (size_t i = 0; i < arg_vals.size(); ++i) {
             if (i > 0) body_ss_ << ", ";
             body_ss_ << arg_types[i] << " " << arg_vals[i];
+        }
+        // Zig-style: pass err_slot as last argument for error-returning calls
+        if (callee_can_error) {
+            if (!arg_vals.empty()) body_ss_ << ", ";
+            body_ss_ << "ptr " << caller_err_slot_alloc;
         }
         body_ss_ << ")\n";
 
@@ -1515,30 +1520,28 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             body_ss_ << "  fence release ; [opaque barrier] after FFI call\n";
         }
 
-        // Error return: build error struct
-        if (ret_type && isa<ErrorType>(ret_type)) {
+        // Error return: store success value in alloca and track err_slot
+        // (The try-expression will check err_slot and load the success value)
+        if (callee_can_error) {
+            caller_err_slot_ = caller_err_slot_alloc;
             auto& err = cast<ErrorType>(ret_type);
-            std::string est = llvmType(ret_type);
-            std::string ea = nextReg();
-            alloca_ss_ << "  " << ea << " = alloca " << est << "\n";
-
             std::string vt = llvmType(err.successType());
             if (vt == "void") {
-                std::string g = nextReg();
-                body_ss_ << "  " << g << " = getelementptr " << est
-                         << ", ptr " << ea << ", i32 0, i32 0\n";
-                body_ss_ << "  store i1 false, ptr " << g << "\n";
+                return "";  // void result — err_slot is tracked in caller_err_slot_
+            } else if (isAggregateType(err.successType())) {
+                // Aggregate: store result in alloca, return pointer
+                std::string ea = nextReg();
+                alloca_ss_ << "  " << ea << " = alloca " << vt << "\n";
+                body_ss_ << "  store " << vt << " " << result << ", ptr " << ea << "\n";
+                return ea;
             } else {
-                std::string g0 = nextReg();
-                body_ss_ << "  " << g0 << " = getelementptr " << est
-                         << ", ptr " << ea << ", i32 0, i32 0\n";
-                body_ss_ << "  store " << vt << " " << result << ", ptr " << g0 << "\n";
-                std::string g1 = nextReg();
-                body_ss_ << "  " << g1 << " = getelementptr " << est
-                         << ", ptr " << ea << ", i32 0, i32 1\n";
-                body_ss_ << "  store i1 false, ptr " << g1 << "\n";
+                // Scalar: store result in alloca, return pointer
+                // (try-expression will load from this alloca)
+                std::string ea = nextReg();
+                alloca_ss_ << "  " << ea << " = alloca " << vt << "\n";
+                body_ss_ << "  store " << vt << " " << result << ", ptr " << ea << "\n";
+                return ea;
             }
-            return ea;
         }
 
         // Aggregate return: store in alloca
@@ -1967,28 +1970,24 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         auto& err = cast<ErrorType>(operand_type);
         std::string vt = llvmType(err.successType());
-        std::string est = llvmType(operand_type);
 
-        // BUG FIX: The result from emitExpr for an ErrorType returning call
-        // is a *pointer* to an alloca, not a first-class struct value.
-        // We must load the struct before using extractvalue.
-        std::string loaded_struct = nextReg();
-        body_ss_ << "  " << loaded_struct << " = load " << est
-                 << ", ptr " << result << "\n";
-
-        // Check the error flag and branch
-        // For ErrorType, the struct is { T value, i1 error_flag }
-        std::string value_reg = nextReg();
+        // Zig-style: Check the err_slot for errors instead of extracting
+        // from a return struct.  The caller_err_slot_ was set by the
+        // CallExpr handler when it emitted the call.
+        std::string err_code = nextReg();
+        body_ss_ << "  " << err_code << " = load i32, ptr " << caller_err_slot_ << "\n";
         std::string err_flag_reg = nextReg();
-        if (vt == "void") {
-            // { i1 } — only the error flag
-            body_ss_ << "  " << err_flag_reg << " = extractvalue { i1 } "
-                     << loaded_struct << ", 0\n";
-        } else {
-            body_ss_ << "  " << value_reg << " = extractvalue " << est
-                     << " " << loaded_struct << ", 0\n";
-            body_ss_ << "  " << err_flag_reg << " = extractvalue " << est
-                     << " " << loaded_struct << ", 1\n";
+        body_ss_ << "  " << err_flag_reg << " = icmp ne i32 " << err_code << ", 0\n";
+
+        // For non-void, load the success value from the alloca
+        std::string value_reg;
+        if (vt != "void") {
+            if (isAggregateType(err.successType())) {
+                value_reg = result;  // already a pointer to the value
+            } else {
+                value_reg = nextReg();
+                body_ss_ << "  " << value_reg << " = load " << vt << ", ptr " << result << "\n";
+            }
         }
 
         std::string err_label = nextLabel("try_err");
@@ -1997,29 +1996,19 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                  << ", label %" << ok_label << "\n";
 
         body_ss_ << err_label << ":\n";
-        // On error: emit errdefer blocks and return the error
+        // On error: emit errdefer blocks and propagate the error
         emitErrdeferBlocks();
         emitDeferBlocks();
         if (!isTerminated()) {
-            // Return the error struct from the current function's error return type
             if (current_can_error_) {
-                // BUG FIX: Use current_fn_error_type_ for correct return struct type
-                std::string crt = current_fn_error_type_.isNull()
-                    ? llvmReturnType(current_return_type_, true)
-                    : llvmReturnType(current_fn_error_type_, true);
-                // Re-propagate the error value
-                if (vt == "void") {
-                    std::string ins = nextReg();
-                    body_ss_ << "  " << ins << " = insertvalue { i1 } undef, i1 true, 0\n";
-                    body_ss_ << "  ret { i1 } " << ins << "\n";
+                // Zig-style: store error code to current function's err_slot
+                // and return zero/poison of the success type
+                body_ss_ << "  store i32 " << err_code << ", ptr " << current_err_slot_ << "\n";
+                std::string crt = llvmType(current_return_type_);
+                if (crt == "void") {
+                    body_ss_ << "  ret void\n";
                 } else {
-                    std::string i1 = nextReg();
-                    body_ss_ << "  " << i1 << " = insertvalue " << crt
-                             << " undef, " << vt << " " << value_reg << ", 0\n";
-                    std::string i2 = nextReg();
-                    body_ss_ << "  " << i2 << " = insertvalue " << crt
-                             << " " << i1 << ", i1 true, 1\n";
-                    body_ss_ << "  ret " << crt << " " << i2 << "\n";
+                    body_ss_ << "  ret " << crt << " 0\n";
                 }
             } else {
                 // Non-error function returning early from try — return zero
@@ -2512,16 +2501,14 @@ void IRGenerator::emitArcDrop(const std::string& arc_ptr, TypeId pointee_type) {
 // ============================================================================
 std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId error_type) {
     auto& err = cast<ErrorType>(error_type);
-    std::string est = llvmType(error_type);
     std::string vt = llvmType(err.successType());
-    int flag_idx = (vt == "void") ? 0 : 1;
 
-    // Extract error flag
-    std::string fg = nextReg();
-    body_ss_ << "  " << fg << " = getelementptr " << est
-             << ", ptr " << result_ptr << ", i32 0, i32 " << flag_idx << "\n";
+    // Zig-style: Check the err_slot for errors instead of extracting from
+    // a return struct.  The caller_err_slot_ was set by the CallExpr handler.
+    std::string err_code = nextReg();
+    body_ss_ << "  " << err_code << " = load i32, ptr " << caller_err_slot_ << "\n";
     std::string ef = nextReg();
-    body_ss_ << "  " << ef << " = load i1, ptr " << fg << "\n";
+    body_ss_ << "  " << ef << " = icmp ne i32 " << err_code << ", 0\n";
 
     std::string err_l = nextLabel("error.propagate");
     std::string ok_l  = nextLabel("error.ok");
@@ -2532,31 +2519,17 @@ std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId er
     setTerminated(false);
     emitDeferBlocks();
     if (current_can_error_) {
-        // BUG FIX: Use current_fn_error_type_ for correct return struct type
-        std::string crt = current_fn_error_type_.isNull()
-            ? llvmReturnType(current_return_type_, true)
-            : llvmReturnType(current_fn_error_type_, true);
-        if (vt == "void") {
-            std::string ins = nextReg();
-            body_ss_ << "  " << ins << " = insertvalue { i1 } undef, i1 true, 0\n";
-            body_ss_ << "  ret { i1 } " << ins << "\n";
+        // Zig-style: store error code to current function's err_slot
+        // and return zero/poison of the success type
+        body_ss_ << "  store i32 " << err_code << ", ptr " << current_err_slot_ << "\n";
+        std::string crt = llvmType(current_return_type_);
+        if (crt == "void") {
+            body_ss_ << "  ret void\n";
         } else {
-            std::string vg = nextReg();
-            body_ss_ << "  " << vg << " = getelementptr " << est
-                     << ", ptr " << result_ptr << ", i32 0, i32 0\n";
-            std::string vr = nextReg();
-            body_ss_ << "  " << vr << " = load " << vt << ", ptr " << vg << "\n";
-            std::string i1 = nextReg();
-            body_ss_ << "  " << i1 << " = insertvalue " << crt
-                     << " undef, " << vt << " " << vr << ", 0\n";
-            std::string i2 = nextReg();
-            body_ss_ << "  " << i2 << " = insertvalue " << crt
-                     << " " << i1 << ", i1 true, 1\n";
-            body_ss_ << "  ret " << crt << " " << i2 << "\n";
+            body_ss_ << "  ret " << crt << " 0\n";
         }
     } else {
-        // BUG FIX: Non-error-returning function should not just 'ret void'.
-        // Return a zero value of the function's actual return type.
+        // Non-error-returning function — return zero of the actual return type
         if (current_return_type_ && !current_return_type_->isVoid()) {
             body_ss_ << "  ret " << llvmType(current_return_type_) << " 0\n";
         } else {
@@ -2570,12 +2543,10 @@ std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId er
     setTerminated(false);
 
     if (vt == "void") return "";
-    std::string vg = nextReg();
-    body_ss_ << "  " << vg << " = getelementptr " << est
-             << ", ptr " << result_ptr << ", i32 0, i32 0\n";
-    if (isAggregateType(err.successType())) return vg;
+    // result_ptr is a pointer to an alloca containing the success value
+    if (isAggregateType(err.successType())) return result_ptr;
     std::string vr = nextReg();
-    body_ss_ << "  " << vr << " = load " << vt << ", ptr " << vg << "\n";
+    body_ss_ << "  " << vr << " = load " << vt << ", ptr " << result_ptr << "\n";
     return vr;
 }
 
@@ -2609,25 +2580,39 @@ int IRGenerator::emitSimdLoopMetadata() {
     auto it = metadata_map_.find("llvm.loop.simd");
     if (it != metadata_map_.end()) return it->second;
 
-    // Create individual metadata entries for each vectorization hint
-    int enable_id    = metadata_counter_++;
-    int width_id     = metadata_counter_++;
+    // Create individual metadata entries for each vectorization hint.
+    // LLVM expects specific types for each option:
+    //   vectorize.enable    → i1 true (boolean flag)
+    //   vectorize.width     → i32 N   (vector width in elements)
+    //   interleave.count    → i32 N   (interleave factor)
+    int enable_id     = metadata_counter_++;
+    int width_id      = metadata_counter_++;
     int interleave_id = metadata_counter_++;
 
     metadata_entries_.push_back({enable_id,
-        "!{!\"llvm.loop.vectorize.enable\", i32 1}"});
+        "!{!\"llvm.loop.vectorize.enable\", i1 true}"});
     metadata_entries_.push_back({width_id,
         "!{!\"llvm.loop.vectorize.width\", i32 4}"});
     metadata_entries_.push_back({interleave_id,
-        "!{!\"llvm.loop.interleave.count\", i32 2}"});
+        "!{!\"llvm.loop.interleave.count\", i32 4}"});
 
-    // Create the loop metadata grouping node (distinct, self-referencing)
-    int loop_id = metadata_counter_++;
-    std::string content = "distinct !{!" + std::to_string(loop_id)
-        + ", !" + std::to_string(enable_id)
+    // Create the loop metadata grouping node — contains all the property nodes.
+    //   !4 = !{!1, !2, !3}
+    int group_id = metadata_counter_++;
+    std::string group_content = "!{!" + std::to_string(enable_id)
         + ", !" + std::to_string(width_id)
         + ", !" + std::to_string(interleave_id) + "}";
-    metadata_entries_.push_back({loop_id, content});
+    metadata_entries_.push_back({group_id, group_content});
+
+    // Create the self-referencing distinct metadata node that LLVM requires.
+    // The !llvm.loop annotation must point to a distinct node that references
+    // itself as the first operand.  This is how LLVM identifies the start of
+    // a loop metadata chain.
+    //   !5 = distinct !{!5, !4}
+    int loop_id = metadata_counter_++;
+    std::string loop_content = "distinct !{!" + std::to_string(loop_id)
+        + ", !" + std::to_string(group_id) + "}";
+    metadata_entries_.push_back({loop_id, loop_content});
 
     metadata_map_["llvm.loop.simd"] = loop_id;
     return loop_id;

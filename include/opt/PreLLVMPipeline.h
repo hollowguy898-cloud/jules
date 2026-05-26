@@ -37,7 +37,8 @@ enum class ASTAnnotationKind : uint8_t {
     SoATransformed,     // This struct has been SoA-transformed
     AllocatorInlined,   // This allocation call was inlined
     HotField,           // This field access is on the hot path (PGO)
-    ColdField           // This field access is on the cold path (PGO)
+    ColdField,          // This field access is on the cold path (PGO)
+    StackAllocated      // This smart pointer allocation can use stack instead of heap
 };
 
 struct ASTAnnotation {

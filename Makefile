@@ -5,7 +5,7 @@
 # Compiler and flags
 CXX       = g++
 CC        = gcc
-CXXFLAGS  = -std=c++17 -Wall -Wextra -O2 -I include
+CXXFLAGS  = -std=c++17 -Wall -Wextra -O3 -march=native -flto -I include
 CFLAGS    = -std=c11 -Wall -Wextra -O2
 
 # Directories

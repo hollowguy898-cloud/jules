@@ -178,12 +178,29 @@ uint64_t FieldReorderer::computeLayoutSize(
 {
     uint64_t offset = 0;
     uint64_t max_align = 1;
-    for (int idx : order) {
+    FieldHotness prev_hotness = FieldHotness::Hot; // start as Hot — first fields assumed hot
+
+    for (size_t i = 0; i < order.size(); ++i) {
+        int idx = order[i];
         uint64_t fa = fieldAlignment(fields[idx].type);
         uint64_t fs = fieldSizeBytes(fields[idx].type);
+        FieldHotness cur_hotness = classifyHotness(fields[idx].type);
+
         max_align = std::max(max_align, fa);
+
+        // Cache-line padding: when transitioning between hotness categories,
+        // pad to the next cache line boundary. This prevents hot loop data
+        // from sharing a cache line with cold/setup data (false sharing).
+        if (i > 0 && cur_hotness != prev_hotness) {
+            uint64_t line_boundary = alignUp(offset, CACHE_LINE_SIZE);
+            if (offset < line_boundary) {
+                offset = line_boundary; // pad to next cache line
+            }
+        }
+
         offset = alignUp(offset, fa);
         offset += fs;
+        prev_hotness = cur_hotness;
     }
     offset = alignUp(offset, max_align);
     return offset;
@@ -208,7 +225,11 @@ ReorderResult FieldReorderer::analyze(StructDecl& decl) {
     // Compute original layout size
     result.original_size = computeLayoutSize(fields, result.original_order);
 
-    // Build sorted order: stable sort by alignment descending
+    // Build sorted order: two-level stable sort
+    //   Primary:   alignment descending (minimises padding waste)
+    //   Secondary: hotness ascending (Hot first, then Warm, then Cold)
+    //              — groups hot primitives into the first cache line(s)
+    //              — pushes cold data (structs, slices) to later lines
     result.reordered_order.resize(n);
     for (int i = 0; i < n; ++i) {
         result.reordered_order[i] = i;
@@ -218,7 +239,13 @@ ReorderResult FieldReorderer::analyze(StructDecl& decl) {
             uint64_t align_a = fieldAlignment(fields[a].type);
             uint64_t align_b = fieldAlignment(fields[b].type);
             if (align_a != align_b) return align_a > align_b;
-            // Preserve original declaration order for same-alignment fields
+
+            // Phase 2: within same alignment, sort by hotness
+            FieldHotness hot_a = classifyHotness(fields[a].type);
+            FieldHotness hot_b = classifyHotness(fields[b].type);
+            if (hot_a != hot_b) return static_cast<uint8_t>(hot_a) < static_cast<uint8_t>(hot_b);
+
+            // Preserve original declaration order for same-alignment, same-hotness fields
             return a < b;
         });
 
