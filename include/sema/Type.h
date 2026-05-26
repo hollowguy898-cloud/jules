@@ -331,7 +331,10 @@ public:
         std::string result = "struct:" + name_ + "{";
         for (size_t i = 0; i < fields_.size(); ++i) {
             if (i > 0) result += ",";
-            result += fields_[i].name + ":" + fields_[i].type->toString();
+            result += fields_[i].name + ":";
+            // BUG FIX: Guard against null TypeId on struct fields
+            if (fields_[i].type) result += fields_[i].type->toString();
+            else result += "<null>";
         }
         result += "}";
         return result;
@@ -340,7 +343,8 @@ public:
     uint64_t bitWidth() const override {
         uint64_t total = 0;
         for (const auto& f : fields_) {
-            total += f.type->bitWidth();
+            // BUG FIX: Guard against null TypeId on struct fields
+            if (f.type) total += f.type->bitWidth();
         }
         return total;
     }
@@ -567,13 +571,21 @@ public:
         for (size_t i = 0; i < params_.size(); ++i) {
             if (i > 0) result += ",";
             if (params_[i].is_mutable) result += "var ";
-            result += params_[i].name + ":" + params_[i].type->toString();
+            result += params_[i].name + ":";
+            // BUG FIX: Guard against null TypeId on params
+            if (params_[i].type) result += params_[i].type->toString();
+            else result += "<null>";
         }
         result += ")";
         if (is_pure_) result += " pure";
-        result += " -> " + return_type_->toString();
+        result += " -> ";
+        // BUG FIX: Guard against null return type
+        if (return_type_) result += return_type_->toString();
+        else result += "<null>";
         if (canError()) {
-            result += " !" + error_type_->toString();
+            result += " !";
+            if (error_type_) result += error_type_->toString();
+            else result += "<null>";
         }
         return result;
     }

@@ -725,8 +725,11 @@ TypeId SemanticAnalyzer::analyzeIdentExpr(IdentExpr& ie) {
 
         emitError(ie.sourceLoc(),
                   "use of undeclared identifier '" + ie.name() + "'");
-        ie.setType(TypeId());
-        return TypeId();
+        // BUG FIX: Set PoisonType instead of null TypeId, so downstream code
+        // can safely call methods on the type without crashing.
+        auto poison = type_table_.getPoison();
+        ie.setType(poison);
+        return poison;
     }
 
     ie.setType(sym->type());

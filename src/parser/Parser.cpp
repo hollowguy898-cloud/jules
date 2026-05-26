@@ -897,12 +897,22 @@ std::unique_ptr<Expr> Parser::parseExpr() {
     return parseOrExpr();
 }
 
+// BUG FIX: Helper to replace null expression with PoisonExpr so that
+// downstream code (semantic analyzer, code generator) never sees a null
+// unique_ptr<Expr> which would cause crashes.
+static std::unique_ptr<Expr> ensureExpr(std::unique_ptr<Expr> e, SourceLocation loc = SourceLocation()) {
+    if (!e) {
+        return std::make_unique<PoisonExpr>(loc, "missing expression");
+    }
+    return e;
+}
+
 // ||
 std::unique_ptr<Expr> Parser::parseOrExpr() {
     auto left = parseAndExpr();
     while (match(TokenKind::PIPE_PIPE)) {
         SourceLocation op_loc = locFrom(previous());
-        auto right = parseAndExpr();
+        auto right = ensureExpr(parseAndExpr());
         left = std::make_unique<BinaryExpr>(
             std::move(op_loc), BinaryOp::Or,
             std::move(left), std::move(right));
@@ -915,7 +925,7 @@ std::unique_ptr<Expr> Parser::parseAndExpr() {
     auto left = parseBitOrExpr();
     while (match(TokenKind::AMP_AMP)) {
         SourceLocation op_loc = locFrom(previous());
-        auto right = parseBitOrExpr();
+        auto right = ensureExpr(parseBitOrExpr());
         left = std::make_unique<BinaryExpr>(
             std::move(op_loc), BinaryOp::And,
             std::move(left), std::move(right));
@@ -928,7 +938,7 @@ std::unique_ptr<Expr> Parser::parseBitOrExpr() {
     auto left = parseBitXorExpr();
     while (match(TokenKind::PIPE)) {
         SourceLocation op_loc = locFrom(previous());
-        auto right = parseBitXorExpr();
+        auto right = ensureExpr(parseBitXorExpr());
         left = std::make_unique<BinaryExpr>(
             std::move(op_loc), BinaryOp::BitOr,
             std::move(left), std::move(right));
@@ -941,7 +951,7 @@ std::unique_ptr<Expr> Parser::parseBitXorExpr() {
     auto left = parseBitAndExpr();
     while (match(TokenKind::CARET)) {
         SourceLocation op_loc = locFrom(previous());
-        auto right = parseBitAndExpr();
+        auto right = ensureExpr(parseBitAndExpr());
         left = std::make_unique<BinaryExpr>(
             std::move(op_loc), BinaryOp::BitXor,
             std::move(left), std::move(right));
@@ -954,7 +964,7 @@ std::unique_ptr<Expr> Parser::parseBitAndExpr() {
     auto left = parseEqualityExpr();
     while (match(TokenKind::AMP)) {
         SourceLocation op_loc = locFrom(previous());
-        auto right = parseEqualityExpr();
+        auto right = ensureExpr(parseEqualityExpr());
         left = std::make_unique<BinaryExpr>(
             std::move(op_loc), BinaryOp::BitAnd,
             std::move(left), std::move(right));
@@ -969,7 +979,7 @@ std::unique_ptr<Expr> Parser::parseEqualityExpr() {
         Token op_tok = advance();
         BinaryOp op = (op_tok.kind() == TokenKind::EQ_EQ)
                           ? BinaryOp::Eq : BinaryOp::Ne;
-        auto right = parseComparisonExpr();
+        auto right = ensureExpr(parseComparisonExpr());
         left = std::make_unique<BinaryExpr>(
             locFrom(op_tok), op, std::move(left), std::move(right));
     }
@@ -990,7 +1000,7 @@ std::unique_ptr<Expr> Parser::parseComparisonExpr() {
             case TokenKind::GE: op = BinaryOp::Ge; break;
             default: op = BinaryOp::Lt; break; // unreachable
         }
-        auto right = parseShiftExpr();
+        auto right = ensureExpr(parseShiftExpr());
         left = std::make_unique<BinaryExpr>(
             locFrom(op_tok), op, std::move(left), std::move(right));
     }
@@ -1004,7 +1014,7 @@ std::unique_ptr<Expr> Parser::parseShiftExpr() {
         Token op_tok = advance();
         BinaryOp op = (op_tok.kind() == TokenKind::SHL)
                           ? BinaryOp::Shl : BinaryOp::Shr;
-        auto right = parseAdditiveExpr();
+        auto right = ensureExpr(parseAdditiveExpr());
         left = std::make_unique<BinaryExpr>(
             locFrom(op_tok), op, std::move(left), std::move(right));
     }
@@ -1018,7 +1028,7 @@ std::unique_ptr<Expr> Parser::parseAdditiveExpr() {
         Token op_tok = advance();
         BinaryOp op = (op_tok.kind() == TokenKind::PLUS)
                           ? BinaryOp::Add : BinaryOp::Sub;
-        auto right = parseMultiplicativeExpr();
+        auto right = ensureExpr(parseMultiplicativeExpr());
         left = std::make_unique<BinaryExpr>(
             locFrom(op_tok), op, std::move(left), std::move(right));
     }
@@ -1038,7 +1048,7 @@ std::unique_ptr<Expr> Parser::parseMultiplicativeExpr() {
             case TokenKind::PERCENT: op = BinaryOp::Mod; break;
             default: op = BinaryOp::Mul; break; // unreachable
         }
-        auto right = parseUnaryExpr();
+        auto right = ensureExpr(parseUnaryExpr());
         left = std::make_unique<BinaryExpr>(
             locFrom(op_tok), op, std::move(left), std::move(right));
     }

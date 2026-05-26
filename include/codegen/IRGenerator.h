@@ -155,9 +155,43 @@ private:
     int reg_counter_   = 0;
     int label_counter_ = 0;
 
-    // Map source variable names → LLVM alloca register names
-    std::unordered_map<std::string, std::string> var_allocas_;
+    // Scoped variable allocation map — each scope level has its own map
+    // of variable names → LLVM alloca register names. On block exit, the
+    // scope is popped, restoring access to outer variables.
+    std::vector<std::unordered_map<std::string, std::string>> scope_stack_;
+
+    // Push a new variable scope (call on block entry)
+    void pushScope() { scope_stack_.emplace_back(); }
+
+    // Pop a variable scope (call on block exit)
+    void popScope() { if (!scope_stack_.empty()) scope_stack_.pop_back(); }
+
+    // Look up a variable name in the scope stack (innermost first)
+    std::string* lookupVarAlloca(const std::string& name) {
+        for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it) {
+            auto found = it->find(name);
+            if (found != it->end()) return &found->second;
+        }
+        // Fallback: check the flat map for function parameters (pre-scope)
+        auto found = var_allocas_.find(name);
+        if (found != var_allocas_.end()) return &found->second;
+        return nullptr;
+    }
+
+    // Register a variable in the current (innermost) scope
+    void registerVarAlloca(const std::string& name, const std::string& alloca) {
+        if (!scope_stack_.empty()) {
+            scope_stack_.back()[name] = alloca;
+        } else {
+            var_allocas_[name] = alloca;
+        }
+    }
+
     std::unordered_set<std::string>               used_alloca_names_;
+
+    // Function-level variable allocas (for parameters, which are registered
+    // before any scope is pushed). Block-scoped variables go into scope_stack_.
+    std::unordered_map<std::string, std::string> var_allocas_;
 
     // Defer stack (raw Stmt pointers – owned by the AST, not by us)
     std::vector<Stmt*> defer_stack_;

@@ -103,13 +103,26 @@ uint64_t IRGenerator::typeSizeBytes(TypeId type) const {
         }
         case TypeKind::Error: {
             auto& err = cast<ErrorType>(type);
+            // BUG FIX: Guard against null success type
+            if (err.successType().isNull()) return 2; // i1 flag + padding
             uint64_t vs = typeSizeBytes(err.successType());
             uint64_t va = typeAlignmentBytes(err.successType());
+            if (va == 0) va = 1;
             vs = ((vs + va - 1) / va) * va;
             return vs + 1;
         }
         case TypeKind::Fn: return 8;
         case TypeKind::Poison: return 0;
+        // BUG FIX: Handle AlignedType — size is same as inner type
+        case TypeKind::Aligned: {
+            auto& at = cast<AlignedType>(type);
+            return at.inner().isNull() ? 0 : typeSizeBytes(at.inner());
+        }
+        // BUG FIX: Handle OpaqueType — size is sizeBytes()
+        case TypeKind::Opaque: {
+            auto& ot = cast<OpaqueType>(type);
+            return ot.sizeBytes();
+        }
         default: return 8;
     }
 }
@@ -139,6 +152,19 @@ uint64_t IRGenerator::typeAlignmentBytes(TypeId type) const {
         case TypeKind::Error:        return 8;
         case TypeKind::Fn:           return 8;
         case TypeKind::Poison:        return 1;
+        // BUG FIX: Handle AlignedType — alignment comes from the inner type
+        case TypeKind::Aligned: {
+            auto& at = cast<AlignedType>(type);
+            if (at.inner().isNull()) return 1;
+            // Use the max of the inner alignment and the explicit alignment
+            uint64_t inner_a = typeAlignmentBytes(at.inner());
+            return std::max<uint64_t>(inner_a, at.alignment());
+        }
+        // BUG FIX: Handle OpaqueType — alignment is max(1, sizeBytes/8)
+        case TypeKind::Opaque: {
+            auto& ot = cast<OpaqueType>(type);
+            return std::max<uint64_t>(1, ot.sizeBytes() / 8);
+        }
         default:                     return 8;
     }
 }
@@ -531,14 +557,32 @@ void IRGenerator::emitStructDecl(StructDecl* sd) {
     // Type defs are handled in emitTypeDefinitions(), but if the struct has
     // a non-default alignment, we need to re-emit with the alignment info.
     if (sd && sd->alignment() > 0) {
-        auto key = sd->name();
-        // Look up the type info - need to construct the key from the struct type
+        // BUG FIX: Build the correct key matching needed_types_ format.
+        // The key is type->toString() (e.g. "struct:Name{...}"), not sd->name().
+        // Since we need the type from the type table, build the body directly.
         std::string body_str;
         std::string ll_name = "%struct." + sanitizeName(sd->name());
         for (size_t i = 0; i < sd->fieldCount(); ++i) {
             if (i > 0) body_str += ", ";
             body_str += llvmType(sd->fields()[i].type);
         }
+        // Remove old entry with the non-aligned key if it exists, to avoid
+        // duplicate type definitions. Search by ll_name prefix.
+        for (auto it = needed_types_.begin(); it != needed_types_.end(); ++it) {
+            if (it->second.llvm_name == ll_name) {
+                needed_types_.erase(it);
+                break;
+            }
+        }
+        // Also remove from emit order
+        type_emit_order_.erase(
+            std::remove_if(type_emit_order_.begin(), type_emit_order_.end(),
+                [&](const std::string& k) {
+                    auto it = needed_types_.find(k);
+                    return it != needed_types_.end() && it->second.llvm_name == ll_name;
+                }),
+            type_emit_order_.end());
+
         module_out_ << ll_name << " = type <{ " << body_str << " }> ; align " << sd->alignment() << "\n";
     }
 }
@@ -564,6 +608,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     reg_counter_ = 0;
     label_counter_ = 0;
     var_allocas_.clear();
+    scope_stack_.clear();
     used_alloca_names_.clear();
     defer_stack_.clear();
     errdefer_stack_.clear();
@@ -671,18 +716,41 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     if (!isTerminated()) {
         emitDeferBlocks();
         if (current_can_error_) {
+            // BUG FIX: Use the function's error type to build the return struct,
+            // not just llvmType(current_return_type_). The return type for an
+            // error-returning function is {success_type, i1}, and we need to
+            // match the function signature exactly.
+            std::string rt = llvmReturnType(current_return_type_, true);
             std::string ll_val = llvmType(current_return_type_);
-            std::string zero = nextReg();
             if (ll_val == "void") {
+                std::string zero = nextReg();
                 body_ss_ << "  " << zero << " = insertvalue { i1 } undef, i1 false, 0\n";
                 body_ss_ << "  ret { i1 } " << zero << "\n";
+            } else if (isAggregateType(current_return_type_)) {
+                // Aggregate: zero-initialize via memset, then load and return
+                std::string zero = nextReg();
+                alloca_ss_ << "  " << zero << " = alloca " << ll_val << "\n";
+                needed_runtime_.insert("memset");
+                body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << zero
+                         << ", i8 0, i64 " << typeSizeBytes(current_return_type_)
+                         << ", i1 false)\n";
+                std::string loaded = nextReg();
+                body_ss_ << "  " << loaded << " = load " << ll_val << ", ptr " << zero << "\n";
+                std::string i1 = nextReg();
+                body_ss_ << "  " << i1 << " = insertvalue " << rt
+                         << " undef, " << ll_val << " " << loaded << ", 0\n";
+                std::string i2 = nextReg();
+                body_ss_ << "  " << i2 << " = insertvalue " << rt
+                         << " " << i1 << ", i1 false, 1\n";
+                body_ss_ << "  ret " << rt << " " << i2 << "\n";
             } else {
-                body_ss_ << "  " << zero << " = insertvalue { " << ll_val << ", i1 } undef, "
-                         << ll_val << " 0, 0\n";
+                std::string zero = nextReg();
+                body_ss_ << "  " << zero << " = insertvalue " << rt
+                         << " undef, " << ll_val << " 0, 0\n";
                 std::string z2 = nextReg();
-                body_ss_ << "  " << z2 << " = insertvalue { " << ll_val << ", i1 } "
-                         << zero << ", i1 false, 1\n";
-                body_ss_ << "  ret { " << ll_val << ", i1 } " << z2 << "\n";
+                body_ss_ << "  " << z2 << " = insertvalue " << rt
+                         << " " << zero << ", i1 false, 1\n";
+                body_ss_ << "  ret " << rt << " " << z2 << "\n";
             }
         } else if (current_return_type_ && current_return_type_->isVoid()) {
             body_ss_ << "  ret void\n";
@@ -751,8 +819,10 @@ std::string IRGenerator::emitAtomicRMW(const std::string& result_reg,
         default: rmw_op = "add"; break;
     }
 
+    // BUG FIX: LLVM 15+ opaque-pointer syntax requires 'ptr' type keyword
+    // before the pointer operand in atomicrmw
     body_ss_ << "  " << result_reg << " = atomicrmw " << rmw_op << " " << ll_type
-             << " " << ptr_reg << ", " << ll_type << " " << val_reg
+             << " ptr " << ptr_reg << ", " << ll_type << " " << val_reg
              << " " << ordering_str << "\n";
     return result_reg;
 }
@@ -762,10 +832,12 @@ std::string IRGenerator::emitAtomicRMW(const std::string& result_reg,
 // ============================================================================
 void IRGenerator::emitBlockStmt(BlockStmt* block) {
     if (!block) return;
+    pushScope();
     for (const auto& stmt : block->stmts()) {
         if (isTerminated()) break;
         emitStmt(stmt.get());
     }
+    popScope();
 }
 
 // ============================================================================
@@ -784,7 +856,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             std::string ll = llvmType(var_type);
             std::string aname = makeAllocaName(vd.name());
             alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
-            var_allocas_[vd.name()] = aname;
+            registerVarAlloca(vd.name(), aname);
             if (vd.hasInit()) {
                 std::string val = emitExpr(vd.init());
                 if (isAggregateType(var_type)) {
@@ -808,7 +880,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             std::string ll = llvmType(val_type);
             std::string aname = makeAllocaName(vd.name());
             alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
-            var_allocas_[vd.name()] = aname;
+            registerVarAlloca(vd.name(), aname);
             if (vd.hasInit()) {
                 std::string val = emitExpr(vd.init());
                 if (isAggregateType(val_type)) {
@@ -1087,6 +1159,23 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             needed_runtime_.insert("tether_yield");
             if (ys.hasValue()) {
                 std::string val = emitExpr(ys.value());
+                // BUG FIX: Cast non-i64 values to i64 before passing to tether_yield.
+                // tether_yield expects i64, but the yielded value may be i32, f64, etc.
+                TypeId val_type = ys.value()->getType();
+                if (val_type && !val_type->isVoid()) {
+                    std::string ll = llvmType(val_type);
+                    if (ll != "i64") {
+                        std::string cast_val = nextReg();
+                        if (ll == "f64" || ll == "f32") {
+                            body_ss_ << "  " << cast_val << " = fptosi " << ll
+                                     << " " << val << " to i64\n";
+                        } else {
+                            body_ss_ << "  " << cast_val << " = zext " << ll
+                                     << " " << val << " to i64\n";
+                        }
+                        val = cast_val;
+                    }
+                }
                 body_ss_ << "  call void @tether_yield(i64 " << val << ")\n";
             } else {
                 body_ss_ << "  call void @tether_yield(i64 0)\n";
@@ -1159,13 +1248,13 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     // ========================================================================
     case NodeKind::IdentExpr: {
         auto& id = cast<IdentExpr>(*expr);
-        auto it = var_allocas_.find(id.name());
-        if (it != var_allocas_.end()) {
+        auto* alloca = lookupVarAlloca(id.name());
+        if (alloca) {
             TypeId ty = expr->getType();
-            if (isAggregateType(ty)) return it->second;
+            if (isAggregateType(ty)) return *alloca;
             std::string ll = llvmType(ty);
             std::string reg = nextReg();
-            body_ss_ << "  " << reg << " = load " << ll << ", ptr " << it->second << "\n";
+            body_ss_ << "  " << reg << " = load " << ll << ", ptr " << *alloca << "\n";
             return reg;
         }
         // Global / function name
@@ -1198,11 +1287,14 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         // Compound assignment: load, compute, store
         if (op >= BinaryOp::AddAssign && op <= BinaryOp::ShrAssign) {
+            // BUG FIX: Load the old value BEFORE computing the lvalue,
+            // to ensure correct evaluation order even if the lvalue
+            // computation has side effects (e.g., array index).
+            std::string lhs = emitExpr(bin.left());
+            std::string rhs = emitExpr(bin.right());
             std::string target_ptr = emitLValue(bin.left());
             TypeId target_type = bin.left()->getType();
             std::string ll = llvmType(target_type);
-            std::string lhs = emitExpr(bin.left());
-            std::string rhs = emitExpr(bin.right());
 
             // Map compound op to its base op
             BinaryOp base_op;
@@ -1730,6 +1822,16 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     case NodeKind::StructInitExpr: {
         auto& si = cast<StructInitExpr>(*expr);
         TypeId ty = expr->getType();
+
+        // BUG FIX: Guard against null or non-struct types (e.g., PoisonType
+        // from error-resilient compilation). Emit a zero-initialized alloca.
+        if (!ty || !isa<StructType>(ty)) {
+            std::string ll = llvmType(ty);
+            std::string aname = nextReg();
+            alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
+            return aname;
+        }
+
         std::string ll = llvmType(ty);
         std::string aname = nextReg();
         alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
@@ -1839,15 +1941,31 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             return result;
         }
 
+        auto& err = cast<ErrorType>(operand_type);
+        std::string vt = llvmType(err.successType());
+        std::string est = llvmType(operand_type);
+
+        // BUG FIX: The result from emitExpr for an ErrorType returning call
+        // is a *pointer* to an alloca, not a first-class struct value.
+        // We must load the struct before using extractvalue.
+        std::string loaded_struct = nextReg();
+        body_ss_ << "  " << loaded_struct << " = load " << est
+                 << ", ptr " << result << "\n";
+
         // Check the error flag and branch
-        // For ErrorType, the result is a struct { T value, i1 error_flag }
-        // Extract the error flag and if set, do early return
+        // For ErrorType, the struct is { T value, i1 error_flag }
         std::string value_reg = nextReg();
         std::string err_flag_reg = nextReg();
-        body_ss_ << "  " << value_reg << " = extractvalue {"
-                 << llvmType(te.getType()) << ", i1} " << result << ", 0\n";
-        body_ss_ << "  " << err_flag_reg << " = extractvalue {"
-                 << llvmType(te.getType()) << ", i1} " << result << ", 1\n";
+        if (vt == "void") {
+            // { i1 } — only the error flag
+            body_ss_ << "  " << err_flag_reg << " = extractvalue { i1 } "
+                     << loaded_struct << ", 0\n";
+        } else {
+            body_ss_ << "  " << value_reg << " = extractvalue " << est
+                     << " " << loaded_struct << ", 0\n";
+            body_ss_ << "  " << err_flag_reg << " = extractvalue " << est
+                     << " " << loaded_struct << ", 1\n";
+        }
 
         std::string err_label = nextLabel("try_err");
         std::string ok_label = nextLabel("try_ok");
@@ -1859,12 +1977,33 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         emitErrdeferBlocks();
         emitDeferBlocks();
         if (!isTerminated()) {
-            body_ss_ << "  ret {" << llvmType(current_return_type_) << ", i1} " << result << "\n";
+            // Return the error struct from the current function's error return type
+            if (current_can_error_) {
+                std::string crt = llvmReturnType(current_return_type_, true);
+                // Re-propagate the error value
+                if (vt == "void") {
+                    std::string ins = nextReg();
+                    body_ss_ << "  " << ins << " = insertvalue { i1 } undef, i1 true, 0\n";
+                    body_ss_ << "  ret { i1 } " << ins << "\n";
+                } else {
+                    std::string i1 = nextReg();
+                    body_ss_ << "  " << i1 << " = insertvalue " << crt
+                             << " undef, " << vt << " " << value_reg << ", 0\n";
+                    std::string i2 = nextReg();
+                    body_ss_ << "  " << i2 << " = insertvalue " << crt
+                             << " " << i1 << ", i1 true, 1\n";
+                    body_ss_ << "  ret " << crt << " " << i2 << "\n";
+                }
+            } else {
+                // Non-error function returning early from try — return zero
+                body_ss_ << "  ret " << llvmType(current_return_type_) << " 0\n";
+            }
         }
         setTerminated(true);
 
         body_ss_ << ok_label << ":\n";
         setTerminated(false);
+        if (vt == "void") return "";  // no value to extract
         return value_reg;
     }
 
@@ -1986,8 +2125,8 @@ std::string IRGenerator::emitLValue(Expr* expr) {
     switch (expr->getKind()) {
         case NodeKind::IdentExpr: {
             auto& id = cast<IdentExpr>(*expr);
-            auto it = var_allocas_.find(id.name());
-            if (it != var_allocas_.end()) return it->second;
+            auto* alloca = lookupVarAlloca(id.name());
+            if (alloca) return *alloca;
             return "@" + sanitizeName(id.name());
         }
 
@@ -2278,7 +2417,8 @@ std::string IRGenerator::emitArcClone(const std::string& arc_ptr, TypeId pointee
     std::string rcg = nextReg();
     body_ss_ << "  " << rcg << " = getelementptr i64, ptr " << dp << ", i64 0\n";
     std::string old = nextReg();
-    body_ss_ << "  " << old << " = atomicrmw add ptr " << rcg << ", i64 1 acquire\n";
+    // BUG FIX: atomicrmw type must be i64 (the integer type), not ptr
+    body_ss_ << "  " << old << " = atomicrmw add i64 ptr " << rcg << ", i64 1 acquire\n";
 
     // Copy struct
     std::string na = nextReg();
@@ -2304,7 +2444,8 @@ void IRGenerator::emitArcDrop(const std::string& arc_ptr, TypeId pointee_type) {
     std::string rcg = nextReg();
     body_ss_ << "  " << rcg << " = getelementptr i64, ptr " << dp << ", i64 0\n";
     std::string old = nextReg();
-    body_ss_ << "  " << old << " = atomicrmw sub ptr " << rcg << ", i64 1 release\n";
+    // BUG FIX: atomicrmw type must be i64 (the integer type), not ptr
+    body_ss_ << "  " << old << " = atomicrmw sub i64 ptr " << rcg << ", i64 1 release\n";
 
     // If old was 1, free
     std::string iz = nextReg();
@@ -2364,7 +2505,13 @@ std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId er
             body_ss_ << "  ret " << crt << " " << i2 << "\n";
         }
     } else {
-        body_ss_ << "  ret void\n";
+        // BUG FIX: Non-error-returning function should not just 'ret void'.
+        // Return a zero value of the function's actual return type.
+        if (current_return_type_ && !current_return_type_->isVoid()) {
+            body_ss_ << "  ret " << llvmType(current_return_type_) << " 0\n";
+        } else {
+            body_ss_ << "  ret void\n";
+        }
     }
     setTerminated(true);
 
