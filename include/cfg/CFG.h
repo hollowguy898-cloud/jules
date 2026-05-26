@@ -170,16 +170,17 @@ public:
 
     // Lookup a node by its ID
     CFGNode* nodeById(CFGNode::NodeId id) {
-        for (auto& n : nodes_) {
-            if (n->id() == id) return n.get();
-        }
+        // O(1) lookup via index map
+        auto it = node_index_.find(id);
+        if (it != node_index_.end() && it->second < nodes_.size())
+            return nodes_[it->second].get();
         return nullptr;
     }
 
     const CFGNode* nodeById(CFGNode::NodeId id) const {
-        for (auto& n : nodes_) {
-            if (n->id() == id) return n.get();
-        }
+        auto it = node_index_.find(id);
+        if (it != node_index_.end() && it->second < nodes_.size())
+            return nodes_[it->second].get();
         return nullptr;
     }
 
@@ -221,6 +222,14 @@ public:
         return result;
     }
 
+    // Rebuild the node_index_ map from nodes_. Call after adding nodes.
+    void rebuildNodeIndex() {
+        node_index_.clear();
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            node_index_[nodes_[i]->id()] = i;
+        }
+    }
+
 private:
     void dfsPostorder(CFGNode* node,
                       std::unordered_set<CFGNode::NodeId>& visited,
@@ -240,6 +249,7 @@ private:
     CFGNode* exit_;
     CFGNode::NodeId next_id_;
     std::vector<std::unique_ptr<CFGNode>> nodes_;
+    std::unordered_map<CFGNode::NodeId, size_t> node_index_;  // id → index in nodes_ (O(1) lookup)
 };
 
 // ============================================================================

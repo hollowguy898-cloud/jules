@@ -43,6 +43,9 @@ std::unique_ptr<CFG> CFGBuilder::build(FnDecl& fn) {
         entry->addSuccessor(exit);
     }
 
+    // Build the O(1) node index for nodeById lookups
+    cfg->rebuildNodeIndex();
+
     return cfg;
 }
 

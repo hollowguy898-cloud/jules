@@ -218,6 +218,11 @@ private:
     // Errdefer stack (similar to defer_stack_ but only runs on error paths)
     std::vector<Stmt*> errdefer_stack_;
 
+    // Stack-allocated Box pointers (from EscapeAnalysis StackAllocated annotation).
+    // Tracks which Box alloca names were stack-allocated so emitBoxDrop can
+    // skip the free() call. Cleared per-function.
+    std::unordered_set<std::string> stack_box_allocas_;
+
     // Track whether current function can error (for errdefer codegen)
     bool current_fn_can_error_ = false;
 

@@ -435,13 +435,13 @@ void IRGenerator::emitTypeDefinitions() {
 void IRGenerator::emitRuntimeDecls() {
     bool any = false;
     if (needed_runtime_.count("malloc")) {
-        module_out_ << "declare ptr @malloc(i64)\n"; any = true;
+        module_out_ << "declare ptr @malloc(i64) nounwind allockind(\"alloc,uninitialized\") allocsize(0)\n"; any = true;
     }
     if (needed_runtime_.count("free")) {
-        module_out_ << "declare void @free(ptr)\n"; any = true;
+        module_out_ << "declare void @free(ptr nocapture writeonly) nounwind\n"; any = true;
     }
     if (needed_runtime_.count("realloc")) {
-        module_out_ << "declare ptr @realloc(ptr, i64)\n"; any = true;
+        module_out_ << "declare ptr @realloc(ptr, i64) nounwind\n"; any = true;
     }
     if (needed_runtime_.count("printf")) {
         module_out_ << "declare i32 @printf(ptr, ...)\n"; any = true;
@@ -629,6 +629,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     used_alloca_names_.clear();
     defer_stack_.clear();
     errdefer_stack_.clear();
+    stack_box_allocas_.clear();  // Clear stack-allocated Box tracking
     current_fn_can_error_ = fn->canError();
     terminated_ = false;
     current_return_type_ = fn->returnType();
@@ -653,33 +654,108 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     std::string ret_type = llvmType(fn->returnType());
 
     // Build function signature
-    // Linkage heuristic:
+    // Linkage + inlining strategy:
     //   main      → external (must be visible to the linker entry point)
-    //   pure      → linkonce_odr (safe to deduplicate across modules)
+    //   pure      → alwaysinline (no side effects → always profitable to inline)
+    //   small fn  → inlinehint (let LLVM know it's small and likely worth inlining)
     //   otherwise → internal (allows aggressive inlining by LLVM)
     std::string linkage;
+    std::string inlining_attr;
+    bool is_small_fn = fn->body() && fn->body()->stmts().size() <= 3;
     if (fn->name() == "main") {
         linkage = "";  // external: define dso_local
     } else if (fn->isPure()) {
-        linkage = "linkonce_odr ";
-    } else {
+        // Pure functions have no side effects → always profitable to inline.
+        // Use alwaysinline for small pure fns, inlinehint for larger ones.
+        linkage = "internal ";  // internal > linkonce_odr for inlining
+        inlining_attr = is_small_fn ? " alwaysinline" : " inlinehint";
+    } else if (is_small_fn) {
         linkage = "internal ";
+        inlining_attr = " alwaysinline";  // tiny functions → always inline
+    } else {
+        linkage = "internal ";  // internal linkage enables aggressive inlining
     }
+
     std::string sig = "define " + linkage + "dso_local " + ret_type + " @" + sanitizeName(fn->name()) + "(";
     for (size_t i = 0; i < fn->paramCount(); ++i) {
         const auto& p = fn->params()[i];
         if (i > 0) sig += ", ";
         sig += llvmParamType(p.type);
-        // Automatic noalias on &mut parameters
-        if (p.type && isa<MutReferenceType>(p.type)) {
-            sig += " noalias";
+
+        // --- Parameter attributes for LLVM optimization ---
+        // These give LLVM the aliasing/null/alignment info it needs to
+        // generate optimal code. Without these, LLVM must be conservative.
+        bool is_ptr_type = p.type && (isa<PointerType>(p.type) ||
+                                       isa<ReferenceType>(p.type) ||
+                                       isa<MutReferenceType>(p.type) ||
+                                       isa<SliceType>(p.type) ||
+                                       isa<AllocatorType>(p.type));
+
+        // noalias: &mut T and &T params don't alias other pointers
+        // (borrow checker guarantees this for &mut; &T is also safe because
+        //  shared borrows can't mutate through the pointer)
+        if (p.type) {
+            if (isa<MutReferenceType>(p.type)) {
+                sig += " noalias";
+            } else if (isa<ReferenceType>(p.type)) {
+                sig += " noalias";  // shared borrows also don't alias mutable ones
+            }
         }
+
+        // nonnull: Tether references are never null (guaranteed by type system)
+        if (is_ptr_type) {
+            sig += " nonnull";
+        }
+
+        // readonly: &T (shared borrow) params can't be written through
+        if (p.type && isa<ReferenceType>(p.type)) {
+            sig += " readonly";
+        }
+
+        // dereferenceable(N): pointer points to at least N bytes
+        if (is_ptr_type) {
+            uint64_t deref_bytes = 0;
+            if (isa<ReferenceType>(p.type)) {
+                deref_bytes = typeSizeBytes(cast<ReferenceType>(p.type).referent());
+            } else if (isa<MutReferenceType>(p.type)) {
+                deref_bytes = typeSizeBytes(cast<MutReferenceType>(p.type).referent());
+            } else if (isa<PointerType>(p.type)) {
+                deref_bytes = typeSizeBytes(cast<PointerType>(p.type).pointee());
+            } else if (isa<SliceType>(p.type)) {
+                deref_bytes = 16;  // { ptr, i64 } = 16 bytes
+            } else if (isa<AllocatorType>(p.type)) {
+                deref_bytes = 40;  // TetherAllocator = 5 pointers = 40 bytes
+            }
+            if (deref_bytes > 0) {
+                sig += " dereferenceable(" + std::to_string(deref_bytes) + ")";
+            }
+        }
+
+        // align(N): propagate alignment from align(N) types
+        if (p.type) {
+            uint64_t align = 0;
+            if (isa<AlignedType>(p.type)) {
+                align = cast<AlignedType>(p.type).alignment();
+            } else if (isa<ReferenceType>(p.type)) {
+                TypeId inner = cast<ReferenceType>(p.type).referent();
+                if (inner && isa<AlignedType>(inner))
+                    align = cast<AlignedType>(inner).alignment();
+            } else if (isa<MutReferenceType>(p.type)) {
+                TypeId inner = cast<MutReferenceType>(p.type).referent();
+                if (inner && isa<AlignedType>(inner))
+                    align = cast<AlignedType>(inner).alignment();
+            }
+            if (align > 0 && align != 8) {  // 8 is default; skip for brevity
+                sig += " align " + std::to_string(align);
+            }
+        }
+
         sig += " %" + sanitizeName(p.name);
     }
     // Zig-style: error-returning functions get an extra ptr %err_slot parameter
     if (fn->canError()) {
         if (fn->paramCount() > 0) sig += ", ";
-        sig += "ptr %__err_slot";
+        sig += "ptr noalias writeonly %__err_slot";  // err_slot is write-only by callee
     }
     sig += ")";
 
@@ -690,6 +766,9 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         // Add nounwind to functions that can't throw errors
         sig += " nounwind";
     }
+
+    // Inlining attribute (alwaysinline / inlinehint)
+    sig += inlining_attr;
 
     // --- Pre-LLVM optimization: opaque barrier function attributes ---
     // If the function takes or returns opaque types, add the
@@ -721,15 +800,22 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             const auto& p = fn->params()[i];
             if (i > 0) module_out_ << ", ";
             module_out_ << llvmParamType(p.type);
-            // Automatic noalias on &mut parameters
-            if (p.type && isa<MutReferenceType>(p.type)) {
-                module_out_ << " noalias";
+            // Same parameter attributes as definitions
+            bool is_ptr_type = p.type && (isa<PointerType>(p.type) ||
+                                           isa<ReferenceType>(p.type) ||
+                                           isa<MutReferenceType>(p.type) ||
+                                           isa<SliceType>(p.type) ||
+                                           isa<AllocatorType>(p.type));
+            if (p.type) {
+                if (isa<MutReferenceType>(p.type)) module_out_ << " noalias";
+                else if (isa<ReferenceType>(p.type)) module_out_ << " noalias readonly";
             }
+            if (is_ptr_type) module_out_ << " nonnull";
         }
         // Zig-style: error-returning function declarations also have the err_slot param
         if (fn->canError()) {
             if (fn->paramCount() > 0) module_out_ << ", ";
-            module_out_ << "ptr";
+            module_out_ << "ptr noalias writeonly";
         }
         module_out_ << ")";
         if (fn->isPure()) module_out_ << " memory(none) nounwind";
@@ -1992,8 +2078,11 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         std::string err_label = nextLabel("try_err");
         std::string ok_label = nextLabel("try_ok");
+        // Error paths are cold: annotate with branch weight metadata
+        int try_prof_id = getBranchWeightMetadataId(1, 10000);
         body_ss_ << "  br i1 " << err_flag_reg << ", label %" << err_label
-                 << ", label %" << ok_label << "\n";
+                 << ", label %" << ok_label
+                 << ", !prof !" << try_prof_id << "\n";
 
         body_ss_ << err_label << ":\n";
         // On error: emit errdefer blocks and propagate the error
@@ -2272,10 +2361,32 @@ std::string IRGenerator::emitLValue(Expr* expr) {
 // ============================================================================
 
 std::string IRGenerator::emitBoxNew(Expr* value, TypeId pointee_type) {
-    needed_runtime_.insert("malloc");
     std::string ll = llvmType(pointee_type);
     uint64_t size = typeSizeBytes(pointee_type);
 
+    // --- Pre-LLVM optimization: StackAllocated ---
+    // If the EscapeAnalysis pass annotated this Box as non-escaping,
+    // use alloca instead of malloc. This eliminates heap allocation
+    // overhead entirely for short-lived Boxes. LLVM CANNOT do this
+    // because malloc/free are opaque external calls.
+    if (annotations_ && annotations_->hasAnnotation(value, ASTAnnotationKind::StackAllocated)) {
+        // Stack-allocated Box: alloca + store (no malloc/free)
+        std::string stack_ptr = nextReg();
+        alloca_ss_ << "  " << stack_ptr << " = alloca " << ll << "\n";
+        std::string val = emitExpr(value);
+        if (isAggregateType(pointee_type)) {
+            body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << stack_ptr
+                     << ", ptr " << val << ", i64 " << size << ", i1 false)\n";
+            needed_runtime_.insert("memcpy");
+        } else {
+            body_ss_ << "  store " << ll << " " << val << ", ptr " << stack_ptr << "\n";
+        }
+        stack_box_allocas_.insert(stack_ptr);
+        return stack_ptr;
+    }
+
+    // Default: heap allocation via malloc
+    needed_runtime_.insert("malloc");
     std::string mr = nextReg();
     body_ss_ << "  " << mr << " = call ptr @malloc(i64 " << size << ")\n";
 
@@ -2291,6 +2402,15 @@ std::string IRGenerator::emitBoxNew(Expr* value, TypeId pointee_type) {
 }
 
 void IRGenerator::emitBoxDrop(const std::string& ptr_val) {
+    // If this Box was stack-allocated (by emitBoxNew with StackAllocated
+    // annotation), skip the free — the alloca is automatically reclaimed
+    // when the function returns.
+    if (stack_box_allocas_.count(ptr_val)) {
+        // Stack-allocated Box: no free needed, just mark as dropped
+        // (could add lifetime.end intrinsic for more precise stack slot reuse)
+        body_ss_ << "  ; stack-allocated Box.drop — no free needed for " << ptr_val << "\n";
+        return;
+    }
     needed_runtime_.insert("free");
     body_ss_ << "  call void @free(ptr " << ptr_val << ")\n";
 }
@@ -2512,7 +2632,11 @@ std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId er
 
     std::string err_l = nextLabel("error.propagate");
     std::string ok_l  = nextLabel("error.ok");
-    body_ss_ << "  br i1 " << ef << ", label %" << err_l << ", label %" << ok_l << "\n";
+    // Error paths are cold: annotate with branch weight metadata so LLVM
+    // places error blocks in cold sections and optimizes the happy path.
+    int prof_id = getBranchWeightMetadataId(1, 10000);
+    body_ss_ << "  br i1 " << ef << ", label %" << err_l << ", label %" << ok_l
+             << ", !prof !" << prof_id << "\n";
 
     // Error block
     body_ss_ << err_l << ":\n";
@@ -2585,9 +2709,13 @@ int IRGenerator::emitSimdLoopMetadata() {
     //   vectorize.enable    → i1 true (boolean flag)
     //   vectorize.width     → i32 N   (vector width in elements)
     //   interleave.count    → i32 N   (interleave factor)
+    //   unroll.enable       → i1 true (force unroll small SIMD loops)
+    //   unroll.count        → i32 N   (unroll factor)
     int enable_id     = metadata_counter_++;
     int width_id      = metadata_counter_++;
     int interleave_id = metadata_counter_++;
+    int unroll_en_id  = metadata_counter_++;
+    int unroll_cnt_id = metadata_counter_++;
 
     metadata_entries_.push_back({enable_id,
         "!{!\"llvm.loop.vectorize.enable\", i1 true}"});
@@ -2595,13 +2723,19 @@ int IRGenerator::emitSimdLoopMetadata() {
         "!{!\"llvm.loop.vectorize.width\", i32 4}"});
     metadata_entries_.push_back({interleave_id,
         "!{!\"llvm.loop.interleave.count\", i32 4}"});
+    metadata_entries_.push_back({unroll_en_id,
+        "!{!\"llvm.loop.unroll.enable\", i1 true}"});
+    metadata_entries_.push_back({unroll_cnt_id,
+        "!{!\"llvm.loop.unroll.count\", i32 4}"});
 
     // Create the loop metadata grouping node — contains all the property nodes.
-    //   !4 = !{!1, !2, !3}
+    //   !4 = !{!1, !2, !3, !4, !5}
     int group_id = metadata_counter_++;
     std::string group_content = "!{!" + std::to_string(enable_id)
         + ", !" + std::to_string(width_id)
-        + ", !" + std::to_string(interleave_id) + "}";
+        + ", !" + std::to_string(interleave_id)
+        + ", !" + std::to_string(unroll_en_id)
+        + ", !" + std::to_string(unroll_cnt_id) + "}";
     metadata_entries_.push_back({group_id, group_content});
 
     // Create the self-referencing distinct metadata node that LLVM requires.
