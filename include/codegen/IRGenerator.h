@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
@@ -37,8 +38,11 @@ public:
 // IRGenerator - walks the typed AST and emits LLVM IR as text (.ll format)
 //
 // Produces valid LLVM IR (LLVM 15+ opaque-pointer syntax) that can be
-// compiled by llc or clang.  All local variables use alloca at function
-// entry; the LLVM mem2reg pass promotes them to SSA values.
+// compiled by llc or clang.  Scalar non-address-taken variables are emitted
+// as SSA values directly (no alloca/load/store).  Aggregate and address-taken
+// variables use alloca at function entry; the LLVM mem2reg pass promotes the
+// remaining simple allocas.  Phi nodes are emitted at control-flow join points
+// (if/else merge, loop headers) for SSA-tracked variables.
 // ============================================================================
 class IRGenerator {
 public:
@@ -174,10 +178,30 @@ private:
     int reg_counter_   = 0;
     int label_counter_ = 0;
 
-    // Scoped variable allocation map — each scope level has its own map
-    // of variable names → LLVM alloca register names. On block exit, the
-    // scope is popped, restoring access to outer variables.
-    std::vector<std::unordered_map<std::string, std::string>> scope_stack_;
+    // =======================================================================
+    // SSA Variable Tracking
+    //
+    // Instead of alloca+load+store for every variable, we track the current
+    // SSA value for each variable. For scalar non-address-taken variables,
+    // we emit the value directly and update it on assignment. For aggregate
+    // types or address-taken variables, we fall back to alloca.
+    //
+    // At control-flow join points (if/else merge, loop headers), we emit
+    // phi nodes for variables that were assigned in multiple branches.
+    // =======================================================================
+
+    // Information about an SSA-tracked variable
+    struct SSAVarInfo {
+        std::string current_value;  // Current SSA value (register name or literal)
+        std::string llvm_type;      // LLVM type string (e.g. "i32", "i64")
+        TypeId      tether_type;    // Tether type for aggregate check
+        bool        needs_alloca;   // true if address-taken or aggregate → use alloca
+        std::string alloca_name;    // Alloca name (only valid if needs_alloca)
+    };
+
+    // Scoped variable map — each scope level has its own map
+    // of variable names → SSAVarInfo. On block exit, the scope is popped.
+    std::vector<std::unordered_map<std::string, SSAVarInfo>> scope_stack_;
 
     // Push a new variable scope (call on block entry)
     void pushScope() { scope_stack_.emplace_back(); }
@@ -185,32 +209,274 @@ private:
     // Pop a variable scope (call on block exit)
     void popScope() { if (!scope_stack_.empty()) scope_stack_.pop_back(); }
 
-    // Look up a variable name in the scope stack (innermost first)
-    std::string* lookupVarAlloca(const std::string& name) {
+    // Look up a variable's SSAVarInfo in the scope stack (innermost first)
+    SSAVarInfo* lookupVar(const std::string& name) {
         for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it) {
             auto found = it->find(name);
             if (found != it->end()) return &found->second;
         }
         // Fallback: check the flat map for function parameters (pre-scope)
-        auto found = var_allocas_.find(name);
-        if (found != var_allocas_.end()) return &found->second;
+        auto found = var_ssa_.find(name);
+        if (found != var_ssa_.end()) return &found->second;
+        return nullptr;
+    }
+
+    // Look up a variable name → alloca pointer (for address-taken / aggregate vars)
+    // Returns nullptr if the variable is SSA-tracked (not alloca-backed)
+    std::string* lookupVarAlloca(const std::string& name) {
+        SSAVarInfo* info = lookupVar(name);
+        if (info && info->needs_alloca) return &info->alloca_name;
         return nullptr;
     }
 
     // Register a variable in the current (innermost) scope
-    void registerVarAlloca(const std::string& name, const std::string& alloca) {
+    void registerVar(const std::string& name, const SSAVarInfo& info) {
         if (!scope_stack_.empty()) {
-            scope_stack_.back()[name] = alloca;
+            scope_stack_.back()[name] = info;
         } else {
-            var_allocas_[name] = alloca;
+            var_ssa_[name] = info;
+        }
+    }
+
+    // Convenience: register with alloca (for aggregate/address-taken vars)
+    void registerVarAlloca(const std::string& name, const std::string& alloca) {
+        SSAVarInfo* existing = lookupVar(name);
+        if (existing) {
+            existing->alloca_name = alloca;
+            existing->needs_alloca = true;
+        }
+    }
+
+    // Update the current SSA value for a variable
+    void updateVarValue(const std::string& name, const std::string& value) {
+        SSAVarInfo* info = lookupVar(name);
+        if (info) info->current_value = value;
+    }
+
+    // Get the current SSA value for a variable (returns "" if not found)
+    std::string getVarValue(const std::string& name) {
+        SSAVarInfo* info = lookupVar(name);
+        return info ? info->current_value : "";
+    }
+
+    // Check if a variable needs alloca (aggregate or address-taken)
+    bool varNeedsAlloca(const std::string& name) {
+        SSAVarInfo* info = lookupVar(name);
+        return info ? info->needs_alloca : false;
+    }
+
+    // Determine if a variable should use SSA (scalar, non-address-taken)
+    bool shouldUseSSA(TypeId type) const {
+        if (!type) return false;
+        if (isAggregateType(type)) return false;
+        // References and pointers are just ptr values — SSA friendly
+        // Smart pointers: Box is ptr (SSA), Rc/Arc are aggregate (not SSA)
+        if (isa<SmartPointerType>(type)) {
+            auto& sp = cast<SmartPointerType>(type);
+            return sp.smartPointerKind() == SmartPointerKind::Box;
+        }
+        // Error types are aggregates
+        if (isa<ErrorType>(type)) return false;
+        return true;
+    }
+
+    // Collect names of variables that are assigned within a subtree.
+    // Used to demote SSA variables to alloca before loops (so LLVM's
+    // mem2reg can handle loop-carried phi nodes correctly).
+    std::unordered_set<std::string> collectAssignedVars(Stmt* stmt) {
+        std::unordered_set<std::string> result;
+        collectAssignedVarsImpl(stmt, result);
+        return result;
+    }
+    std::unordered_set<std::string> collectAssignedVars(Expr* expr) {
+        std::unordered_set<std::string> result;
+        collectAssignedVarsImpl(expr, result);
+        return result;
+    }
+
+    // Demote an SSA-tracked variable to alloca-based (for loop vars)
+    void demoteSSAToAlloca(const std::string& name) {
+        SSAVarInfo* info = lookupVar(name);
+        if (!info || info->needs_alloca) return;
+        // Create alloca, store current value
+        std::string aname = makeAllocaName(name);
+        alloca_ss_ << "  " << aname << " = alloca " << info->llvm_type << "\n";
+        body_ss_ << "  store " << info->llvm_type << " " << info->current_value
+                 << ", ptr " << aname << "\n";
+        info->alloca_name = aname;
+        info->needs_alloca = true;
+    }
+
+private:
+    // Recursive implementation of collectAssignedVars
+    void collectAssignedVarsImpl(Stmt* stmt, std::unordered_set<std::string>& result) {
+        if (!stmt) return;
+        switch (stmt->getKind()) {
+            case NodeKind::VarDeclStmt: {
+                auto& vd = cast<VarDeclStmt>(*stmt);
+                result.insert(vd.name());
+                break;
+            }
+            case NodeKind::ValDeclStmt: {
+                auto& vd = cast<ValDeclStmt>(*stmt);
+                result.insert(vd.name());
+                break;
+            }
+            case NodeKind::AssignStmt: {
+                auto& as = cast<AssignStmt>(*stmt);
+                if (auto* ident = dyn_cast<IdentExpr>(as.target())) {
+                    result.insert(ident->name());
+                }
+                // Also check RHS for nested assignments
+                collectAssignedVarsImpl(as.value(), result);
+                break;
+            }
+            case NodeKind::BlockStmt: {
+                auto& block = cast<BlockStmt>(*stmt);
+                for (const auto& s : block.stmts())
+                    collectAssignedVarsImpl(s.get(), result);
+                break;
+            }
+            case NodeKind::IfStmt: {
+                auto& is = cast<IfStmt>(*stmt);
+                collectAssignedVarsImpl(is.thenBlock(), result);
+                if (is.hasElse()) collectAssignedVarsImpl(is.elseBlock(), result);
+                break;
+            }
+            case NodeKind::WhileStmt: {
+                auto& ws = cast<WhileStmt>(*stmt);
+                collectAssignedVarsImpl(ws.body(), result);
+                break;
+            }
+            case NodeKind::ExprStmt: {
+                auto& es = cast<ExprStmt>(*stmt);
+                collectAssignedVarsImpl(es.expr(), result);
+                break;
+            }
+            case NodeKind::DeferStmt: {
+                auto& ds = cast<DeferStmt>(*stmt);
+                collectAssignedVarsImpl(ds.stmt(), result);
+                break;
+            }
+            case NodeKind::ErrdeferStmt: {
+                auto& es = static_cast<ErrdeferStmt&>(*stmt);
+                collectAssignedVarsImpl(es.stmt(), result);
+                break;
+            }
+            default: break;
+        }
+    }
+    void collectAssignedVarsImpl(Expr* expr, std::unordered_set<std::string>& result) {
+        if (!expr) return;
+        switch (expr->getKind()) {
+            case NodeKind::BinaryExpr: {
+                auto& bin = cast<BinaryExpr>(*expr);
+                if (bin.op() == BinaryOp::Assign || 
+                    (bin.op() >= BinaryOp::AddAssign && bin.op() <= BinaryOp::ShrAssign)) {
+                    if (auto* ident = dyn_cast<IdentExpr>(bin.left())) {
+                        result.insert(ident->name());
+                    }
+                }
+                collectAssignedVarsImpl(bin.left(), result);
+                collectAssignedVarsImpl(bin.right(), result);
+                break;
+            }
+            case NodeKind::CallExpr: {
+                auto& call = cast<CallExpr>(*expr);
+                for (const auto& arg : call.args())
+                    collectAssignedVarsImpl(arg.get(), result);
+                break;
+            }
+            default: break;
+        }
+    }
+
+public:
+
+    // =======================================================================
+    // Phi Node Tracking
+    //
+    // At control-flow join points, we need phi nodes for SSA variables
+    // that were assigned in multiple predecessor blocks.
+    // =======================================================================
+
+    // Snapshot of all SSA variable values at a point in time
+    struct SSASnapshot {
+        std::unordered_map<std::string, std::string> values;  // name → current_value
+    };
+
+    // Take a snapshot of all current SSA variable values
+    SSASnapshot takeSnapshot() {
+        SSASnapshot snap;
+        // Walk all scopes (innermost first, so inner scopes shadow outer)
+        for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it) {
+            for (auto& [name, info] : *it) {
+                if (!info.needs_alloca && !info.current_value.empty()) {
+                    snap.values[name] = info.current_value;
+                }
+            }
+        }
+        // Also walk param-level vars
+        for (auto& [name, info] : var_ssa_) {
+            if (!info.needs_alloca && !info.current_value.empty()) {
+                snap.values[name] = info.current_value;
+            }
+        }
+        return snap;
+    }
+
+    // Emit phi nodes at a join block for variables that differ between
+    // two predecessor snapshots. Returns the set of variables that got phis.
+    std::unordered_map<std::string, std::string> emitPhiNodes(
+        const SSASnapshot& left_snap, const std::string& left_label,
+        const SSASnapshot& right_snap, const std::string& right_label)
+    {
+        std::unordered_map<std::string, std::string> phi_results;
+        // Collect all variable names from both snapshots
+        std::set<std::string> all_names;
+        for (auto& [n, _] : left_snap.values) all_names.insert(n);
+        for (auto& [n, _] : right_snap.values) all_names.insert(n);
+
+        for (const auto& name : all_names) {
+            auto left_it = left_snap.values.find(name);
+            auto right_it = right_snap.values.find(name);
+            std::string left_val = (left_it != left_snap.values.end()) ? left_it->second : "undef";
+            std::string right_val = (right_it != right_snap.values.end()) ? right_it->second : "undef";
+
+            // Only emit phi if values actually differ
+            if (left_val == right_val) {
+                // Same value from both sides — no phi needed, just update
+                updateVarValue(name, left_val);
+                continue;
+            }
+
+            // Look up the type
+            SSAVarInfo* info = lookupVar(name);
+            if (!info) continue;
+            std::string ll_type = info->llvm_type;
+
+            std::string phi_reg = nextReg();
+            body_ss_ << "  " << phi_reg << " = phi " << ll_type
+                     << " [ " << left_val << ", %" << left_label << " ]"
+                     << ", [ " << right_val << ", %" << right_label << " ]\n";
+            updateVarValue(name, phi_reg);
+            phi_results[name] = phi_reg;
+        }
+        return phi_results;
+    }
+
+    // Overload: emit phi nodes when one side is missing (only one predecessor)
+    void emitPhiNodesSinglePred(const SSASnapshot& snap, const std::string& pred_label) {
+        for (auto& [name, val] : snap.values) {
+            updateVarValue(name, val);
         }
     }
 
     std::unordered_set<std::string>               used_alloca_names_;
 
-    // Function-level variable allocas (for parameters, which are registered
+    // Function-level variable SSA info (for parameters, which are registered
     // before any scope is pushed). Block-scoped variables go into scope_stack_.
-    std::unordered_map<std::string, std::string> var_allocas_;
+    std::unordered_map<std::string, SSAVarInfo> var_ssa_;
 
     // Defer stack (raw Stmt pointers – owned by the AST, not by us)
     std::vector<Stmt*> defer_stack_;
@@ -268,6 +534,16 @@ private:
     bool terminated_ = false;
     bool isTerminated() const { return terminated_; }
     void setTerminated(bool t) { terminated_ = t; }
+
+    // Track the current block label for phi node predecessor references.
+    // Updated whenever we emit a new label (body_ss_ << label << ":\n").
+    std::string current_block_label_ = "entry";
+
+    // Emit a block label and update current_block_label_
+    void emitBlockLabel(const std::string& label) {
+        body_ss_ << label << ":\n";
+        current_block_label_ = label;
+    }
 
     // =======================================================================
     // Metadata (for @superoptimize / @polly directives)

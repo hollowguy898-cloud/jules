@@ -624,7 +624,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     // Reset per-function state
     reg_counter_ = 0;
     label_counter_ = 0;
-    var_allocas_.clear();
+    var_ssa_.clear();
     scope_stack_.clear();
     used_alloca_names_.clear();
     defer_stack_.clear();
@@ -644,6 +644,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     current_err_slot_.clear();
     caller_err_slot_.clear();
     current_fn_has_simd_ = fn->hasDirective(CompilerDirective::Simd);
+    current_block_label_ = "entry";
 
     alloca_ss_.clear();
     body_ss_.clear();
@@ -824,15 +825,38 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         return;
     }
 
-    // --- Emit parameter allocas + stores ---
+    // --- Register parameters as SSA variables ---
+    // Scalar parameters are tracked as SSA values (no alloca/load/store).
+    // Aggregate parameters still need alloca + store because they're
+    // accessed by pointer (GEP, memcpy, etc.).
     for (size_t i = 0; i < fn->paramCount(); ++i) {
         const auto& p = fn->params()[i];
-        std::string aname = makeAllocaName(p.name);
         std::string ll = llvmType(p.type);
-        alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
-        body_ss_ << "  store " << ll << " %" << sanitizeName(p.name)
-                 << ", ptr " << aname << "\n";
-        var_allocas_[p.name] = aname;
+        std::string param_reg = "%" + sanitizeName(p.name);
+
+        if (shouldUseSSA(p.type)) {
+            // SSA: parameter value is directly available in its register
+            var_ssa_[p.name] = SSAVarInfo{
+                param_reg,    // current_value = the parameter register
+                ll,           // llvm_type
+                p.type,       // tether_type
+                false,        // needs_alloca
+                ""            // alloca_name (unused)
+            };
+        } else {
+            // Aggregate / address-taken: use alloca + store
+            std::string aname = makeAllocaName(p.name);
+            alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
+            body_ss_ << "  store " << ll << " " << param_reg
+                     << ", ptr " << aname << "\n";
+            var_ssa_[p.name] = SSAVarInfo{
+                param_reg,    // current_value (not used for alloca vars)
+                ll,           // llvm_type
+                p.type,       // tether_type
+                true,         // needs_alloca
+                aname         // alloca_name
+            };
+        }
     }
 
     // For error-returning functions, store the err_slot parameter name
@@ -972,18 +996,44 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             TypeId var_type = vd.declaredType();
             if (var_type.isNull() && vd.hasInit()) var_type = vd.init()->getType();
             std::string ll = llvmType(var_type);
-            std::string aname = makeAllocaName(vd.name());
-            alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
-            registerVarAlloca(vd.name(), aname);
-            if (vd.hasInit()) {
-                std::string val = emitExpr(vd.init());
-                if (isAggregateType(var_type)) {
-                    body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << aname
-                             << ", ptr " << val << ", i64 " << typeSizeBytes(var_type)
-                             << ", i1 false)\n";
-                    needed_runtime_.insert("memcpy");
+
+            if (shouldUseSSA(var_type)) {
+                // SSA: track value directly, no alloca
+                std::string val;
+                if (vd.hasInit()) {
+                    val = emitExpr(vd.init());
                 } else {
-                    body_ss_ << "  store " << ll << " " << val << ", ptr " << aname << "\n";
+                    // Uninitialized scalar → use zero value
+                    val = "0";
+                }
+                registerVar(vd.name(), SSAVarInfo{
+                    val,          // current_value
+                    ll,           // llvm_type
+                    var_type,     // tether_type
+                    false,        // needs_alloca
+                    ""            // alloca_name
+                });
+            } else {
+                // Aggregate / address-taken: alloca + store/memcpy
+                std::string aname = makeAllocaName(vd.name());
+                alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
+                registerVar(vd.name(), SSAVarInfo{
+                    "",           // current_value (unused for alloca vars)
+                    ll,           // llvm_type
+                    var_type,     // tether_type
+                    true,         // needs_alloca
+                    aname         // alloca_name
+                });
+                if (vd.hasInit()) {
+                    std::string val = emitExpr(vd.init());
+                    if (isAggregateType(var_type)) {
+                        body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << aname
+                                 << ", ptr " << val << ", i64 " << typeSizeBytes(var_type)
+                                 << ", i1 false)\n";
+                        needed_runtime_.insert("memcpy");
+                    } else {
+                        body_ss_ << "  store " << ll << " " << val << ", ptr " << aname << "\n";
+                    }
                 }
             }
             break;
@@ -996,18 +1046,43 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             TypeId val_type = vd.declaredType();
             if (val_type.isNull() && vd.hasInit()) val_type = vd.init()->getType();
             std::string ll = llvmType(val_type);
-            std::string aname = makeAllocaName(vd.name());
-            alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
-            registerVarAlloca(vd.name(), aname);
-            if (vd.hasInit()) {
-                std::string val = emitExpr(vd.init());
-                if (isAggregateType(val_type)) {
-                    body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << aname
-                             << ", ptr " << val << ", i64 " << typeSizeBytes(val_type)
-                             << ", i1 false)\n";
-                    needed_runtime_.insert("memcpy");
+
+            if (shouldUseSSA(val_type)) {
+                // SSA: track value directly, no alloca
+                std::string val;
+                if (vd.hasInit()) {
+                    val = emitExpr(vd.init());
                 } else {
-                    body_ss_ << "  store " << ll << " " << val << ", ptr " << aname << "\n";
+                    val = "0";
+                }
+                registerVar(vd.name(), SSAVarInfo{
+                    val,          // current_value
+                    ll,           // llvm_type
+                    val_type,     // tether_type
+                    false,        // needs_alloca
+                    ""            // alloca_name
+                });
+            } else {
+                // Aggregate / address-taken: alloca + store/memcpy
+                std::string aname = makeAllocaName(vd.name());
+                alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
+                registerVar(vd.name(), SSAVarInfo{
+                    "",           // current_value (unused for alloca vars)
+                    ll,           // llvm_type
+                    val_type,     // tether_type
+                    true,         // needs_alloca
+                    aname         // alloca_name
+                });
+                if (vd.hasInit()) {
+                    std::string val = emitExpr(vd.init());
+                    if (isAggregateType(val_type)) {
+                        body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << aname
+                                 << ", ptr " << val << ", i64 " << typeSizeBytes(val_type)
+                                 << ", i1 false)\n";
+                        needed_runtime_.insert("memcpy");
+                    } else {
+                        body_ss_ << "  store " << ll << " " << val << ", ptr " << aname << "\n";
+                    }
                 }
             }
             break;
@@ -1016,9 +1091,21 @@ void IRGenerator::emitStmt(Stmt* stmt) {
         // ---- assignment ----
         case NodeKind::AssignStmt: {
             auto& as = cast<AssignStmt>(*stmt);
-            std::string target_ptr = emitLValue(as.target());
             TypeId target_type = as.target()->getType();
             std::string val = emitExpr(as.value());
+
+            // Check if the target is a simple scalar variable (SSA-eligible)
+            if (auto* ident = dyn_cast<IdentExpr>(as.target())) {
+                SSAVarInfo* info = lookupVar(ident->name());
+                if (info && !info->needs_alloca) {
+                    // SSA assignment: just update the tracked value
+                    updateVarValue(ident->name(), val);
+                    break;
+                }
+            }
+
+            // Fallback: alloca-based store via emitLValue
+            std::string target_ptr = emitLValue(as.target());
             if (isAggregateType(target_type)) {
                 body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << target_ptr
                          << ", ptr " << val << ", i64 " << typeSizeBytes(target_type)
@@ -1054,12 +1141,15 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             std::string merge_l = nextLabel("ifmerge");
 
             // --- Pre-LLVM optimization: cold path branch weights ---
-            // If the condition or if-statement has a ColdPath annotation,
-            // add !prof branch weight metadata to the branch instruction.
             std::string cold_meta = emitColdPathMetadata(stmt);
             if (cold_meta.empty() && is.condition()) {
                 cold_meta = emitColdPathMetadata(is.condition());
             }
+
+            // Snapshot SSA values before branching (for phi node emission)
+            SSASnapshot pre_branch_snap = takeSnapshot();
+            // Remember the label of the block that contains the branch instruction
+            std::string branch_block = current_block_label_;
 
             if (is.hasElse()) {
                 body_ss_ << "  br i1 " << cond << ", label %" << then_l
@@ -1070,19 +1160,37 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             }
             setTerminated(false);
 
-            body_ss_ << then_l << ":\n";
+            emitBlockLabel(then_l);
             emitBlockStmt(is.thenBlock());
+            // Snapshot SSA values at end of then-block
+            SSASnapshot then_snap = takeSnapshot();
+            // Remember which block branches to merge (for phi predecessor)
+            std::string then_exit_block = current_block_label_;
             if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
             setTerminated(false);
 
+            SSASnapshot else_snap;
+            std::string else_exit_block;
             if (is.hasElse()) {
-                body_ss_ << else_l << ":\n";
+                emitBlockLabel(else_l);
+                // Restore SSA values to pre-branch state before emitting else
+                for (auto& [name, val] : pre_branch_snap.values) {
+                    updateVarValue(name, val);
+                }
                 emitBlockStmt(is.elseBlock());
+                else_snap = takeSnapshot();
+                else_exit_block = current_block_label_;
                 if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
                 setTerminated(false);
+            } else {
+                // No else: the "else" path is the fallthrough from branch_block
+                else_snap = pre_branch_snap;
+                else_exit_block = branch_block;
             }
 
-            body_ss_ << merge_l << ":\n";
+            emitBlockLabel(merge_l);
+            // Emit phi nodes for variables that differ between then and else paths
+            emitPhiNodes(then_snap, then_exit_block, else_snap, else_exit_block);
             setTerminated(false);
             break;
         }
@@ -1096,9 +1204,25 @@ void IRGenerator::emitStmt(Stmt* stmt) {
 
             loop_stack_.push_back({end_l, cond_l});
 
+            // Before emitting the loop, demote any SSA variables that are
+            // assigned inside the loop body, condition, or increment clause.
+            // These need alloca-based tracking so LLVM's mem2reg can insert
+            // proper phi nodes at the loop header.
+            auto assigned_in_loop = collectAssignedVars(ws.body());
+            if (ws.hasIncrement()) {
+                auto incr_vars = collectAssignedVars(ws.increment());
+                assigned_in_loop.insert(incr_vars.begin(), incr_vars.end());
+            }
+            // Also check condition for assignments (rare but valid)
+            auto cond_vars = collectAssignedVars(ws.condition());
+            assigned_in_loop.insert(cond_vars.begin(), cond_vars.end());
+            for (const auto& name : assigned_in_loop) {
+                demoteSSAToAlloca(name);
+            }
+
             body_ss_ << "  br label %" << cond_l << "\n";
 
-            body_ss_ << cond_l << ":\n";
+            emitBlockLabel(cond_l);
             setTerminated(false);
             std::string cond = emitExpr(ws.condition());
             if (ws.condition()->getType() && !ws.condition()->getType()->isBool()) {
@@ -1110,7 +1234,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             body_ss_ << "  br i1 " << cond << ", label %" << body_l
                      << ", label %" << end_l << "\n";
 
-            body_ss_ << body_l << ":\n";
+            emitBlockLabel(body_l);
             setTerminated(false);
 
             // --- Pre-LLVM optimization: yield check insertion ---
@@ -1132,7 +1256,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             }
             setTerminated(false);
 
-            body_ss_ << end_l << ":\n";
+            emitBlockLabel(end_l);
             setTerminated(false);
             loop_stack_.pop_back();
             break;
@@ -1346,14 +1470,21 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     // ========================================================================
     case NodeKind::IdentExpr: {
         auto& id = cast<IdentExpr>(*expr);
-        auto* alloca = lookupVarAlloca(id.name());
-        if (alloca) {
-            TypeId ty = expr->getType();
-            if (isAggregateType(ty)) return *alloca;
-            std::string ll = llvmType(ty);
-            std::string reg = nextReg();
-            body_ss_ << "  " << reg << " = load " << ll << ", ptr " << *alloca << "\n";
-            return reg;
+        SSAVarInfo* info = lookupVar(id.name());
+        if (info) {
+            if (info->needs_alloca) {
+                // Alloca-backed variable: return pointer for aggregates,
+                // load scalar value for non-aggregates
+                TypeId ty = expr->getType();
+                if (isAggregateType(ty)) return info->alloca_name;
+                std::string ll = llvmType(ty);
+                std::string reg = nextReg();
+                body_ss_ << "  " << reg << " = load " << ll << ", ptr " << info->alloca_name << "\n";
+                return reg;
+            } else {
+                // SSA-tracked variable: return the current SSA value directly
+                return info->current_value;
+            }
         }
         // Global / function name
         return "@" + sanitizeName(id.name());
@@ -1368,9 +1499,21 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         // ---- Assignment operators ----
         if (op == BinaryOp::Assign) {
-            std::string target_ptr = emitLValue(bin.left());
             TypeId target_type = bin.left()->getType();
             std::string val = emitExpr(bin.right());
+
+            // Check if the target is a simple scalar variable (SSA-eligible)
+            if (auto* ident = dyn_cast<IdentExpr>(bin.left())) {
+                SSAVarInfo* info = lookupVar(ident->name());
+                if (info && !info->needs_alloca) {
+                    // SSA assignment: just update the tracked value
+                    updateVarValue(ident->name(), val);
+                    return val;
+                }
+            }
+
+            // Fallback: alloca-based store via emitLValue
+            std::string target_ptr = emitLValue(bin.left());
             if (isAggregateType(target_type)) {
                 body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << target_ptr
                          << ", ptr " << val << ", i64 " << typeSizeBytes(target_type)
@@ -1385,14 +1528,26 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         // Compound assignment: load, compute, store
         if (op >= BinaryOp::AddAssign && op <= BinaryOp::ShrAssign) {
-            // BUG FIX: Load the old value BEFORE computing the lvalue,
-            // to ensure correct evaluation order even if the lvalue
-            // computation has side effects (e.g., array index).
-            std::string lhs = emitExpr(bin.left());
-            std::string rhs = emitExpr(bin.right());
-            std::string target_ptr = emitLValue(bin.left());
+            // For SSA variables, we can compute the new value directly
+            // without going through emitLValue/emitExpr for the load.
             TypeId target_type = bin.left()->getType();
             std::string ll = llvmType(target_type);
+
+            // Get the current value of the LHS
+            std::string lhs;
+            if (auto* ident = dyn_cast<IdentExpr>(bin.left())) {
+                SSAVarInfo* info = lookupVar(ident->name());
+                if (info && !info->needs_alloca) {
+                    // SSA variable: use current value directly
+                    lhs = info->current_value;
+                } else {
+                    // Alloca variable: load from alloca
+                    lhs = emitExpr(bin.left());
+                }
+            } else {
+                lhs = emitExpr(bin.left());
+            }
+            std::string rhs = emitExpr(bin.right());
 
             // Map compound op to its base op
             BinaryOp base_op;
@@ -1410,13 +1565,25 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 default: base_op = BinaryOp::Add; break;
             }
 
-            // Compute the new value (reuse the binary-emit logic below)
+            // Compute the new value
             std::string new_val;
             {
                 std::string reg = nextReg();
                 emitBinaryOp(reg, ll, lhs, base_op, rhs, target_type);
                 new_val = reg;
             }
+
+            // Store the result
+            if (auto* ident = dyn_cast<IdentExpr>(bin.left())) {
+                SSAVarInfo* info = lookupVar(ident->name());
+                if (info && !info->needs_alloca) {
+                    // SSA variable: just update the tracked value
+                    updateVarValue(ident->name(), new_val);
+                    return new_val;
+                }
+            }
+            // Fallback: store via emitLValue
+            std::string target_ptr = emitLValue(bin.left());
             body_ss_ << "  store " << ll << " " << new_val << ", ptr " << target_ptr << "\n";
             return new_val;
         }
@@ -2235,8 +2402,21 @@ std::string IRGenerator::emitLValue(Expr* expr) {
     switch (expr->getKind()) {
         case NodeKind::IdentExpr: {
             auto& id = cast<IdentExpr>(*expr);
-            auto* alloca = lookupVarAlloca(id.name());
-            if (alloca) return *alloca;
+            SSAVarInfo* info = lookupVar(id.name());
+            if (info && info->needs_alloca) {
+                return info->alloca_name;
+            }
+            // SSA variable needs an alloca for address-of — create one on demand
+            if (info && !info->needs_alloca) {
+                // Materialize: create an alloca, store current value, mark as alloca-backed
+                std::string aname = makeAllocaName(id.name());
+                alloca_ss_ << "  " << aname << " = alloca " << info->llvm_type << "\n";
+                body_ss_ << "  store " << info->llvm_type << " " << info->current_value
+                         << ", ptr " << aname << "\n";
+                info->alloca_name = aname;
+                info->needs_alloca = true;
+                return aname;
+            }
             return "@" + sanitizeName(id.name());
         }
 
