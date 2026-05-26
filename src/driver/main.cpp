@@ -12,7 +12,7 @@ using namespace tether;
 // ============================================================================
 static void printUsage(const char* prog_name) {
     std::cerr
-        << "Usage: " << prog_name << " [options] <input.jl>\n"
+        << "Usage: " << prog_name << " [options] <input.tth>\n"
         << "\n"
         << "Options:\n"
         << "  -o <output>       Output file path\n"
@@ -31,12 +31,12 @@ static void printUsage(const char* prog_name) {
         << "  --help            Show this help message\n"
         << "\n"
         << "Examples:\n"
-        << "  " << prog_name << " hello.jl                     # Compile to executable 'hello'\n"
-        << "  " << prog_name << " -O2 -o hello hello.jl         # Compile with -O2\n"
-        << "  " << prog_name << " --emit-ir hello.jl            # Emit LLVM IR to hello.ll\n"
-        << "  " << prog_name << " --emit-asm -v hello.jl        # Emit assembly with verbose output\n"
-        << "  " << prog_name << " --profile-generate hello.jl   # Generate PGO profile\n"
-        << "  " << prog_name << " --target aarch64 hello.jl     # Cross-compile for AArch64\n"
+        << "  " << prog_name << " hello.tth                     # Compile to executable 'hello'\n"
+        << "  " << prog_name << " -O2 -o hello hello.tth         # Compile with -O2\n"
+        << "  " << prog_name << " --emit-ir hello.tth            # Emit LLVM IR to hello.ll\n"
+        << "  " << prog_name << " --emit-asm -v hello.tth        # Emit assembly with verbose output\n"
+        << "  " << prog_name << " --profile-generate hello.tth   # Generate PGO profile\n"
+        << "  " << prog_name << " --target aarch64 hello.tth     # Cross-compile for AArch64\n"
         << std::endl;
 }
 

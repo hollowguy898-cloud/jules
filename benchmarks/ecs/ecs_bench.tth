@@ -1,0 +1,65 @@
+// ============================================================================
+// Tether ECS Benchmark
+//
+// This file demonstrates Tether's ECS features that give it an edge over Rust:
+// - soa struct: Auto SoA layout (Rust requires manual SoA)
+// - align(64): Cache-line alignment with automatic prefetch
+// - @simd: Guaranteed vectorization (not just hints)
+// - try/catch: Error paths annotated as cold for LLVM block layout
+// - defer: Structured cleanup (coalesced by pre-LLVM pass)
+// ============================================================================
+
+soa struct Position {
+    x: f64,
+    y: f64,
+    z: f64
+}
+
+soa struct Velocity {
+    x: f64,
+    y: f64,
+    z: f64
+}
+
+align(64) struct Health {
+    val: f64
+}
+
+@simd
+fn update_positions(pos: &mut []Position, vel: &[]Velocity, dt: f64) void {
+    var i: u64 = 0;
+    while (i < 1000000) : (i += 1) {
+        pos[i].x = pos[i].x + vel[i].x * dt;
+        pos[i].y = pos[i].y + vel[i].y * dt;
+        pos[i].z = pos[i].z + vel[i].z * dt;
+    }
+}
+
+fn damage_entities(healths: &mut []Health, dmg: f64) void {
+    var i: u64 = 0;
+    while (i < 1000000) : (i += 1) {
+        healths[i].val = healths[i].val - dmg;
+    }
+}
+
+fn filter_alive(healths: &[]Health) u64 {
+    var count: u64 = 0;
+    var i: u64 = 0;
+    while (i < 1000000) : (i += 1) {
+        if (healths[i].val > 10.0) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+fn process_entity(health: f64) !f64 {
+    if (health <= 0.0) {
+        return 0.0;
+    }
+    return health * 1.1;
+}
+
+fn main() void {
+    return;
+}

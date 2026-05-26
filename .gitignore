@@ -5,3 +5,7 @@ tetherc
 bench_speed
 benchmarks/ecs/tether_ecs
 benchmarks/ecs/rust_ecs/target/
+julesc
+tetherc
+*.ll
+jules

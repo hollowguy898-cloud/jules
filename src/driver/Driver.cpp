@@ -5,6 +5,7 @@
 #include "sema/SemanticAnalyzer.h"
 #include "cfg/CFG.h"
 #include "borrowck/BorrowChecker.h"
+#include "opt/PreLLVMPipeline.h"
 #include "codegen/IRGenerator.h"
 
 #include <iostream>
@@ -56,6 +57,7 @@ bool Driver::compile() {
     runLexer();
     runParser();
     runSemanticAnalysis();
+    runPreLLVMOptimizations();
     runCFGBuilding();
     runBorrowChecking();
     runIRGeneration();
@@ -246,7 +248,52 @@ bool Driver::runSemanticAnalysis() {
 }
 
 // ============================================================================
-// Phase 5: CFG building
+// Phase 5: Pre-LLVM optimizations
+//
+// These are optimizations that LLVM CANNOT perform because they require
+// semantic knowledge about the Tether language (data layout, error paths,
+// allocator types, alignment hints, cooperative scheduling, etc.).
+// They run AFTER semantic analysis but BEFORE IR generation.
+// ============================================================================
+bool Driver::runPreLLVMOptimizations() {
+    if (verbose_) {
+        std::cerr << "[tether] Phase 5: Pre-LLVM optimizations..." << std::endl;
+    }
+
+    // Map LLVM opt level to Tether pre-LLVM opt level:
+    // -O0 → None, -O1 → Basic, -O2/-O3 → Aggressive
+    PreLLVMOptLevel pre_level = PreLLVMOptLevel::None;
+    if (opt_level_ == 1) {
+        pre_level = PreLLVMOptLevel::Basic;
+    } else if (opt_level_ >= 2) {
+        pre_level = PreLLVMOptLevel::Aggressive;
+    }
+
+    if (pre_level == PreLLVMOptLevel::None) {
+        if (verbose_) {
+            std::cerr << "[tether]   Pre-LLVM optimizations skipped (-O0)" << std::endl;
+        }
+        return true;
+    }
+
+    PreLLVMPipeline pipeline(pre_level, type_table_);
+    auto result = pipeline.run(program_);
+
+    if (verbose_) {
+        std::cerr << "[tether]   Ran " << result.passes_run
+                  << " pre-LLVM passes, "
+                  << result.transformations_made << " transformations made"
+                  << std::endl;
+        for (const auto& log_entry : result.pass_log) {
+            std::cerr << "[tether]     " << log_entry << std::endl;
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Phase 6: CFG building
 // ============================================================================
 bool Driver::runCFGBuilding() {
     if (verbose_) {

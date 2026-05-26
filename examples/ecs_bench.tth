@@ -1,0 +1,44 @@
+// ============================================================================
+// Tether ECS Benchmark
+// Entity Component System pattern: iterate over arrays of components
+// Tests: SoA transformation, align prefetch, @simd
+// ============================================================================
+
+soa struct Position {
+    x: f64,
+    y: f64,
+    z: f64
+}
+
+soa struct Velocity {
+    x: f64,
+    y: f64,
+    z: f64
+}
+
+align(64) struct Health {
+    val: f64
+}
+
+@simd
+fn update_positions(positions: []Position, velocities: []Velocity, dt: f64) void {
+    var i: u64 = 0;
+    while (i < 1000000) : (i += 1) {
+        positions[i].x = positions[i].x + velocities[i].x * dt;
+        positions[i].y = positions[i].y + velocities[i].y * dt;
+        positions[i].z = positions[i].z + velocities[i].z * dt;
+    }
+}
+
+fn damage_entities(healths: []Health, damage: f64) void {
+    var i: u64 = 0;
+    while (i < 1000000) : (i += 1) {
+        healths[i].val = healths[i].val - damage;
+    }
+}
+
+fn main() void {
+    // In a full implementation, these would be allocated arrays
+    // For now this tests the SoA + align + @simd code paths
+    return;
+}

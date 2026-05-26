@@ -47,7 +47,7 @@ public:
     // -----------------------------------------------------------------------
     // Constructor
     //
-    // input_file:  path to the .jl source file
+    // input_file:  path to the .tth source file
     // output_file: path for the output (empty string = derive from input)
     // opt_level:   optimization level 0-3
     // emit_type:   what to emit (object, assembly, IR, executable)
@@ -84,6 +84,7 @@ private:
     bool runLexer();
     bool runParser();
     bool runSemanticAnalysis();
+    bool runPreLLVMOptimizations();  // Pre-LLVM passes (non-redundant with LLVM)
     bool runCFGBuilding();
     bool runBorrowChecking();
     bool runIRGeneration();
