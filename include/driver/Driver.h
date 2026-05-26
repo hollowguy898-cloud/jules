@@ -7,6 +7,7 @@
 #include "sema/SemanticAnalyzer.h"
 #include "cfg/CFG.h"
 #include "borrowck/BorrowChecker.h"
+#include "opt/PreLLVMPipeline.h"
 
 #include <string>
 #include <vector>
@@ -116,7 +117,7 @@ private:
     // -----------------------------------------------------------------------
     std::string input_file_;
     std::string output_file_;
-    int opt_level_;            // 0-3
+    int opt_level_;            // 0-5: 0=none, 1=basic, 2=standard, 3=aggressive, 4=size, 5=aggressive-size
     EmitType emit_type_;
     bool verbose_;
     bool profile_generate_;    // -fprofile-generate
@@ -138,6 +139,9 @@ private:
     std::string ir_text_;                                        // Phase 7
     std::string ir_file_path_;                                   // Phase 8
     std::string obj_file_path_;                                  // Phase 9
+
+    // Annotation map from pre-LLVM optimization passes (consumed by IR gen)
+    ASTAnnotationMap prellvm_annotations_;                        // Phase 5
 
     // -----------------------------------------------------------------------
     // Error state

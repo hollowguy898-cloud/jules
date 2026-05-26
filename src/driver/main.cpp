@@ -20,6 +20,8 @@ static void printUsage(const char* prog_name) {
         << "  -O1               Basic optimization\n"
         << "  -O2               Standard optimization\n"
         << "  -O3               Aggressive optimization\n"
+        << "  -Os               Optimize for size\n"
+        << "  -Oz               Aggressive size optimization\n"
         << "  --emit-obj        Emit an object file (.o)\n"
         << "  --emit-asm        Emit assembly (.s)\n"
         << "  --emit-ir         Emit LLVM IR (.ll)\n"
@@ -84,6 +86,12 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "-O3") {
             opt_level = 3;
+        }
+        else if (arg == "-Os") {
+            opt_level = 4;
+        }
+        else if (arg == "-Oz") {
+            opt_level = 5;
         }
         else if (arg == "--emit-obj") {
             emit_type = EmitType::Object;

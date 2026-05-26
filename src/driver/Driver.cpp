@@ -31,7 +31,7 @@ Driver::Driver(const std::string& input_file,
                const std::string& target_triple)
     : input_file_(input_file)
     , output_file_(output_file)
-    , opt_level_(std::clamp(opt_level, 0, 3))
+    , opt_level_(std::clamp(opt_level, 0, 5))
     , emit_type_(emit_type)
     , verbose_(verbose)
     , profile_generate_(profile_generate)
@@ -261,9 +261,13 @@ bool Driver::runPreLLVMOptimizations() {
     }
 
     // Map LLVM opt level to Tether pre-LLVM opt level:
-    // -O0 → None, -O1 → Basic, -O2/-O3 → Aggressive
+    // -O0 → None
+    // -O1 → Basic
+    // -O2/-O3 → Aggressive
+    // -Os (4) → Basic (size optimizations, no aggressive transforms like SoA)
+    // -Oz (5) → Basic (minimal, size-first)
     PreLLVMOptLevel pre_level = PreLLVMOptLevel::None;
-    if (opt_level_ == 1) {
+    if (opt_level_ == 1 || opt_level_ == 4 || opt_level_ == 5) {
         pre_level = PreLLVMOptLevel::Basic;
     } else if (opt_level_ >= 2) {
         pre_level = PreLLVMOptLevel::Aggressive;
@@ -278,6 +282,9 @@ bool Driver::runPreLLVMOptimizations() {
 
     PreLLVMPipeline pipeline(pre_level, type_table_);
     auto result = pipeline.run(program_);
+
+    // Save the annotation map so the IR generator can consume it
+    prellvm_annotations_ = std::move(pipeline.annotations());
 
     if (verbose_) {
         std::cerr << "[tether]   Ran " << result.passes_run
@@ -359,7 +366,7 @@ bool Driver::runIRGeneration() {
         std::cerr << "[tether] Phase 7: IR generation..." << std::endl;
     }
 
-    IRGenerator generator(program_, type_table_);
+    IRGenerator generator(program_, type_table_, &prellvm_annotations_);
     ir_text_ = generator.generate();
 
     if (ir_text_.empty()) {
@@ -444,7 +451,17 @@ bool Driver::runBackend() {
     if (using_clang) {
         // clang can directly compile .ll files
         cmd << compiler;
-        cmd << " -O" << opt_level_;
+        // Map Tether opt levels to LLVM opt flags:
+        // 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz
+        switch (opt_level_) {
+            case 0: cmd << " -O0"; break;
+            case 1: cmd << " -O1"; break;
+            case 2: cmd << " -O2"; break;
+            case 3: cmd << " -O3"; break;
+            case 4: cmd << " -Os"; break;
+            case 5: cmd << " -Oz"; break;
+            default: cmd << " -O2"; break;
+        }
 
         if (emit_type_ == EmitType::Assembly) {
             cmd << " -S";
@@ -464,7 +481,15 @@ bool Driver::runBackend() {
     } else {
         // Using llc
         cmd << compiler;
-        cmd << " -O" << opt_level_;
+        switch (opt_level_) {
+            case 0: cmd << " -O0"; break;
+            case 1: cmd << " -O1"; break;
+            case 2: cmd << " -O2"; break;
+            case 3: cmd << " -O3"; break;
+            case 4: cmd << " -Os"; break;
+            case 5: cmd << " -Oz"; break;
+            default: cmd << " -O2"; break;
+        }
 
         if (emit_type_ == EmitType::Assembly) {
             cmd << " --filetype=asm";
@@ -579,7 +604,16 @@ bool Driver::runLinker() {
     // Build the link command
     std::ostringstream cmd;
     cmd << clang;
-    cmd << " -O" << opt_level_;
+    // Map Tether opt levels to LLVM link flags
+    switch (opt_level_) {
+        case 0: cmd << " -O0"; break;
+        case 1: cmd << " -O1"; break;
+        case 2: cmd << " -O2"; break;
+        case 3: cmd << " -O3"; break;
+        case 4: cmd << " -Os"; break;
+        case 5: cmd << " -Oz"; break;
+        default: cmd << " -O2"; break;
+    }
 
     // PGO: profile-generate / profile-use flags
     if (profile_generate_) {

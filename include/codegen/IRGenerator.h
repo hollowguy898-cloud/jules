@@ -2,6 +2,7 @@
 
 #include "ast/AST.h"
 #include "sema/Type.h"
+#include "opt/PreLLVMPipeline.h"
 
 #include <string>
 #include <vector>
@@ -24,9 +25,16 @@ class IRGenerator {
 public:
     // -----------------------------------------------------------------------
     // Construction
+    //
+    // annotations: optional annotation map from the PreLLVM optimization
+    // pipeline. When provided, the IR generator consumes optimization
+    // metadata (cold paths, prefetch sites, yield points, SoA transforms,
+    // allocator lowering, opaque barriers) and emits the corresponding
+    // LLVM IR constructs.
     // -----------------------------------------------------------------------
     IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
-                TypeTable& type_table);
+                TypeTable& type_table,
+                ASTAnnotationMap* annotations = nullptr);
 
     // -----------------------------------------------------------------------
     // Main entry point – returns the full LLVM IR module as a string
@@ -129,6 +137,7 @@ private:
     // =======================================================================
     const std::vector<std::unique_ptr<TopLevel>>& program_;
     TypeTable& type_table_;
+    ASTAnnotationMap* annotations_;  // May be nullptr if no pre-LLVM opts ran
 
     // =======================================================================
     // Output streams
@@ -216,6 +225,44 @@ private:
     // Emits @simd loop vectorization metadata and returns the metadata ID
     // for the loop annotation node (e.g. !llvm.loop !N).
     int emitSimdLoopMetadata();
+
+    // =======================================================================
+    // Annotation-driven emission helpers
+    //
+    // These methods check the ASTAnnotationMap for optimization metadata
+    // computed by the pre-LLVM pipeline and emit the appropriate LLVM IR.
+    // =======================================================================
+
+    // Check if a node has a ColdPath annotation; if so, emit branch weight
+    // metadata on the enclosing branch instruction.
+    // Returns the profile metadata string (e.g., "!prof !5") or empty string.
+    std::string emitColdPathMetadata(const ASTNode* node);
+
+    // Emit a prefetch intrinsic if the WhileStmt has a PrefetchSite annotation.
+    void emitPrefetchIfAnnotated(WhileStmt* loop);
+
+    // Emit a yield check at the top of a loop body if the WhileStmt has
+    // a YieldPoint annotation. Uses a counter to only check every N iterations.
+    void emitYieldCheckIfAnnotated(WhileStmt* loop);
+
+    // Check if a FnDecl has an OpaqueBarrier annotation; if so, add
+    // the appropriate function attributes and emit fences around calls.
+    bool hasOpaqueBarrierAnnotation(FnDecl* fn) const;
+
+    // Emit an inline arena bump allocation if a CallExpr has an
+    // AllocatorInlined annotation. Returns the result register.
+    std::string emitInlineAllocatorIfAnnotated(CallExpr* call, TypeId ret_type);
+
+    // Emit SoA-transformed array access if a MemberExpr/IndexExpr has
+    // a SoATransformed annotation. Returns the result register.
+    std::string emitSoAAccessIfAnnotated(Expr* expr);
+
+    // Check if an expression has a SoATransformed annotation.
+    bool hasSoAAnnotation(Expr* expr) const;
+
+    // Get the branch weight metadata ID for cold/hot branch hints.
+    // Creates metadata entries like: !{!"branch_weights", i32 1, i32 1000}
+    int getBranchWeightMetadataId(uint32_t cold_weight, uint32_t hot_weight);
 };
 
 } // namespace tether
