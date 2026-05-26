@@ -221,6 +221,7 @@ private:
     // Current-function context
     // =======================================================================
     TypeId      current_return_type_;
+    TypeId      current_fn_error_type_;  // BUG FIX: stored for correct default terminator
     bool        current_can_error_   = false;
     bool        current_fn_has_simd_ = false;
     std::string current_fn_name_;

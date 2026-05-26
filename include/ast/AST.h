@@ -1202,6 +1202,7 @@ struct StructFieldDecl {
     std::string name;
     TypeId type;
     SourceLocation loc;
+    std::string unresolved_type_name;  // BUG FIX: stores type name text when type is unresolved
 
     StructFieldDecl(std::string n, TypeId t, SourceLocation l)
         : name(std::move(n)), type(t), loc(std::move(l)) {}

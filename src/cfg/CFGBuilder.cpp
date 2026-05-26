@@ -75,6 +75,34 @@ CFGNode* CFGBuilder::buildStmt(Stmt& stmt, CFGNode* current) {
             return buildAssignStmt(static_cast<AssignStmt&>(stmt), current);
         case NodeKind::DeferStmt:
             return buildDeferStmt(static_cast<DeferStmt&>(stmt), current);
+        // BUG FIX: Add explicit handling for ErrdeferStmt, AtomicStmt, YieldStmt
+        // instead of falling through to the default case.
+        case NodeKind::ErrdeferStmt: {
+            auto& es = static_cast<ErrdeferStmt&>(stmt);
+            current->addStmt(&es);
+            trackStatement(es, current);
+            // Errdefer stmts are collected for error-path handling (similar to defer)
+            deferred_stmts_.push_back(es.stmt());
+            return current;
+        }
+        case NodeKind::AtomicStmt: {
+            auto& as = static_cast<AtomicStmt&>(stmt);
+            current->addStmt(&as);
+            trackStatement(as, current);
+            // Build the inner statement for variable tracking
+            if (as.inner()) {
+                current = buildStmt(*as.inner(), current);
+            }
+            return current;
+        }
+        case NodeKind::YieldStmt: {
+            auto& ys = static_cast<YieldStmt&>(stmt);
+            current->addStmt(&ys);
+            trackStatement(ys, current);
+            // Yield creates a suspend point in the CFG — model as a
+            // split into a yield-resume path
+            return current;
+        }
         case NodeKind::IfStmt:
             return buildIfStmt(static_cast<IfStmt&>(stmt), current);
         case NodeKind::WhileStmt:

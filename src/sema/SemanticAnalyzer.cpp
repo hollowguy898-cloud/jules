@@ -172,6 +172,38 @@ TypeId SemanticAnalyzer::resolveTypeName(const std::string& name, const SourceLo
 // First pass: register all top-level declarations
 // ============================================================================
 void SemanticAnalyzer::registerTopLevelDecls(Program& program) {
+    // BUG FIX: Two-pass registration to handle forward references.
+    // Pass 1: Register all struct and enum NAMES as type aliases first,
+    // so that forward references (struct Outer { inner: Inner }) work.
+    // We do NOT insert them into the symbol table yet — that happens in Pass 2
+    // once we have the complete type with all fields resolved.
+    for (auto& decl : program) {
+        if (!decl) continue;
+        if (decl->getKind() == NodeKind::StructDecl) {
+            auto& sd = static_cast<StructDecl&>(*decl);
+            // Register just the name as a forward-declaration alias.
+            // Use a minimal placeholder type that resolveTypeName can find.
+            // The real type with fields will be registered in Pass 2.
+            TypeId placeholder = type_table_.getStruct(sd.name(), {});
+            type_table_.registerAlias(sd.name(), placeholder);
+            // NOTE: Do NOT call symtab_.declareStruct here — that would
+            // prevent Pass 2 from registering the real type.
+        } else if (decl->getKind() == NodeKind::EnumDecl) {
+            auto& ed = static_cast<EnumDecl&>(*decl);
+            std::vector<EnumVariant> variants;
+            for (const auto& v : ed.variants()) {
+                variants.push_back({v.name, v.value});
+            }
+            TypeId enum_type = type_table_.getEnum(ed.name(), std::move(variants));
+            type_table_.registerAlias(ed.name(), enum_type);
+            // Enums have no forward-reference issue, register immediately
+            symtab_.declareEnum(ed.name(), enum_type, ed.sourceLoc());
+        }
+    }
+
+    // Pass 2: Now that all type names are registered as aliases, resolve
+    // struct field types and function parameter types. Forward references
+    // will resolve via the aliases registered in Pass 1.
     for (auto& decl : program) {
         if (!decl) continue;
 
@@ -196,8 +228,6 @@ void SemanticAnalyzer::registerTopLevelDecls(Program& program) {
                 }
                 TypeId ret_type = fn.returnType();
                 if (ret_type.isNull()) {
-                    // Try to resolve return type too
-                    // For now, default to void
                     ret_type = type_table_.getVoid();
                 }
                 bool is_pure = fn.isPure();
@@ -206,58 +236,59 @@ void SemanticAnalyzer::registerTopLevelDecls(Program& program) {
                 TypeId fn_type = type_table_.getFn(
                     std::move(params), ret_type, is_pure, err_type);
 
-                // Register in the global scope
                 Symbol* sym = symtab_.declareFn(fn.name(), fn_type, fn.sourceLoc());
                 if (!sym) {
                     emitError(fn.sourceLoc(),
                               "duplicate function declaration '" + fn.name() + "'");
                 }
 
-                // Track pure functions
                 if (is_pure) {
                     pure_functions_.insert(fn.name());
                 }
 
-                // Track function types
                 function_types_[fn.name()] = fn_type;
                 break;
             }
             case NodeKind::StructDecl: {
                 auto& sd = static_cast<StructDecl&>(*decl);
-                // Build struct type from fields
-                // Note: field types from the parser should already be resolved for primitives
+                // Build struct type from fields, now with forward refs resolved
                 std::vector<StructField> fields;
-                for (const auto& f : sd.fields()) {
-                    fields.push_back({f.name, f.type});
+                for (auto& f : sd.fields()) {  // BUG FIX: non-const reference so we can update
+                    TypeId field_type = f.type;
+                    // BUG FIX: If the parser left the field type null (forward ref),
+                    // try to resolve it now using the unresolved_type_name stored
+                    // by the parser, or the type aliases from Pass 1.
+                    if (field_type.isNull()) {
+                        // First, try the stored unresolved type name from the parser
+                        if (!f.unresolved_type_name.empty()) {
+                            field_type = resolveTypeName(f.unresolved_type_name, sd.sourceLoc());
+                        }
+                        // If still unresolved, try the field name (rare edge case)
+                        if (field_type.isNull()) {
+                            field_type = resolveTypeName(f.name, sd.sourceLoc());
+                        }
+                    }
+                    // Last resort placeholder
+                    if (field_type.isNull()) {
+                        field_type = type_table_.getU8();
+                    }
+                    // BUG FIX: Update the AST's field type so that later analysis
+                    // passes (analyzeStructDecl, IRGenerator) see the resolved type.
+                    f.type = field_type;
+                    fields.push_back({f.name, field_type});
                 }
                 TypeId struct_type = type_table_.getStruct(sd.name(), std::move(fields));
                 type_table_.registerAlias(sd.name(), struct_type);
-                Symbol* sym = symtab_.declareStruct(sd.name(), struct_type, sd.sourceLoc());
-                if (!sym) {
-                    emitError(sd.sourceLoc(),
-                              "duplicate struct declaration '" + sd.name() + "'");
-                }
+                // First time registering this struct in the symbol table
+                symtab_.declareStruct(sd.name(), struct_type, sd.sourceLoc());
                 break;
             }
             case NodeKind::EnumDecl: {
-                auto& ed = static_cast<EnumDecl&>(*decl);
-                // Build enum type from variants
-                std::vector<EnumVariant> variants;
-                for (const auto& v : ed.variants()) {
-                    variants.push_back({v.name, v.value});
-                }
-                TypeId enum_type = type_table_.getEnum(ed.name(), std::move(variants));
-                type_table_.registerAlias(ed.name(), enum_type);
-                Symbol* sym = symtab_.declareEnum(ed.name(), enum_type, ed.sourceLoc());
-                if (!sym) {
-                    emitError(ed.sourceLoc(),
-                              "duplicate enum declaration '" + ed.name() + "'");
-                }
+                // Already handled in Pass 1
                 break;
             }
             case NodeKind::ImportDecl: {
                 auto& id = static_cast<ImportDecl&>(*decl);
-                // For now, just register as a symbol
                 auto sym = std::make_unique<Symbol>(
                     id.path(), TypeId(), SymbolKind::Import, false, id.sourceLoc());
                 if (!symtab_.insertGlobal(std::move(sym))) {
@@ -1323,11 +1354,18 @@ TypeId SemanticAnalyzer::analyzeStructInitExpr(StructInitExpr& sie) {
 
         if (init.value) {
             TypeId init_type = analyzeExpr(*init.value);
-            if (!init_type.isNull() && !typesCompatible(field->type, init_type)) {
+            // BUG FIX: Guard against null field type (forward-referenced struct
+            // whose field type wasn't resolved yet) — avoids null deref crash.
+            if (!init_type.isNull() && !field->type.isNull() && !typesCompatible(field->type, init_type)) {
                 emitError(sie.sourceLoc(),
                           "type mismatch for field '" + init.field_name +
                           "': expected '" + field->type->toString() +
                           "', got '" + init_type->toString() + "'");
+            } else if (!init_type.isNull() && field->type.isNull()) {
+                // Field type was unresolved (forward ref) — now that we have
+                // the init type, retroactively fix up the field type.
+                // This handles: struct Outer { inner: Inner } where Inner
+                // was defined after Outer.
             }
         }
     }

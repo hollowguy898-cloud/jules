@@ -20,13 +20,27 @@ Parser::Parser(std::vector<Token> tokens, TypeTable& type_table)
 // ============================================================================
 Program Parser::parse() {
     Program program;
+    int safety_counter = 0;
+    const int MAX_SAFETY = 10000;
     while (!isAtEnd()) {
         auto decl = parseTopLevel();
         if (decl) {
             program.push_back(std::move(decl));
+            safety_counter = 0;  // reset on successful parse
         } else {
             // On error, skip to next likely top-level start
+            Token before = peek();
             synchronize();
+            // BUG FIX: Force progress if synchronize didn't advance
+            if (peek().kind() == before.kind() &&
+                peek().text() == before.text() &&
+                !isAtEnd()) {
+                advance();
+            }
+            if (++safety_counter > MAX_SAFETY) {
+                error("too many errors; aborting parse");
+                break;
+            }
         }
     }
     return program;
@@ -356,9 +370,17 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
             break;
         }
         consume(TokenKind::COLON, "expected ':' after field name");
+        // BUG FIX: Store the type name token text before parsing, so that
+        // forward-referenced types (like 'Inner' in 'struct Outer { inner: Inner }')
+        // can be resolved later by the semantic analyzer.
+        Token type_name_tok = peek();
         TypeId field_type = parseType();
 
         fields.emplace_back(field_name.text(), field_type, std::move(field_loc));
+        // If the type couldn't be resolved by the parser, save the name text
+        if (field_type.isNull() && type_name_tok.kind() == TokenKind::IDENTIFIER) {
+            fields.back().unresolved_type_name = type_name_tok.text();
+        }
 
         if (!match(TokenKind::COMMA)) {
             break;
@@ -876,12 +898,27 @@ std::unique_ptr<BlockStmt> Parser::parseBlockStmt() {
     consume(TokenKind::LBRACE, "expected '{'");
 
     std::vector<std::unique_ptr<Stmt>> stmts;
+    int safety_counter = 0;
+    const int MAX_SAFETY = 10000;  // BUG FIX: prevent infinite loops on malformed input
     while (!check(TokenKind::RBRACE) && !isAtEnd()) {
+        if (++safety_counter > MAX_SAFETY) {
+            error("too many errors in block; skipping to end");
+            break;
+        }
         auto stmt = parseStmt();
         if (stmt) {
             stmts.push_back(std::move(stmt));
+            safety_counter = 0;  // reset on successful parse
         } else {
+            // BUG FIX: ensure we always make progress — if synchronize() didn't
+            // advance past the current token, force-advance one token.
+            Token before = peek();
             synchronize();
+            if (peek().kind() == before.kind() &&
+                peek().text() == before.text() &&
+                !isAtEnd()) {
+                advance();  // force progress to avoid infinite loop
+            }
         }
     }
 

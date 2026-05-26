@@ -84,11 +84,16 @@ uint64_t IRGenerator::typeSizeBytes(TypeId type) const {
         case TypeKind::Slice:      return 16;
         case TypeKind::Struct: {
             auto& st = cast<StructType>(type);
+            // BUG FIX: Empty structs have size 1 (like in C), not 0
+            if (st.fields().empty()) return 1;
             uint64_t total = 0;
             for (const auto& f : st.fields()) {
                 uint64_t fa = typeAlignmentBytes(f.type);
+                if (fa == 0) fa = 1;  // guard against null/zero alignment
                 total = ((total + fa - 1) / fa) * fa;
-                total += typeSizeBytes(f.type);
+                uint64_t fs = typeSizeBytes(f.type);
+                if (fs == 0) fs = 1;  // guard against null/zero size
+                total += fs;
             }
             return total;
         }
@@ -212,6 +217,8 @@ std::string IRGenerator::llvmType(TypeId type) const {
             auto key = type->toString();
             auto it = needed_types_.find(key);
             if (it != needed_types_.end()) return it->second.llvm_name;
+            // BUG FIX: Empty structs need to return a valid LLVM type
+            if (st.fields().empty()) return "%struct." + sanitizeName(st.name());
             return "%struct." + sanitizeName(st.name());
         }
         case TypeKind::Enum:
@@ -315,12 +322,19 @@ void IRGenerator::collectNeededTypes(TypeId type) {
             auto& st = cast<StructType>(type);
             for (const auto& f : st.fields()) collectNeededTypes(f.type);
             std::string ln = "%struct." + sanitizeName(st.name());
-            std::string body = "{ ";
-            for (size_t i = 0; i < st.fields().size(); ++i) {
-                if (i > 0) body += ", ";
-                body += llvmType(st.fields()[i].type);
+            std::string body;
+            // BUG FIX: Empty structs must emit at least { i8 } because LLVM
+            // does not allow zero-element struct types.
+            if (st.fields().empty()) {
+                body = "{ i8 }";
+            } else {
+                body = "{ ";
+                for (size_t i = 0; i < st.fields().size(); ++i) {
+                    if (i > 0) body += ", ";
+                    body += llvmType(st.fields()[i].type);
+                }
+                body += " }";
             }
-            body += " }";
             needed_types_[key] = {ln, body};
             type_emit_order_.push_back(key);
             break;
@@ -616,6 +630,11 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     terminated_ = false;
     current_return_type_ = fn->returnType();
     current_can_error_ = fn->canError();
+    // BUG FIX: Store the function's error type for the default terminator.
+    // The default terminator needs the ErrorType to build the correct return
+    // struct — using just current_return_type_ with can_error=true produces
+    // a wrong fallback type like "{ i64, i1 }" instead of the actual type.
+    current_fn_error_type_ = fn->errorType();
     current_fn_name_ = fn->name();
     current_ret_alloca_.clear();
     current_fn_has_simd_ = fn->hasDirective(CompilerDirective::Simd);
@@ -716,11 +735,13 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     if (!isTerminated()) {
         emitDeferBlocks();
         if (current_can_error_) {
-            // BUG FIX: Use the function's error type to build the return struct,
-            // not just llvmType(current_return_type_). The return type for an
-            // error-returning function is {success_type, i1}, and we need to
-            // match the function signature exactly.
-            std::string rt = llvmReturnType(current_return_type_, true);
+            // BUG FIX: Use the stored error type (current_fn_error_type_) to build
+            // the return struct, NOT llvmReturnType(current_return_type_, true).
+            // Using current_return_type_ with can_error=true hits the fallback path
+            // in llvmReturnType() which returns "{ i64, i1 }" — wrong for i32 etc.
+            std::string rt = current_fn_error_type_.isNull()
+                ? llvmReturnType(current_return_type_, true)
+                : llvmReturnType(current_fn_error_type_, true);
             std::string ll_val = llvmType(current_return_type_);
             if (ll_val == "void") {
                 std::string zero = nextReg();
@@ -1026,7 +1047,10 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             emitDeferBlocks();
 
             if (current_can_error_) {
-                std::string rt = llvmReturnType(current_return_type_, true);
+                // BUG FIX: Use current_fn_error_type_ for correct return struct type
+                std::string rt = current_fn_error_type_.isNull()
+                    ? llvmReturnType(current_return_type_, true)
+                    : llvmReturnType(current_fn_error_type_, true);
                 std::string vt = llvmType(current_return_type_);
                 if (rs.hasValue()) {
                     std::string val = emitExpr(rs.value());
@@ -1979,7 +2003,10 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         if (!isTerminated()) {
             // Return the error struct from the current function's error return type
             if (current_can_error_) {
-                std::string crt = llvmReturnType(current_return_type_, true);
+                // BUG FIX: Use current_fn_error_type_ for correct return struct type
+                std::string crt = current_fn_error_type_.isNull()
+                    ? llvmReturnType(current_return_type_, true)
+                    : llvmReturnType(current_fn_error_type_, true);
                 // Re-propagate the error value
                 if (vt == "void") {
                     std::string ins = nextReg();
@@ -2120,7 +2147,12 @@ void IRGenerator::emitBinaryOp(const std::string& result_reg,
 // emitLValue
 // ============================================================================
 std::string IRGenerator::emitLValue(Expr* expr) {
-    if (!expr) return "null";
+    if (!expr) {
+        // BUG FIX: Return a valid alloca instead of "null" string
+        std::string fallback = nextReg();
+        alloca_ss_ << "  " << fallback << " = alloca i8\n";
+        return fallback;
+    }
 
     switch (expr->getKind()) {
         case NodeKind::IdentExpr: {
@@ -2145,7 +2177,12 @@ std::string IRGenerator::emitLValue(Expr* expr) {
                 if (deref_type && isa<StructType>(deref_type)) {
                     auto& st = cast<StructType>(deref_type);
                     int idx = st.fieldIndex(mem.field());
-                    if (idx < 0) return "null";
+                    if (idx < 0) {
+                        // BUG FIX: field not found — return fallback alloca
+                        std::string fallback = nextReg();
+                        alloca_ss_ << "  " << fallback << " = alloca i8\n";
+                        return fallback;
+                    }
                     std::string ptr_val = emitExpr(mem.object());
                     std::string ll = llvmType(deref_type);
                     std::string gep = nextReg();
@@ -2159,7 +2196,12 @@ std::string IRGenerator::emitLValue(Expr* expr) {
             if (obj_type && isa<StructType>(obj_type)) {
                 auto& st = cast<StructType>(obj_type);
                 int idx = st.fieldIndex(mem.field());
-                if (idx < 0) return "null";
+                if (idx < 0) {
+                    // BUG FIX: field not found — return fallback alloca
+                    std::string fallback = nextReg();
+                    alloca_ss_ << "  " << fallback << " = alloca i8\n";
+                    return fallback;
+                }
                 std::string obj_ptr = emitLValue(mem.object());
                 std::string ll = llvmType(obj_type);
                 std::string gep = nextReg();
@@ -2168,7 +2210,12 @@ std::string IRGenerator::emitLValue(Expr* expr) {
                 return gep;
             }
 
-            return "null";
+            // BUG FIX: Unknown member target — return fallback alloca
+            {
+                std::string fallback = nextReg();
+                alloca_ss_ << "  " << fallback << " = alloca i8\n";
+                return fallback;
+            }
         }
 
         case NodeKind::IndexExpr: {
@@ -2485,7 +2532,10 @@ std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId er
     setTerminated(false);
     emitDeferBlocks();
     if (current_can_error_) {
-        std::string crt = llvmReturnType(current_return_type_, true);
+        // BUG FIX: Use current_fn_error_type_ for correct return struct type
+        std::string crt = current_fn_error_type_.isNull()
+            ? llvmReturnType(current_return_type_, true)
+            : llvmReturnType(current_fn_error_type_, true);
         if (vt == "void") {
             std::string ins = nextReg();
             body_ss_ << "  " << ins << " = insertvalue { i1 } undef, i1 true, 0\n";

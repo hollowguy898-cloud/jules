@@ -778,7 +778,7 @@ public:
     bool isBool() const override { return inner_.isNull() ? false : inner_->isBool(); }
     bool isVoid() const override { return inner_.isNull() ? false : inner_->isVoid(); }
     bool isError() const override { return inner_.isNull() ? false : inner_->isError(); }
-    bool isPoison() const override { return inner_->isPoison(); }
+    bool isPoison() const override { return !inner_.isNull() && inner_->isPoison(); }
 
 private:
     TypeId inner_;
