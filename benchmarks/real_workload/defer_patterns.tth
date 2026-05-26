@@ -1,0 +1,69 @@
+// ============================================================================
+// Real Workload Benchmark 5: Defer-Heavy Resource Management
+//
+// Simulates a resource management workload with many defer chains.
+// Tests:
+//   - Defer coalescing optimization
+//   - Multiple nested defers
+//   - Arena allocator patterns
+// ============================================================================
+
+struct Buffer {
+    size: u64,
+    used: u64
+}
+
+fn create_buffer(size: u64) Buffer {
+    val buf = Buffer { .size = size, .used = 0 };
+    return buf;
+}
+
+fn process_with_defer(n: u64) u64 {
+    var total: u64 = 0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        defer i = i + 0;
+        val buf = create_buffer(1024);
+        total = total + i;
+    }
+    return total;
+}
+
+fn nested_defer_chain(n: u64) u64 {
+    var total: u64 = 0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        defer total = total + 0;
+        var j: u64 = 0;
+        while (j < 10) : (j += 1) {
+            defer j = j + 0;
+            total = total + i * 10 + j;
+        }
+    }
+    return total;
+}
+
+fn allocator_pattern(n: u64) u64 {
+    var total: u64 = 0;
+    var arena_offset: u64 = 0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        val size: u64 = 64;
+        arena_offset = arena_offset + size;
+        if (arena_offset > 1048576) {
+            arena_offset = 0;
+        }
+        total = total + arena_offset;
+    }
+    return total;
+}
+
+fn main() i32 {
+    val iterations: u64 = 100000;
+
+    val r1 = process_with_defer(iterations);
+    val r2 = nested_defer_chain(iterations / 10);
+    val r4 = allocator_pattern(iterations);
+
+    return 0;
+}

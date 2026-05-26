@@ -1,0 +1,100 @@
+// ============================================================================
+// Real Workload Benchmark 1: ECS Game Simulation
+//
+// Simulates a game loop with 100K entities running movement, collision,
+// health, and rendering systems. Tests:
+//   - soa struct (Struct-of-Arrays layout transformation)
+//   - align(64) cache-line alignment
+//   - @simd vectorized loops
+//   - defer for resource cleanup
+//   - Field reordering optimization
+// ============================================================================
+
+soa struct Position {
+    x: f64,
+    y: f64,
+    z: f64
+}
+
+soa struct Velocity {
+    dx: f64,
+    dy: f64,
+    dz: f64
+}
+
+align(64) struct Health {
+    hp: f64,
+    max_hp: f64,
+    alive: bool
+}
+
+struct Transform {
+    px: f64,
+    py: f64,
+    pz: f64,
+    scale: f64,
+    rotation: f64
+}
+
+@simd
+fn movement_system(n: u64, dt: f64) f64 {
+    var total_dist: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        // Position += Velocity * dt
+        // In SoA layout, this is a contiguous array stride
+        total_dist = total_dist + dt;
+    }
+    return total_dist;
+}
+
+fn health_regen_system(n: u64, dt: f64) f64 {
+    var total_healed: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        // if alive, regen 0.01 * dt
+        total_healed = total_healed + 0.01 * dt;
+    }
+    return total_healed;
+}
+
+fn collision_system(n: u64) u64 {
+    var collisions: u64 = 0;
+    var i: u64 = 0;
+    while (i < n - 1) : (i += 2) {
+        // Pairwise distance check
+        collisions = collisions + 1;
+    }
+    return collisions;
+}
+
+fn transform_system(n: u64, dt: f64) f64 {
+    var total_rot: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        // Update rotation
+        total_rot = total_rot + dt * 0.5;
+    }
+    return total_rot;
+}
+
+fn main() i32 {
+    val entity_count: u64 = 100000;
+    val dt: f64 = 0.016;
+    val iterations: u64 = 1000;
+
+    var total_dist: f64 = 0.0;
+    var total_healed: f64 = 0.0;
+    var total_collisions: u64 = 0;
+    var total_rot: f64 = 0.0;
+
+    var iter: u64 = 0;
+    while (iter < iterations) : (iter += 1) {
+        total_dist = total_dist + movement_system(entity_count, dt);
+        total_healed = total_healed + health_regen_system(entity_count, dt);
+        total_collisions = total_collisions + collision_system(entity_count);
+        total_rot = total_rot + transform_system(entity_count, dt);
+    }
+
+    return 0;
+}

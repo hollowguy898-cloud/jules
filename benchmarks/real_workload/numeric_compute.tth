@@ -1,0 +1,139 @@
+// ============================================================================
+// Real Workload Benchmark 2: Numerical Computing
+//
+// Matrix operations, Newton's method, polynomial evaluation.
+// Tests:
+//   - pure functions (LLVM memory(none) optimization)
+//   - Heavy floating-point arithmetic
+//   - Nested loops with accumulation
+//   - Loop-invariant code motion opportunities
+// ============================================================================
+
+fn newton_sqrt(x: f64, guess: f64, iterations: u64) f64 {
+    var result: f64 = guess;
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        val sq = result * result;
+        val diff = sq - x;
+        val deriv = 2.0 * result;
+        result = result - diff / deriv;
+    }
+    return result;
+}
+
+fn polynomial_eval(c0: f64, c1: f64, c2: f64,
+                   c3: f64, c4: f64, x: f64) f64 {
+    var result: f64 = c4;
+    result = result * x + c3;
+    result = result * x + c2;
+    result = result * x + c1;
+    result = result * x + c0;
+    return result;
+}
+
+fn sum_of_squares(n: u64) f64 {
+    var total: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        val fi: f64 = i * 1.0;
+        total = total + fi * fi;
+    }
+    return total;
+}
+
+fn mandelbrot_iter(cx: f64, cy: f64, max_iter: u64) f64 {
+    var zx: f64 = 0.0;
+    var zy: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < max_iter) : (i += 1) {
+        val zx2 = zx * zx;
+        val zy2 = zy * zy;
+        if (zx2 + zy2 > 4.0) {
+            return i * 1.0;
+        }
+        zy = 2.0 * zx * zy + cy;
+        zx = zx2 - zy2 + cx;
+    }
+    return max_iter * 1.0;
+}
+
+fn matrix_multiply_element(a: f64, b: f64, c: f64, d: f64,
+                           e: f64, f: f64, g: f64, h: f64,
+                           row: u64, col: u64) f64 pure {
+    if (row == 0) {
+        if (col == 0) { return a * e + b * g; }
+        return a * f + b * h;
+    }
+    if (col == 0) { return c * e + d * g; }
+    return c * f + d * h;
+}
+
+fn fibonacci_iterative(n: u64) u64 {
+    if (n <= 1) { return n; }
+    var a: u64 = 0;
+    var b: u64 = 1;
+    var i: u64 = 2;
+    while (i <= n) : (i += 1) {
+        val temp = b;
+        b = a + b;
+        a = temp;
+    }
+    return b;
+}
+
+fn pi_leibniz(n: u64) f64 {
+    var total: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        val sign: f64 = 1.0 - 2.0 * (i % 2);
+        val denom: f64 = 2.0 * i + 1.0;
+        total = total + sign / denom;
+    }
+    return total * 4.0;
+}
+
+fn main() i32 {
+    val iterations: u64 = 100000;
+
+    // Newton's method: compute sqrt(2) many times
+    var sqrt_sum: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        sqrt_sum = sqrt_sum + newton_sqrt(2.0, 1.414, 10);
+    }
+
+    // Polynomial evaluation stress test
+    var poly_sum: f64 = 0.0;
+    var k: u64 = 0;
+    while (k < iterations) : (k += 1) {
+        val x: f64 = k * 0.001;
+        poly_sum = poly_sum + polynomial_eval(1.0, 2.5, -0.3, 0.01, -0.001, x);
+    }
+
+    // Sum of squares
+    val ssq = sum_of_squares(100000);
+
+    // Mandelbrot set computation
+    var mandel_sum: f64 = 0.0;
+    var mx: u64 = 0;
+    while (mx < 100) : (mx += 1) {
+        var my: u64 = 0;
+        while (my < 100) : (my += 1) {
+            val cx: f64 = -2.0 + mx * 0.04;
+            val cy: f64 = -1.5 + my * 0.03;
+            mandel_sum = mandel_sum + mandelbrot_iter(cx, cy, 100);
+        }
+    }
+
+    // Fibonacci stress test
+    var fib_sum: u64 = 0;
+    var fi: u64 = 0;
+    while (fi < 10000) : (fi += 1) {
+        fib_sum = fib_sum + fibonacci_iterative(fi % 50);
+    }
+
+    // Pi via Leibniz formula
+    val pi_approx = pi_leibniz(1000000);
+
+    return 0;
+}
