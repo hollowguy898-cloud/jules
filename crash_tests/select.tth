@@ -1,0 +1,9 @@
+// CRASH TEST: Select expression
+fn select_test() i32 {
+    val cond: bool = true;
+    val result: i32 = select(cond, 42, 99);
+    return result;
+}
+fn main() i32 {
+    return select_test();
+}

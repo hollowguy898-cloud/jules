@@ -1,0 +1,7 @@
+// CRASH TEST: Error-returning function with empty body
+fn may_fail(x: i32) !i32 {
+}
+fn main() i32 {
+    val r = try may_fail(5);
+    return r;
+}

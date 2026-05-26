@@ -1,0 +1,11 @@
+// CRASH TEST: Multiple defer statements
+fn multi_defer() i32 {
+    var a: i32 = 1;
+    defer a = 10;
+    defer a = 20;
+    defer a = 30;
+    return a;
+}
+fn main() i32 {
+    return multi_defer();
+}

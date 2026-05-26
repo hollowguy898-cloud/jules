@@ -164,6 +164,7 @@ bool Driver::runLexer() {
 
     Lexer lexer(source_text_, input_file_);
     tokens_ = lexer.tokenize();
+    filename_ptr_ = lexer.filenamePtr();  // Keep filename alive for Token string_views
 
     if (lexer.hasErrors()) {
         for (const auto& diag : lexer.diagnostics()) {

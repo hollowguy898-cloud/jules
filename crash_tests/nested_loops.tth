@@ -1,0 +1,18 @@
+// CRASH TEST: Break/continue in deeply nested loops
+fn nested_loops() i32 {
+    var sum: i32 = 0;
+    var i: i32 = 0;
+    while (i < 10) : (i += 1) {
+        var j: i32 = 0;
+        while (j < 10) : (j += 1) {
+            if (j == 5) {
+                break;
+            }
+            sum += 1;
+        }
+    }
+    return sum;
+}
+fn main() i32 {
+    return nested_loops();
+}

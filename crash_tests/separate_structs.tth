@@ -1,0 +1,11 @@
+// Test: Nested struct types (INNER SEPARATE)
+struct Inner { x: i32, y: i32 }
+struct Outer { a: i32, z: i64 }
+fn use_nested() i32 {
+    val inner = Inner{ .x = 1, .y = 2 }
+    val outer = Outer{ .a = 3, .z = 4 }
+    return inner.x + outer.a
+}
+fn main() i32 {
+    return use_nested()
+}

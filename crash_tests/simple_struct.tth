@@ -1,0 +1,9 @@
+// Test: Simple struct (no nesting) - just Inner alone
+struct Inner { x: i32, y: i32 }
+fn simple_struct() i32 {
+    val i = Inner{ .x = 1, .y = 2 };
+    return i.x;
+}
+fn main() i32 {
+    return simple_struct();
+}

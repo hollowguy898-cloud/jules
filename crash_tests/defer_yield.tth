@@ -1,0 +1,9 @@
+// Test: Defer with yield inside (defer expects a statement)
+fn deferred_yield() i32 {
+    defer val x: i32 = 0
+    yield
+    return 0
+}
+fn main() i32 {
+    return deferred_yield()
+}

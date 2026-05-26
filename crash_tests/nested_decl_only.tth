@@ -1,0 +1,6 @@
+// Test: Struct with struct-type field but NO creation or usage
+struct Inner { x: i32, y: i32 }
+struct Outer { inner: Inner, z: i64 }
+fn main() i32 {
+    return 0;
+}

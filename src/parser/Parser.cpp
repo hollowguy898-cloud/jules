@@ -127,21 +127,23 @@ Token Parser::consumeGT() {
     }
     if (check(TokenKind::SHR)) {
         Token shr = advance(); // consume the >> token
-        // Split into two > tokens
-        Token first_gt(TokenKind::GT, ">",
-                       shr.line(), shr.col(), shr.filename());
-        Token second_gt(TokenKind::GT, ">",
-                        shr.line(), shr.col() + 1, shr.filename());
+        // Split into two > tokens — string_view from static literals (safe)
+        const std::string* fn_ptr = &shr.filename();
+        Token first_gt(TokenKind::GT, std::string_view(">"),
+                       shr.line(), shr.col(), fn_ptr);
+        Token second_gt(TokenKind::GT, std::string_view(">"),
+                        shr.line(), shr.col() + 1, fn_ptr);
         pending_tokens_.push_back(second_gt);
         return first_gt;
     }
     if (check(TokenKind::SHR_EQ)) {
         // Split >>= into > and >=
         Token shr_eq = advance();
-        Token first_gt(TokenKind::GT, ">",
-                       shr_eq.line(), shr_eq.col(), shr_eq.filename());
-        Token second_ge(TokenKind::GE, ">=",
-                        shr_eq.line(), shr_eq.col() + 1, shr_eq.filename());
+        const std::string* fn_ptr = &shr_eq.filename();
+        Token first_gt(TokenKind::GT, std::string_view(">"),
+                       shr_eq.line(), shr_eq.col(), fn_ptr);
+        Token second_ge(TokenKind::GE, std::string_view(">="),
+                        shr_eq.line(), shr_eq.col() + 1, fn_ptr);
         pending_tokens_.push_back(second_ge);
         return first_gt;
     }
@@ -194,7 +196,9 @@ void Parser::errorAt(const Token& token, const std::string& message) {
                       std::to_string(token.line()) + ":" +
                       std::to_string(token.col()) + ": " + message;
     if (token.kind() != TokenKind::EOF_TOKEN) {
-        msg += " (got '" + token.text() + "')";
+        msg += " (got '";
+        msg.append(token.text());
+        msg += "')";
     }
     errors_.push_back({locFrom(token), msg});
 }
@@ -240,7 +244,7 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
         // We represent opaque types as a special struct with no fields and alignment info
         // Semantic analysis will register it as an OpaqueType
         auto decl = std::make_unique<StructDecl>(
-            std::move(opaque_loc), name_tok.text(), std::vector<StructFieldDecl>{});
+            std::move(opaque_loc), std::string(name_tok.text()), std::vector<StructFieldDecl>{});
         decl->setSoA(false);
         return decl;
     }
@@ -262,7 +266,7 @@ std::vector<CompilerDirective> Parser::parseDirectives() {
             continue;
         }
         Token name = advance();
-        const std::string& text = name.text();
+        std::string_view text = name.text();
         if (text == "superoptimize") {
             directives.push_back(CompilerDirective::Superoptimize);
         } else if (text == "polly") {
@@ -270,7 +274,10 @@ std::vector<CompilerDirective> Parser::parseDirectives() {
         } else if (text == "simd") {
             directives.push_back(CompilerDirective::Simd);
         } else {
-            errorAt(name, "unknown compiler directive '@" + text + "'");
+            std::string err_msg = "unknown compiler directive '@";
+            err_msg.append(text);
+            err_msg += "'";
+            errorAt(name, err_msg);
         }
     }
     return directives;
@@ -282,7 +289,7 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
     consume(TokenKind::KW_FN, "expected 'fn'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected function name");
-    std::string fn_name = name_tok.text();
+    std::string fn_name(name_tok.text());
 
     consume(TokenKind::LPAREN, "expected '(' after function name");
     auto params = parseFnParams();
@@ -338,7 +345,7 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     if (match(TokenKind::KW_ALIGN)) {
         consume(TokenKind::LPAREN, "expected '(' after 'align'");
         Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
-        alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
+        alignment = static_cast<uint32_t>(std::stoull(std::string(align_tok.text())));
         consume(TokenKind::RPAREN, "expected ')' after alignment value");
     }
 
@@ -349,12 +356,12 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     if (alignment == 0 && match(TokenKind::KW_ALIGN)) {
         consume(TokenKind::LPAREN, "expected '(' after 'align'");
         Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
-        alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
+        alignment = static_cast<uint32_t>(std::stoull(std::string(align_tok.text())));
         consume(TokenKind::RPAREN, "expected ')' after alignment value");
     }
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected struct name");
-    std::string struct_name = name_tok.text();
+    std::string struct_name(name_tok.text());
 
     consume(TokenKind::LBRACE, "expected '{' after struct name");
 
@@ -376,10 +383,10 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
         Token type_name_tok = peek();
         TypeId field_type = parseType();
 
-        fields.emplace_back(field_name.text(), field_type, std::move(field_loc));
+        fields.emplace_back(std::string(field_name.text()), field_type, std::move(field_loc));
         // If the type couldn't be resolved by the parser, save the name text
         if (field_type.isNull() && type_name_tok.kind() == TokenKind::IDENTIFIER) {
-            fields.back().unresolved_type_name = type_name_tok.text();
+            fields.back().unresolved_type_name = std::string(type_name_tok.text());
         }
 
         if (!match(TokenKind::COMMA)) {
@@ -400,7 +407,7 @@ std::unique_ptr<EnumDecl> Parser::parseEnumDecl() {
     consume(TokenKind::KW_ENUM, "expected 'enum'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected enum name");
-    std::string enum_name = name_tok.text();
+    std::string enum_name(name_tok.text());
 
     consume(TokenKind::LBRACE, "expected '{' after enum name");
 
@@ -416,14 +423,14 @@ std::unique_ptr<EnumDecl> Parser::parseEnumDecl() {
             // Explicit value
             Token val_tok = consume(TokenKind::INT_LITERAL,
                                     "expected integer value for enum variant");
-            explicit_value = std::stoll(val_tok.text());
+            explicit_value = std::stoll(std::string(val_tok.text()));
             next_value = *explicit_value + 1;
         } else {
             explicit_value = std::nullopt;
             next_value++;
         }
 
-        variants.emplace_back(variant_name.text(), explicit_value,
+        variants.emplace_back(std::string(variant_name.text()), explicit_value,
                               std::move(variant_loc));
 
         if (!match(TokenKind::COMMA)) {
@@ -445,7 +452,7 @@ std::unique_ptr<ImportDecl> Parser::parseImportDecl() {
     if (check(TokenKind::STRING_LITERAL)) {
         Token path_tok = advance();
         // Strip quotes
-        path = path_tok.text().substr(1, path_tok.text().size() - 2);
+        path = std::string(path_tok.text().substr(1, path_tok.text().size() - 2));
     } else {
         // Identifier-based import path
         Token first = consume(TokenKind::IDENTIFIER,
@@ -454,7 +461,8 @@ std::unique_ptr<ImportDecl> Parser::parseImportDecl() {
         while (match(TokenKind::DOT_DOT)) {
             Token part = consume(TokenKind::IDENTIFIER,
                                  "expected identifier in import path");
-            path += "::" + part.text();
+            path += "::";
+            path.append(part.text());
         }
     }
 
@@ -632,7 +640,7 @@ std::unique_ptr<ValDeclStmt> Parser::parseValDecl() {
     consume(TokenKind::KW_VAL, "expected 'val'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected variable name");
-    std::string name = name_tok.text();
+    std::string name(name_tok.text());
 
     // Optional type annotation
     TypeId declared_type;
@@ -665,7 +673,7 @@ std::unique_ptr<VarDeclStmt> Parser::parseVarDecl() {
     consume(TokenKind::KW_VAR, "expected 'var'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected variable name");
-    std::string name = name_tok.text();
+    std::string name(name_tok.text());
 
     // Optional type annotation
     TypeId declared_type;
@@ -831,13 +839,18 @@ std::unique_ptr<Stmt> Parser::parseAtomicStmt() {
     // Check for optional ordering specifier: atomic(relaxed), atomic(acquire), atomic(release), atomic(acqrel), atomic(seqcst)
     if (match(TokenKind::LPAREN)) {
         Token ordering_tok = consume(TokenKind::IDENTIFIER, "expected atomic ordering (relaxed, acquire, release, acqrel, seqcst)");
-        std::string ordering_text = ordering_tok.text();
+        std::string_view ordering_text = ordering_tok.text();
         if (ordering_text == "relaxed") ordering = AtomicStmt::Ordering::Relaxed;
         else if (ordering_text == "acquire") ordering = AtomicStmt::Ordering::Acquire;
         else if (ordering_text == "release") ordering = AtomicStmt::Ordering::Release;
         else if (ordering_text == "acqrel") ordering = AtomicStmt::Ordering::AcqRel;
         else if (ordering_text == "seqcst" || ordering_text == "seq_cst") ordering = AtomicStmt::Ordering::SeqCst;
-        else errorAt(ordering_tok, "unknown atomic ordering '" + ordering_text + "'");
+        else {
+            std::string err_msg = "unknown atomic ordering '";
+            err_msg.append(ordering_text);
+            err_msg += "'";
+            errorAt(ordering_tok, err_msg);
+        }
         consume(TokenKind::RPAREN, "expected ')' after atomic ordering");
     }
 
@@ -1186,7 +1199,7 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
             Token tok = advance();
             SourceLocation tok_loc = locFrom(tok);
             // Parse value, stripping any type suffix
-            std::string text = tok.text();
+            std::string_view text = tok.text();
             uint64_t value = 0;
             bool is_signed = false;
 
@@ -1200,8 +1213,7 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                        (isxdigit(text[digit_end]) || text[digit_end] == '_')) {
                     digit_end++;
                 }
-                std::string hex_str = text.substr(2, digit_end - 2);
-                value = std::stoull(hex_str, nullptr, 16);
+                value = std::stoull(std::string(text.substr(2, digit_end - 2)), nullptr, 16);
             } else if (text.size() > 2 && text[0] == '0' &&
                        (text[1] == 'b' || text[1] == 'B')) {
                 // Binary literal
@@ -1211,8 +1223,7 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                         text[digit_end] == '_')) {
                     digit_end++;
                 }
-                std::string bin_str = text.substr(2, digit_end - 2);
-                value = std::stoull(bin_str, nullptr, 2);
+                value = std::stoull(std::string(text.substr(2, digit_end - 2)), nullptr, 2);
             } else {
                 // Decimal
                 digit_end = 0;
@@ -1220,13 +1231,12 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                        (isdigit(text[digit_end]) || text[digit_end] == '_')) {
                     digit_end++;
                 }
-                std::string dec_str = text.substr(0, digit_end);
-                value = std::stoull(dec_str, nullptr, 10);
+                value = std::stoull(std::string(text.substr(0, digit_end)), nullptr, 10);
             }
 
             // Determine signedness from suffix
-            std::string suffix = text.substr(digit_end);
-            if (suffix.find('i') != std::string::npos) {
+            std::string_view suffix = text.substr(digit_end);
+            if (suffix.find('i') != std::string_view::npos) {
                 is_signed = true;
             }
 
@@ -1238,12 +1248,11 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
             Token tok = advance();
             SourceLocation tok_loc = locFrom(tok);
             // Parse value, stripping any type suffix
-            std::string text = tok.text();
+            std::string_view text = tok.text();
             size_t last_digit = text.find_last_of("0123456789");
             double value = 0.0;
-            if (last_digit != std::string::npos) {
-                std::string num_str = text.substr(0, last_digit + 1);
-                value = std::stod(num_str);
+            if (last_digit != std::string_view::npos) {
+                value = std::stod(std::string(text.substr(0, last_digit + 1)));
             }
             return std::make_unique<FloatLiteral>(std::move(tok_loc), value);
         }
@@ -1252,7 +1261,7 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
             Token tok = advance();
             SourceLocation tok_loc = locFrom(tok);
             // Strip quotes and process escape sequences
-            std::string raw = tok.text().substr(1, tok.text().size() - 2);
+            std::string_view raw = tok.text().substr(1, tok.text().size() - 2);
             std::string value;
             value.reserve(raw.size());
             for (size_t i = 0; i < raw.size(); ++i) {
@@ -1268,9 +1277,8 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                         case 'x': {
                             // Hex escape \xHH
                             if (i + 3 < raw.size()) {
-                                std::string hex = raw.substr(i + 2, 2);
                                 char ch = static_cast<char>(
-                                    std::stoul(hex, nullptr, 16));
+                                    std::stoul(std::string(raw.substr(i + 2, 2)), nullptr, 16));
                                 value += ch;
                                 i += 3;
                             }
@@ -1279,10 +1287,9 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                         case 'u': {
                             // Unicode escape \uHHHH
                             if (i + 5 < raw.size()) {
-                                std::string hex = raw.substr(i + 2, 4);
                                 uint32_t codepoint =
                                     static_cast<uint32_t>(
-                                        std::stoul(hex, nullptr, 16));
+                                        std::stoul(std::string(raw.substr(i + 2, 4)), nullptr, 16));
                                 // Simple UTF-8 encoding
                                 if (codepoint < 0x80) {
                                     value += static_cast<char>(codepoint);
@@ -1314,7 +1321,7 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
             Token tok = advance();
             SourceLocation tok_loc = locFrom(tok);
             // Strip quotes and process escape sequences
-            std::string raw = tok.text().substr(1, tok.text().size() - 2);
+            std::string_view raw = tok.text().substr(1, tok.text().size() - 2);
             char value = '\0';
             if (!raw.empty()) {
                 if (raw[0] == '\\' && raw.size() > 1) {
@@ -1327,9 +1334,8 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                         case '0':  value = '\0'; break;
                         case 'x': {
                             if (raw.size() > 3) {
-                                std::string hex = raw.substr(2, 2);
                                 value = static_cast<char>(
-                                    std::stoul(hex, nullptr, 16));
+                                    std::stoul(std::string(raw.substr(2, 2)), nullptr, 16));
                             }
                             break;
                         }
@@ -1392,7 +1398,7 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
                 // Parse as a smart pointer type name, possibly followed by struct init
                 SourceLocation name_loc = loc();
                 advance(); // consume Box/Rc/Arc
-                std::string sp_name = ident_tok.text();
+                std::string sp_name(ident_tok.text());
 
                 consume(TokenKind::LT,
                         "expected '<' after smart pointer name");
@@ -1415,11 +1421,11 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
 
             // Struct initialization: TypeName { .field = value, ... }
             if (check(TokenKind::LBRACE)) {
-                return parseStructInitExpr(ident_tok.text());
+                return parseStructInitExpr(std::string(ident_tok.text()));
             }
 
             return std::make_unique<IdentExpr>(
-                locFrom(ident_tok), ident_tok.text());
+                locFrom(ident_tok), std::string(ident_tok.text()));
         }
 
         // Array literal: [a, b, c]
@@ -1467,7 +1473,7 @@ std::unique_ptr<Expr> Parser::parseMemberExpr(std::unique_ptr<Expr> object) {
     Token field = consume(TokenKind::IDENTIFIER,
                           "expected field name after '.'");
     return std::make_unique<MemberExpr>(
-        std::move(dot_loc), std::move(object), field.text());
+        std::move(dot_loc), std::move(object), std::string(field.text()));
 }
 
 std::unique_ptr<Expr> Parser::parseIndexExpr(std::unique_ptr<Expr> object) {
@@ -1546,7 +1552,7 @@ TypeId Parser::parseType() {
     if (match(TokenKind::KW_ALIGN)) {
         consume(TokenKind::LPAREN, "expected '(' after 'align'");
         Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
-        uint32_t alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
+        uint32_t alignment = static_cast<uint32_t>(std::stoull(std::string(align_tok.text())));
         consume(TokenKind::RPAREN, "expected ')' after alignment value");
         TypeId inner = parseType();
         return type_table_.getAligned(inner, alignment);
@@ -1589,7 +1595,7 @@ TypeId Parser::parseType() {
 
     // Primitive type identifiers
     if (check(TokenKind::IDENTIFIER)) {
-        std::string name = peek().text();
+        std::string name(peek().text());
 
         // Primitives
         if (name == "u8")    { advance(); return type_table_.getU8(); }
@@ -1675,7 +1681,7 @@ std::vector<FnParam> Parser::parseFnParams() {
 
         Token name_tok = consume(TokenKind::IDENTIFIER,
                                  "expected parameter name");
-        param.name = name_tok.text();
+        param.name = std::string(name_tok.text());
 
         consume(TokenKind::COLON, "expected ':' after parameter name");
         Token type_name_tok = peek();
@@ -1684,7 +1690,7 @@ std::vector<FnParam> Parser::parseFnParams() {
         if (param.type.isNull() && type_name_tok.kind() == TokenKind::IDENTIFIER) {
             // We need the function name, which is set after parseFnParams returns.
             // Store by param index temporarily; parseFnDecl will add the function name prefix.
-            param_type_annotations_["__pending__" + std::to_string(params.size())] = type_name_tok.text();
+            param_type_annotations_["__pending__" + std::to_string(params.size())] = std::string(type_name_tok.text());
         }
 
         params.push_back(std::move(param));
@@ -1707,7 +1713,7 @@ std::vector<DesignatedInit> Parser::parseDesignatedInits() {
         if (match(TokenKind::DOT)) {
             Token field = consume(TokenKind::IDENTIFIER,
                                   "expected field name after '.'");
-            init.field_name = field.text();
+            init.field_name = std::string(field.text());
             consume(TokenKind::EQ, "expected '=' after field name in struct init");
         } else {
             // Could also support positional init, but spec says designated

@@ -1,0 +1,10 @@
+// Test: Nested struct with field-of-field read access
+struct Inner { x: i32, y: i32 }
+struct Outer { inner: Inner, z: i64 }
+fn field_of_field() i32 {
+    val o = Outer{ .inner = Inner{ .x = 1, .y = 2 }, .z = 3 };
+    return o.inner.x;
+}
+fn main() i32 {
+    return field_of_field();
+}

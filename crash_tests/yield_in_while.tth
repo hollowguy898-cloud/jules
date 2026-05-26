@@ -1,0 +1,11 @@
+// CRASH TEST: Yield in while loop
+fn yield_loop() void {
+    var i: i32 = 0;
+    while (i < 10) : (i += 1) {
+        yield;
+    }
+}
+fn main() i32 {
+    yield_loop();
+    return 0;
+}

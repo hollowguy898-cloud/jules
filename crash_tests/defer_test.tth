@@ -1,0 +1,10 @@
+// CRASH TEST: Defer with compound assignment
+fn defer_test() i32 {
+    var x: i32 = 10;
+    defer x = 0;
+    x += 5;
+    return x;
+}
+fn main() i32 {
+    return defer_test();
+}

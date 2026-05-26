@@ -1,0 +1,10 @@
+// CRASH TEST: Struct init with missing fields
+struct Point { x: f64, y: f64 }
+fn partial_init() Point {
+    val p = Point{ .x = 1.0 };
+    return p;
+}
+fn main() i32 {
+    val p = partial_init();
+    return 0;
+}

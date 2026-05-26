@@ -1,0 +1,15 @@
+// CRASH TEST: Multiple error-returning functions calling each other
+fn inner_fail(x: i32) !i32 {
+    if (x < 0) {
+        return 0;
+    }
+    return x * 2;
+}
+fn outer_fail(x: i32) !i32 {
+    val r = try inner_fail(x);
+    return r + 1;
+}
+fn main() i32 {
+    val r = try outer_fail(5);
+    return r;
+}

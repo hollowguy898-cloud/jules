@@ -1,0 +1,11 @@
+// CRASH TEST: Multiple struct types with same field names
+struct A { val: i32 }
+struct B { val: i64 }
+fn test() i32 {
+    val a = A{ .val = 1 };
+    val b = B{ .val = 2 };
+    return a.val;
+}
+fn main() i32 {
+    return test();
+}

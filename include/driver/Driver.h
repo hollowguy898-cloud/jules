@@ -128,6 +128,7 @@ private:
     // Intermediate data (populated during compilation)
     // -----------------------------------------------------------------------
     std::string source_text_;                                    // Phase 1
+    std::shared_ptr<std::string> filename_ptr_;                   // Kept alive for Token string_views
     std::vector<Token> tokens_;                                  // Phase 2
     Program program_;                                            // Phase 3
     TypeTable type_table_;                                       // Shared type table

@@ -1,0 +1,13 @@
+// CRASH TEST: Errdefer in error-returning function  
+fn error_cleanup(x: i32) !i32 {
+    var temp: i32 = x;
+    errdefer temp = 0;
+    if (x < 0) {
+        return 0;
+    }
+    return temp + 1;
+}
+fn main() i32 {
+    val r = try error_cleanup(5);
+    return r;
+}

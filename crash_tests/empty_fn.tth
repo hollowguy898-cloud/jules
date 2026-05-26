@@ -1,0 +1,6 @@
+// Test 2: Empty function body with error return type
+fn might_error() i32 !ErrorType {
+}
+fn main() i32 {
+    return 0
+}

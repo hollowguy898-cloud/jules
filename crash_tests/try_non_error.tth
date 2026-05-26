@@ -1,0 +1,8 @@
+// CRASH TEST: try on non-error-returning function
+fn not_error() i32 {
+    return 42;
+}
+fn main() i32 {
+    val x = try not_error();
+    return x;
+}

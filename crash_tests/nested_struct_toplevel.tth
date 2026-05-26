@@ -1,0 +1,10 @@
+// Test: Nested struct with only top-level field access (not .inner.x)
+struct Inner { x: i32, y: i32 }
+struct Outer { inner: Inner, z: i64 }
+fn top_level_access() i64 {
+    val o = Outer{ .inner = Inner{ .x = 1, .y = 2 }, .z = 3 };
+    return o.z;
+}
+fn main() i32 {
+    return 0;
+}

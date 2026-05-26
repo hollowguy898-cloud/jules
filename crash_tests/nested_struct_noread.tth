@@ -1,0 +1,10 @@
+// Test: Nested struct WITHOUT field-of-field access (just creation and return)
+struct Inner { x: i32, y: i32 }
+struct Outer { inner: Inner, z: i64 }
+fn create_only() Outer {
+    val o = Outer{ .inner = Inner{ .x = 1, .y = 2 }, .z = 3 };
+    return o;
+}
+fn main() i32 {
+    return 0;
+}

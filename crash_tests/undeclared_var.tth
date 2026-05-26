@@ -1,0 +1,8 @@
+// CRASH TEST: Undeclared variable (error-resilient compilation)
+fn use_undeclared() i32 {
+    var x: i32 = unknown_var + 1;
+    return x;
+}
+fn main() i32 {
+    return 0;
+}

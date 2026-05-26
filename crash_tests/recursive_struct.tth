@@ -1,0 +1,10 @@
+// CRASH TEST: Struct with field referring to pointer of itself
+struct Node { value: i32, next: *Node }
+fn make_node() Node {
+    val n = Node{ .value = 42, .next = 0 };
+    return n;
+}
+fn main() i32 {
+    val n = make_node();
+    return n.value;
+}

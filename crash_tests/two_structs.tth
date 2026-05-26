@@ -1,0 +1,11 @@
+// Test: Two separate structs (one referencing the other) but no nesting in types
+struct A { x: i32 }
+struct B { y: i64 }
+fn two_structs() i32 {
+    val a = A{ .x = 1 };
+    val b = B{ .y = 2 };
+    return a.x;
+}
+fn main() i32 {
+    return two_structs();
+}

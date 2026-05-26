@@ -1,0 +1,11 @@
+// CRASH TEST: Atomic operations with compound assignment
+fn atomic_test() i32 {
+    var counter: i32 = 0;
+    atomic(release) counter += 1;
+    atomic(release) counter += 1;
+    atomic(release) counter += 1;
+    return counter;
+}
+fn main() i32 {
+    return atomic_test();
+}

@@ -1,0 +1,9 @@
+// CRASH TEST: Empty struct with zero fields
+struct Empty {}
+fn use_empty() Empty {
+    val e = Empty{};
+    return e;
+}
+fn main() i32 {
+    return 0;
+}

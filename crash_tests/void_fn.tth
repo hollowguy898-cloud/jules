@@ -1,0 +1,8 @@
+// CRASH TEST: Void function with no return
+fn void_fn() void {
+    val x: i32 = 1;
+}
+fn main() i32 {
+    void_fn();
+    return 0;
+}

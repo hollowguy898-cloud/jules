@@ -1,0 +1,10 @@
+// Test: Struct with struct-type field - just declaration + pass through (no field access)
+struct Inner { x: i32, y: i32 }
+struct Outer { z: i64 }
+fn create_outer() Outer {
+    val o = Outer{ .z = 3 };
+    return o;
+}
+fn main() i32 {
+    return 0;
+}
