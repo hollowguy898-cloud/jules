@@ -45,30 +45,30 @@ all: $(TARGET) $(RUNTIME_LIB)
 # ============================================================================
 
 $(TARGET): $(CXX_OBJS)
-        $(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) -o $@ $^
 
 # ============================================================================
 # Compile C++ sources
 # ============================================================================
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
-        @mkdir -p $(dir $@)
-        $(CXX) $(CXXFLAGS) -c -MMD -MP -o $@ $<
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c -MMD -MP -o $@ $<
 
 # ============================================================================
 # Compile C runtime
 # ============================================================================
 
 $(BUILDDIR)/runtime/%.o: $(RUNTIMEDIR)/%.c
-        @mkdir -p $(dir $@)
-        $(CC) $(CFLAGS) -c -o $@ $<
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ============================================================================
 # Build runtime static library
 # ============================================================================
 
 $(RUNTIME_LIB): $(C_OBJ)
-        ar rcs $@ $<
+	ar rcs $@ $<
 
 # ============================================================================
 # Dependency tracking (auto-generated .d files from -MMD -MP)
@@ -82,7 +82,7 @@ $(RUNTIME_LIB): $(C_OBJ)
 
 .PHONY: clean
 clean:
-        rm -rf $(BUILDDIR) $(TARGET)
+	rm -rf $(BUILDDIR) $(TARGET)
 
 # ============================================================================
 # Test target
@@ -90,12 +90,12 @@ clean:
 
 .PHONY: test
 test: $(TARGET)
-        @echo "=== Testing compiler on examples ==="
-        @for f in examples/*.tth; do \
-                echo "  Compiling $$f ..."; \
-                ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
-        done
-        @echo "=== Tests complete ==="
+	@echo "=== Testing compiler on examples ==="
+	@for f in examples/*.tth; do \
+	        echo "  Compiling $$f ..."; \
+	        ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
+	done
+	@echo "=== Tests complete ==="
 
 # ============================================================================
 # Install
@@ -105,12 +105,12 @@ PREFIX ?= /usr/local
 
 .PHONY: install
 install: $(TARGET) $(RUNTIME_LIB)
-        install -d $(DESTDIR)$(PREFIX)/bin
-        install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/tetherc
-        install -d $(DESTDIR)$(PREFIX)/lib
-        install -m 644 $(RUNTIME_LIB) $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
-        install -d $(DESTDIR)$(PREFIX)/include/tether
-        install -m 644 $(RUNTIMEDIR)/tether_runtime.h $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/tetherc
+	install -d $(DESTDIR)$(PREFIX)/lib
+	install -m 644 $(RUNTIME_LIB) $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
+	install -d $(DESTDIR)$(PREFIX)/include/tether
+	install -m 644 $(RUNTIMEDIR)/tether_runtime.h $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
 
 # ============================================================================
 # Uninstall
@@ -118,9 +118,9 @@ install: $(TARGET) $(RUNTIME_LIB)
 
 .PHONY: uninstall
 uninstall:
-        rm -f $(DESTDIR)$(PREFIX)/bin/tetherc
-        rm -f $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
-        rm -f $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
+	rm -f $(DESTDIR)$(PREFIX)/bin/tetherc
+	rm -f $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
+	rm -f $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
 
 # ============================================================================
 # Help
@@ -128,19 +128,19 @@ uninstall:
 
 .PHONY: help
 help:
-        @echo "Tether Compiler Build System"
-        @echo ""
-        @echo "Targets:"
-        @echo "  all       - Build the compiler and runtime (default)"
-        @echo "  clean     - Remove build artifacts"
-        @echo "  test      - Build and run tests"
-        @echo "  install   - Install to PREFIX (default: /usr/local)"
-        @echo "  uninstall - Remove installed files"
-        @echo "  help      - Show this message"
-        @echo ""
-        @echo "Variables:"
-        @echo "  CXX       - C++ compiler (default: g++)"
-        @echo "  CC        - C compiler (default: gcc)"
-        @echo "  CXXFLAGS  - C++ compiler flags"
-        @echo "  CFLAGS    - C compiler flags"
-        @echo "  PREFIX    - Install prefix (default: /usr/local)"
+	@echo "Tether Compiler Build System"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all       - Build the compiler and runtime (default)"
+	@echo "  clean     - Remove build artifacts"
+	@echo "  test      - Build and run tests"
+	@echo "  install   - Install to PREFIX (default: /usr/local)"
+	@echo "  uninstall - Remove installed files"
+	@echo "  help      - Show this message"
+	@echo ""
+	@echo "Variables:"
+	@echo "  CXX       - C++ compiler (default: g++)"
+	@echo "  CC        - C compiler (default: gcc)"
+	@echo "  CXXFLAGS  - C++ compiler flags"
+	@echo "  CFLAGS    - C compiler flags"
+	@echo "  PREFIX    - Install prefix (default: /usr/local)"

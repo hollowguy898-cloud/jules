@@ -1,0 +1,210 @@
+// ============================================================================
+// Tether Comprehensive Feature Test
+// Tests every keyword, construct, and feature in the Tether language
+// ============================================================================
+
+// --- struct declarations ---
+struct Point {
+    x: f64,
+    y: f64
+}
+
+soa struct Particle {
+    px: f64,
+    py: f64,
+    pz: f64
+}
+
+align(64) struct CacheAligned {
+    data: u64
+}
+
+// --- enum declarations ---
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+enum Status {
+    Ok,
+    Error,
+    Timeout
+}
+
+// --- plain functions ---
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+fn multiply(x: f64, y: f64) f64 {
+    return x * y;
+}
+
+// --- error-returning functions ---
+fn may_fail(input: i32) !i32 {
+    if (input < 0) {
+        return 0;
+    }
+    return input * 2;
+}
+
+// --- defer ---
+fn resource_example() i32 {
+    var result: i32 = 0;
+    defer result = 0;
+    result = 42;
+    return result;
+}
+
+// --- errdefer ---
+fn error_cleanup(x: i32) !i32 {
+    var temp: i32 = x;
+    errdefer temp = 0;
+    if (x < 0) {
+        return 0;
+    }
+    return temp + 1;
+}
+
+// --- while loop with increment ---
+fn sum_to_n(n: u64) u64 {
+    var total: u64 = 0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        total = total + i;
+    }
+    return total;
+}
+
+// --- struct field access ---
+fn point_sum(p: Point) f64 {
+    return p.x + p.y;
+}
+
+// --- atomic operations ---
+fn atomic_counter() i32 {
+    var counter: i32 = 0;
+    atomic(release) counter += 1;
+    atomic(release) counter += 1;
+    atomic(release) counter += 1;
+    return counter;
+}
+
+// --- yield (cooperative) ---
+fn cooperative_loop(n: u64) void {
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        if (i % 100 == 0) {
+            yield;
+        }
+    }
+}
+
+// --- try expression ---
+fn try_example(x: i32) i32 {
+    val result: i32 = try may_fail(x);
+    return result;
+}
+
+// --- @simd directive ---
+@simd
+fn vector_sum(n: u64) f64 {
+    var total: f64 = 0.0;
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        total = total + 1.0;
+    }
+    return total;
+}
+
+// --- compound assignment operators ---
+fn compound_ops() i32 {
+    var x: i32 = 10;
+    x += 5;
+    x -= 3;
+    x *= 2;
+    x /= 2;
+    x %= 3;
+    return x;
+}
+
+// --- bitwise operations ---
+fn bitwise_ops() i32 {
+    var a: i32 = 255;
+    var b: i32 = 15;
+    var c: i32 = a & b;
+    var d: i32 = a | b;
+    var e: i32 = a ^ b;
+    return c + d + e;
+}
+
+// --- boolean logic ---
+fn logic_example(a: bool, b: bool) bool {
+    return a && b || !a;
+}
+
+// --- fibonacci ---
+fn fibonacci(n: u64) u64 {
+    if (n <= 1) {
+        return n;
+    }
+    var a: u64 = 0;
+    var b: u64 = 1;
+    var i: u64 = 2;
+    while (i <= n) : (i += 1) {
+        var temp: u64 = a + b;
+        a = b;
+        b = temp;
+    }
+    return b;
+}
+
+// --- select (branchless) ---
+fn select_example(cond: bool, a: i32, b: i32) i32 {
+    return select(cond, a, b);
+}
+
+// --- main: exercise all features ---
+fn main() i32 {
+    // Basic arithmetic
+    val a: i32 = add(10, 20);
+    val b: f64 = multiply(3.14, 2.0);
+
+    // Error handling
+    val c: i32 = try may_fail(5);
+    val d: i32 = try_example(10);
+
+    // Loops
+    val sum: u64 = sum_to_n(100);
+    val fib: u64 = fibonacci(20);
+
+    // Structs (struct initialization via designated init)
+    val p: Point = Point { .x = 1.0, .y = 2.0 };
+    val psum: f64 = point_sum(p);
+
+    // Atomic
+    val atomic_val: i32 = atomic_counter();
+
+    // Compound/bitwise
+    val comp: i32 = compound_ops();
+    val bits: i32 = bitwise_ops();
+
+    // Logic
+    val logic_val: bool = logic_example(true, false);
+
+    // @simd
+    val vsum: f64 = vector_sum(100);
+
+    // Resource cleanup
+    val res: i32 = resource_example();
+
+    // Defer with assignment
+    var def_val: i32 = 0;
+    defer def_val = 0;
+
+    // Select
+    val sel: i32 = select_example(true, 42, 99);
+
+    return 0;
+}

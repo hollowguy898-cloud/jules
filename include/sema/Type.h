@@ -432,6 +432,7 @@ public:
     TypeId pointee() const { return pointee_; }
 
     std::string toString() const override {
+        if (pointee_.isNull()) return "*<unresolved>";
         return "*" + pointee_->toString();
     }
 
@@ -459,6 +460,7 @@ public:
     TypeId referent() const { return referent_; }
 
     std::string toString() const override {
+        if (referent_.isNull()) return "&<unresolved>";
         return "&" + referent_->toString();
     }
 
@@ -486,6 +488,7 @@ public:
     TypeId referent() const { return referent_; }
 
     std::string toString() const override {
+        if (referent_.isNull()) return "&mut <unresolved>";
         return "&mut " + referent_->toString();
     }
 
@@ -513,6 +516,7 @@ public:
     TypeId element() const { return element_; }
 
     std::string toString() const override {
+        if (element_.isNull()) return "[]<unresolved>";
         return "[]" + element_->toString();
     }
 
@@ -609,6 +613,7 @@ public:
     }
 
     std::string toString() const override {
+        if (pointee_.isNull()) return kindToString() + "<unresolved>";
         return kindToString() + "<" + pointee_->toString() + ">";
     }
 
@@ -661,6 +666,7 @@ public:
     TypeId successType() const { return success_type_; }
 
     std::string toString() const override {
+        if (success_type_.isNull()) return "!<unresolved>";
         return "!" + success_type_->toString();
     }
 
@@ -745,20 +751,21 @@ public:
     uint32_t alignment() const { return alignment_; }
 
     std::string toString() const override {
+        if (inner_.isNull()) return "align(" + std::to_string(alignment_) + "):<unresolved>";
         return "align(" + std::to_string(alignment_) + "):" + inner_->toString();
     }
 
-    uint64_t bitWidth() const override { return inner_->bitWidth(); }
-    bool isPointerLike() const override { return inner_->isPointerLike(); }
+    uint64_t bitWidth() const override { return inner_.isNull() ? 0 : inner_->bitWidth(); }
+    bool isPointerLike() const override { return inner_.isNull() ? false : inner_->isPointerLike(); }
 
-    bool isInteger() const override { return inner_->isInteger(); }
-    bool isFloat() const override { return inner_->isFloat(); }
-    bool isNumeric() const override { return inner_->isNumeric(); }
-    bool isSigned() const override { return inner_->isSigned(); }
-    bool isUnsigned() const override { return inner_->isUnsigned(); }
-    bool isBool() const override { return inner_->isBool(); }
-    bool isVoid() const override { return inner_->isVoid(); }
-    bool isError() const override { return inner_->isError(); }
+    bool isInteger() const override { return inner_.isNull() ? false : inner_->isInteger(); }
+    bool isFloat() const override { return inner_.isNull() ? false : inner_->isFloat(); }
+    bool isNumeric() const override { return inner_.isNull() ? false : inner_->isNumeric(); }
+    bool isSigned() const override { return inner_.isNull() ? false : inner_->isSigned(); }
+    bool isUnsigned() const override { return inner_.isNull() ? false : inner_->isUnsigned(); }
+    bool isBool() const override { return inner_.isNull() ? false : inner_->isBool(); }
+    bool isVoid() const override { return inner_.isNull() ? false : inner_->isVoid(); }
+    bool isError() const override { return inner_.isNull() ? false : inner_->isError(); }
     bool isPoison() const override { return inner_->isPoison(); }
 
 private:
@@ -930,7 +937,7 @@ public:
     // Intern a pointer type
     // -----------------------------------------------------------------------
     TypeId getPointer(TypeId pointee) {
-        std::string key = "*" + pointee->toString();
+        std::string key = pointee.isNull() ? "*<unresolved>" : "*" + pointee->toString();
 
         auto it = type_map_.find(key);
         if (it != type_map_.end()) {
@@ -947,7 +954,7 @@ public:
     // Intern a shared reference type (&T)
     // -----------------------------------------------------------------------
     TypeId getReference(TypeId referent) {
-        std::string key = "&" + referent->toString();
+        std::string key = referent.isNull() ? "&<unresolved>" : "&" + referent->toString();
 
         auto it = type_map_.find(key);
         if (it != type_map_.end()) {
@@ -964,7 +971,7 @@ public:
     // Intern a mutable reference type (&mut T)
     // -----------------------------------------------------------------------
     TypeId getMutReference(TypeId referent) {
-        std::string key = "&mut " + referent->toString();
+        std::string key = referent.isNull() ? "&mut <unresolved>" : "&mut " + referent->toString();
 
         auto it = type_map_.find(key);
         if (it != type_map_.end()) {
@@ -981,7 +988,7 @@ public:
     // Intern a slice type ([]T)
     // -----------------------------------------------------------------------
     TypeId getSlice(TypeId element) {
-        std::string key = "[]" + element->toString();
+        std::string key = element.isNull() ? "[]<unresolved>" : "[]" + element->toString();
 
         auto it = type_map_.find(key);
         if (it != type_map_.end()) {
@@ -1047,7 +1054,7 @@ public:
 
     // Intern an aligned type
     TypeId getAligned(TypeId inner, uint32_t alignment) {
-        std::string key = "align(" + std::to_string(alignment) + "):" + inner->toString();
+        std::string key = inner.isNull() ? "align(" + std::to_string(alignment) + "):<unresolved>" : "align(" + std::to_string(alignment) + "):" + inner->toString();
         auto it = type_map_.find(key);
         if (it != type_map_.end()) {
             return TypeId(it->second.get());
@@ -1062,7 +1069,7 @@ public:
     // Intern an error type
     // -----------------------------------------------------------------------
     TypeId getError(TypeId success_type) {
-        std::string key = "!" + success_type->toString();
+        std::string key = success_type.isNull() ? "!<unresolved>" : "!" + success_type->toString();
 
         auto it = type_map_.find(key);
         if (it != type_map_.end()) {

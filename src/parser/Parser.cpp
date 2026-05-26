@@ -99,6 +99,10 @@ Token Parser::consume(TokenKind kind, const std::string& message) {
         return advance();
     }
     error(message);
+    // Error recovery: advance past the unexpected token to prevent infinite loops
+    if (!isAtEnd()) {
+        return advance();
+    }
     return peek();
 }
 
@@ -202,6 +206,10 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
         return parseFnDecl(std::move(directives));
     }
     if (check(TokenKind::KW_STRUCT) || check(TokenKind::KW_SOA)) {
+        return parseStructDecl();
+    }
+    // Handle align(N) struct at top level
+    if (check(TokenKind::KW_ALIGN) && peekNext().kind() == TokenKind::LPAREN) {
         return parseStructDecl();
     }
     if (check(TokenKind::KW_ENUM)) {
@@ -309,12 +317,22 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
 
 std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     SourceLocation struct_loc = loc();
+
+    // Handle alignment specifier BEFORE struct keyword: align(N) struct Name
+    // Also handles: align(N) soa struct Name
+    uint32_t alignment = 0;
+    if (match(TokenKind::KW_ALIGN)) {
+        consume(TokenKind::LPAREN, "expected '(' after 'align'");
+        Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
+        alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
+        consume(TokenKind::RPAREN, "expected ')' after alignment value");
+    }
+
     bool is_soa = match(TokenKind::KW_SOA);
     consume(TokenKind::KW_STRUCT, "expected 'struct'");
 
-    // Check for alignment specifier: align(N)
-    uint32_t alignment = 0;
-    if (match(TokenKind::KW_ALIGN)) {
+    // Check for alignment specifier AFTER struct keyword: struct align(N) Name
+    if (alignment == 0 && match(TokenKind::KW_ALIGN)) {
         consume(TokenKind::LPAREN, "expected '(' after 'align'");
         Token align_tok = consume(TokenKind::INT_LITERAL, "expected alignment value");
         alignment = static_cast<uint32_t>(std::stoull(align_tok.text()));
@@ -329,7 +347,14 @@ std::unique_ptr<StructDecl> Parser::parseStructDecl() {
     std::vector<StructFieldDecl> fields;
     while (!check(TokenKind::RBRACE) && !isAtEnd()) {
         SourceLocation field_loc = loc();
-        Token field_name = consume(TokenKind::IDENTIFIER, "expected field name");
+        // Accept keywords as field names (e.g., 'val', 'type', 'align')
+        Token field_name;
+        if (peek().isKeyword() || check(TokenKind::IDENTIFIER)) {
+            field_name = advance();
+        } else {
+            error("expected field name");
+            break;
+        }
         consume(TokenKind::COLON, "expected ':' after field name");
         TypeId field_type = parseType();
 
@@ -466,13 +491,45 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
             SourceLocation unsafe_loc = loc();
             advance(); // consume 'unsafe'
             if (check(TokenKind::LPAREN)) {
-                // unsafe(expr) at statement level
+                // unsafe(stmt) at statement level — supports assignment expressions
+                // like unsafe(*ptr = 42) or unsafe(x += 1)
                 advance(); // consume (
-                auto inner = parseExpr();
+                auto lhs = parseExpr();
+                if (match(TokenKind::EQ)) {
+                    // Simple assignment inside unsafe()
+                    auto rhs = parseExpr();
+                    consume(TokenKind::RPAREN, "expected ')' after unsafe assignment");
+                    match(TokenKind::SEMI);
+                    // Wrap assignment in UnsafeExpr via a block
+                    std::vector<std::unique_ptr<Stmt>> stmts;
+                    stmts.push_back(std::make_unique<AssignStmt>(
+                        SourceLocation(unsafe_loc), std::move(lhs), std::move(rhs)));
+                    auto block = std::make_unique<BlockStmt>(
+                        SourceLocation(unsafe_loc), std::move(stmts));
+                    unsafe_blocks_.insert(block.get());
+                    return block;
+                }
+                if (peek().isCompoundAssignment()) {
+                    Token op_tok = advance();
+                    auto rhs = parseExpr();
+                    consume(TokenKind::RPAREN, "expected ')' after unsafe compound assignment");
+                    match(TokenKind::SEMI);
+                    BinaryOp op = tokenToCompoundAssignOp(op_tok.kind());
+                    auto bin_expr = std::make_unique<BinaryExpr>(
+                        locFrom(op_tok), op, std::move(lhs), std::move(rhs));
+                    std::vector<std::unique_ptr<Stmt>> stmts;
+                    stmts.push_back(std::make_unique<ExprStmt>(
+                        SourceLocation(unsafe_loc), std::move(bin_expr)));
+                    auto block = std::make_unique<BlockStmt>(
+                        SourceLocation(unsafe_loc), std::move(stmts));
+                    unsafe_blocks_.insert(block.get());
+                    return block;
+                }
+                // Plain expression inside unsafe()
                 consume(TokenKind::RPAREN, "expected ')' after unsafe expression");
                 match(TokenKind::SEMI);
                 auto unsafe_expr = std::make_unique<UnsafeExpr>(
-                    std::move(unsafe_loc), std::move(inner));
+                    std::move(unsafe_loc), std::move(lhs));
                 return std::make_unique<ExprStmt>(
                     SourceLocation(unsafe_loc), std::move(unsafe_expr));
             }
@@ -757,7 +814,7 @@ std::unique_ptr<Stmt> Parser::parseAtomicStmt() {
         else if (ordering_text == "acquire") ordering = AtomicStmt::Ordering::Acquire;
         else if (ordering_text == "release") ordering = AtomicStmt::Ordering::Release;
         else if (ordering_text == "acqrel") ordering = AtomicStmt::Ordering::AcqRel;
-        else if (ordering_text == "seqcst") ordering = AtomicStmt::Ordering::SeqCst;
+        else if (ordering_text == "seqcst" || ordering_text == "seq_cst") ordering = AtomicStmt::Ordering::SeqCst;
         else errorAt(ordering_tok, "unknown atomic ordering '" + ordering_text + "'");
         consume(TokenKind::RPAREN, "expected ')' after atomic ordering");
     }
