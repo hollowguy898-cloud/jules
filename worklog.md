@@ -30,3 +30,31 @@ Stage Summary:
 - File extension updated from .jl to .tth throughout
 - ECS benchmark created with Rust comparison
 - Compiler builds and runs successfully with -O0, -O1, -O2, -O3
+---
+Task ID: SSA-codegen
+Agent: main
+Task: Implement SSA codegen — eliminate alloca/load/store for scalar variables (CRITICAL #1)
+
+Work Log:
+- Analyzed IRGenerator.h/cpp: confirmed all variables use alloca+store+load pattern
+- Designed hybrid SSA approach: scalars use SSA values, aggregates/loop-vars use alloca
+- Added SSAVarInfo struct with current_value, llvm_type, needs_alloca, alloca_name
+- Updated parameter emission: scalar params use SSA directly (no alloca+store)
+- Updated VarDecl/ValDecl: scalars track value directly, aggregates use alloca
+- Updated AssignStmt: SSA vars update tracked value (no store instruction)
+- Updated compound assignment: compute directly from current SSA value
+- Updated IdentExpr: SSA vars return current_value (no load instruction)
+- Implemented phi node emission at if/else merge points via snapshots
+- Implemented loop variable demotion: collectAssignedVars + demoteSSAToAlloca
+- Added emitBlockLabel() for current_block_label_ tracking
+- Added on-demand SSA→alloca materialization in emitLValue for address-of
+- Built and tested: all 14 examples pass, all crash tests pass (pre-existing failures unchanged)
+- Verified IR quality: pure functions have ZERO allocas, scalars flow directly
+
+Stage Summary:
+- Commit 0233f03: feat: SSA codegen — eliminate alloca/load/store for scalar variables
+- +527/-71 lines across IRGenerator.h and IRGenerator.cpp
+- Pure functions like add(x,y) now generate: `add i32 %x, %y` directly
+- If/else generates proper phi nodes at merge points
+- Loop-modified variables are demoted to alloca for correct mem2reg phi insertion
+- All 5 CRITICAL optimizations now implemented (#1-#5)
