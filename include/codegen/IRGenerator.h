@@ -3,6 +3,7 @@
 #include "ast/AST.h"
 #include "sema/Type.h"
 #include "opt/PreLLVMPipeline.h"
+#include "metadata/MetaTypes.h"
 
 #include <string>
 #include <vector>
@@ -57,7 +58,8 @@ public:
     // -----------------------------------------------------------------------
     IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
                 TypeTable& type_table,
-                ASTAnnotationMap* annotations = nullptr);
+                ASTAnnotationMap* annotations = nullptr,
+                MetadataMap* meta_map = nullptr);
 
     // -----------------------------------------------------------------------
     // Main entry point – returns the full LLVM IR module as a string
@@ -92,6 +94,12 @@ private:
     void emitRuntimeDecls();
     void emitStringConstants();
     void emitMetadata();
+
+    // Emit TBAA type descriptors and alias scopes from the metadata engine
+    void emitMetaMapTBAA();
+
+    // Pre-register TBAA metadata IDs (called before code emission)
+    void preRegisterTBAAMetadata();
 
     // =======================================================================
     // Top-level emission
@@ -161,6 +169,7 @@ private:
     const std::vector<std::unique_ptr<TopLevel>>& program_;
     TypeTable& type_table_;
     ASTAnnotationMap* annotations_;  // May be nullptr if no pre-LLVM opts ran
+    MetadataMap* meta_map_;          // May be nullptr if metadata engine not run
 
     // =======================================================================
     // Output streams
@@ -618,6 +627,13 @@ public:
     // Get the branch weight metadata ID for cold/hot branch hints.
     // Creates metadata entries like: !{!"branch_weights", i32 1, i32 1000}
     int getBranchWeightMetadataId(uint32_t cold_weight, uint32_t hot_weight);
+
+    // Metadata engine helpers: emit TBAA metadata on struct field loads
+    std::string emitTBAAMetadataForField(const std::string& struct_name,
+                                          const std::string& field_name);
+
+    // Metadata engine helpers: emit !range metadata on enum loads
+    std::string emitRangeMetadataForEnum(TypeId type);
 };
 
 } // namespace tether

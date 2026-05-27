@@ -17,10 +17,12 @@ namespace tether {
 // ============================================================================
 IRGenerator::IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
                          TypeTable& type_table,
-                         ASTAnnotationMap* annotations)
+                         ASTAnnotationMap* annotations,
+                         MetadataMap* meta_map)
     : program_(program)
     , type_table_(type_table)
     , annotations_(annotations)
+    , meta_map_(meta_map)
 {}
 
 // ============================================================================
@@ -552,6 +554,65 @@ void IRGenerator::emitStringConstants() {
 }
 
 // ============================================================================
+// emitTBAAMetadataForField — emit !tbaa metadata on struct field loads/stores
+//
+// Queries the MetadataMap for TBAA type info for the given struct name and
+// field name. Returns a string like ", !tbaa !5" to append to a load/store,
+// or empty string if no TBAA info is available.
+// ============================================================================
+std::string IRGenerator::emitTBAAMetadataForField(const std::string& struct_name,
+                                                    const std::string& field_name) {
+    if (!meta_map_) return "";
+
+    // Look up the struct in the metadata map
+    auto* smeta = meta_map_->getStructMeta(struct_name);
+    if (!smeta) return "";
+
+    // Find the TBAA metadata ID for this struct+field combination
+    // The key format is "field.STRUCT_NAME.FIELD_NAME" (as created by L5)
+    std::string key = "field." + struct_name + "." + field_name;
+    auto it = metadata_map_.find(key);
+    if (it != metadata_map_.end()) {
+        return ", !tbaa !" + std::to_string(it->second);
+    }
+
+    // Fall back to struct-level TBAA
+    std::string struct_key = "struct." + struct_name;
+    it = metadata_map_.find(struct_key);
+    if (it != metadata_map_.end()) {
+        return ", !tbaa !" + std::to_string(it->second);
+    }
+
+    return "";
+}
+
+// ============================================================================
+// emitRangeMetadataForEnum — emit !range metadata on enum loads
+// ============================================================================
+std::string IRGenerator::emitRangeMetadataForEnum(TypeId type) {
+    if (!meta_map_ || !type) return "";
+    // Only emit range metadata for enum types
+    if (!isa<EnumType>(type)) return "";
+
+    auto& en = cast<EnumType>(type);
+    uint32_t count = static_cast<uint32_t>(en.variants().size());
+    if (count == 0) return "";
+
+    // Create range metadata: !{i32 0, i32 COUNT}
+    std::string key = "range.enum." + std::to_string(count);
+    auto it = metadata_map_.find(key);
+    if (it != metadata_map_.end()) {
+        return ", !range !" + std::to_string(it->second);
+    }
+
+    int range_id = metadata_counter_++;
+    metadata_entries_.push_back({range_id,
+        "!{i32 0, i32 " + std::to_string(count) + "}"});
+    metadata_map_[key] = range_id;
+    return ", !range !" + std::to_string(range_id);
+}
+
+// ============================================================================
 // emitMetadata
 // ============================================================================
 void IRGenerator::emitMetadata() {
@@ -559,6 +620,90 @@ void IRGenerator::emitMetadata() {
     for (const auto& e : metadata_entries_) {
         module_out_ << "!" << e.id << " = " << e.content << "\n";
     }
+    module_out_ << "\n";
+}
+
+// ============================================================================
+// preRegisterTBAAMetadata — allocate TBAA metadata IDs before code emission
+//
+// This must be called before any code emission so that
+// emitTBAAMetadataForField() can find the IDs in metadata_map_.
+// The actual metadata text is emitted by emitMetaMapTBAA() at the end.
+// ============================================================================
+void IRGenerator::preRegisterTBAAMetadata() {
+    if (!meta_map_) return;
+
+    // Allocate root TBAA node ID
+    int root_id = metadata_counter_++;
+    metadata_map_["__tbaa_root"] = root_id;
+
+    // Allocate alias scope domain and scope IDs
+    int domain_id = metadata_counter_++;
+    metadata_map_["__tbaa_domain"] = domain_id;
+    int scope_id = metadata_counter_++;
+    metadata_map_["__tbaa_scope"] = scope_id;
+
+    // For each struct, allocate struct-level and per-field TBAA IDs
+    for (const auto& [name, sm] : meta_map_->structs()) {
+        int struct_id = metadata_counter_++;
+        metadata_map_["struct." + name] = struct_id;
+
+        for (size_t i = 0; i < sm.field_names.size(); ++i) {
+            int field_id = metadata_counter_++;
+            metadata_map_["field." + name + "." + sm.field_names[i]] = field_id;
+        }
+    }
+}
+
+// ============================================================================
+// emitMetaMapTBAA — emit TBAA type descriptors from the metadata engine
+//
+// Emits the metadata text for IDs that were pre-allocated by
+// preRegisterTBAAMetadata(). This is called at the end of generate()
+// after all code has been emitted.
+// ============================================================================
+void IRGenerator::emitMetaMapTBAA() {
+    if (!meta_map_) return;
+
+    // Emit root TBAA node
+    auto root_it = metadata_map_.find("__tbaa_root");
+    if (root_it == metadata_map_.end()) return;
+
+    int root_id = root_it->second;
+    module_out_ << "!" << root_id << " = !{!\"Tether TBAA\"}\n";
+
+    // Emit alias scope domain and scope
+    auto domain_it = metadata_map_.find("__tbaa_domain");
+    auto scope_it = metadata_map_.find("__tbaa_scope");
+    if (domain_it != metadata_map_.end()) {
+        module_out_ << "!" << domain_it->second << " = !{!\"tether-alias-domain\"}\n";
+    }
+    if (scope_it != metadata_map_.end() && domain_it != metadata_map_.end()) {
+        module_out_ << "!" << scope_it->second << " = !{!\"tether-noalias-scope\", !"
+                     << domain_it->second << "}\n";
+    }
+
+    // For each struct, emit struct-level and per-field TBAA nodes
+    for (const auto& [name, sm] : meta_map_->structs()) {
+        auto struct_it = metadata_map_.find("struct." + name);
+        if (struct_it == metadata_map_.end()) continue;
+
+        int struct_id = struct_it->second;
+        module_out_ << "!" << struct_id << " = !{!\"struct." << name
+                     << "\", !" << root_id << ", 0}\n";
+
+        uint64_t offset = 0;
+        for (size_t i = 0; i < sm.field_names.size(); ++i) {
+            auto field_it = metadata_map_.find("field." + name + "." + sm.field_names[i]);
+            if (field_it == metadata_map_.end()) continue;
+
+            module_out_ << "!" << field_it->second << " = !{!\"field."
+                         << sm.field_names[i] << "\", !" << struct_id
+                         << ", " << offset << "}\n";
+            offset += 8;
+        }
+    }
+
     module_out_ << "\n";
 }
 
@@ -587,6 +732,14 @@ std::string IRGenerator::generate() {
         }
     }
 
+    // 1.5 Pre-register TBAA metadata IDs from the metadata engine.
+    // This must happen BEFORE code emission so that emitTBAAMetadataForField()
+    // can find the IDs in metadata_map_. The actual metadata text is emitted
+    // at the end via emitMetaMapTBAA().
+    if (meta_map_) {
+        preRegisterTBAAMetadata();
+    }
+
     // 2. Emit module header
     emitModuleHeader();
 
@@ -604,8 +757,15 @@ std::string IRGenerator::generate() {
         emitTopLevel(tl.get());
     }
 
-    // 7. Emit metadata
+    // 7. Emit metadata (IRGenerator's own + metadata engine's L5 block)
     emitMetadata();
+
+    // 8. Emit TBAA type descriptors and alias scopes from the metadata engine
+    // These provide the type-based alias analysis info that LLVM uses to
+    // prove that different struct field accesses don't alias.
+    if (meta_map_) {
+        emitMetaMapTBAA();
+    }
 
     return module_out_.str();
 }
@@ -862,6 +1022,15 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
 
     // Inlining attribute (alwaysinline / inlinehint)
     sig += inlining_attr;
+
+    // --- Metadata engine: hot/cold function attributes from L5 ---
+    if (meta_map_) {
+        auto* nm = meta_map_->get(fn);
+        if (nm) {
+            if (nm->llvm_meta.hot_path) sig += " hot";
+            if (nm->llvm_meta.cold_path) sig += " cold";
+        }
+    }
 
     // --- Pre-LLVM optimization: opaque barrier function attributes ---
     // If the function takes or returns opaque types, add the
@@ -1238,6 +1407,21 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 cold_meta = emitColdPathMetadata(is.condition());
             }
 
+            // --- Metadata engine: branch probability from L1/L5 ---
+            // If the MetadataMap has branch probability info for this IfStmt,
+            // emit !prof metadata. This supplements the cold_meta from the
+            // pre-LLVM pipeline and takes priority when both exist.
+            if (meta_map_ && cold_meta.empty()) {
+                auto* nm = meta_map_->get(&is);
+                if (nm && nm->branch_prob != BranchProbability::Unknown) {
+                    int prof_id = getBranchWeightMetadataId(
+                        nm->branch_prob == BranchProbability::Likely ? 80 : 20,
+                        nm->branch_prob == BranchProbability::Likely ? 20 : 80
+                    );
+                    cold_meta = ", !prof !" + std::to_string(prof_id);
+                }
+            }
+
             // Snapshot SSA values before branching (for phi node emission)
             SSASnapshot pre_branch_snap = takeSnapshot();
             // Remember the label of the block that contains the branch instruction
@@ -1338,10 +1522,110 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             emitBlockStmt(ws.body());
             if (!isTerminated()) {
                 if (ws.hasIncrement()) emitExpr(ws.increment());
-                // @simd loop vectorization metadata
+
+                // Collect loop metadata from all sources:
+                // 1. @simd directive (existing)
+                // 2. Metadata engine L3/L5 (vectorizable, prefetch, unroll)
+                bool has_any_loop_md = current_fn_has_simd_;
+                int simd_md_id = 0;
+
                 if (current_fn_has_simd_) {
-                    int loop_md_id = emitSimdLoopMetadata();
-                    body_ss_ << "  br label %" << cond_l << ", !llvm.loop !" << loop_md_id << "\n";
+                    simd_md_id = emitSimdLoopMetadata();
+                }
+
+                // Check MetadataMap for L3/L5 loop metadata
+                int meta_loop_md_id = 0;
+                if (meta_map_) {
+                    auto* nm = meta_map_->get(&ws);
+                    if (nm) {
+                        bool needs_meta_md = false;
+                        // L3: vectorization-safe from access pattern analysis
+                        if (nm->llvm_meta.vectorization_safe && !current_fn_has_simd_) {
+                            needs_meta_md = true;
+                        }
+                        // L3: access pattern says vectorizable
+                        if (!nm->access_patterns.empty()) {
+                            for (const auto& ap : nm->access_patterns) {
+                                if (ap.vectorizable && !current_fn_has_simd_) {
+                                    needs_meta_md = true;
+                                    break;
+                                }
+                            }
+                        }
+                        // L3: prefetch distance hint
+                        if (nm->llvm_meta.prefetch_distance > 0) {
+                            needs_meta_md = true;
+                        }
+                        // L6: profile-guided unroll count
+                        if (nm->profile.has_profile && nm->profile.loop_iteration_count >= 2) {
+                            needs_meta_md = true;
+                        }
+
+                        if (needs_meta_md) {
+                            // Build combined loop metadata entries
+                            std::vector<int> entry_ids;
+                            if (nm->llvm_meta.vectorization_safe || !nm->access_patterns.empty()) {
+                                bool any_vec = nm->llvm_meta.vectorization_safe;
+                                if (!any_vec) {
+                                    for (const auto& ap : nm->access_patterns) {
+                                        if (ap.vectorizable) { any_vec = true; break; }
+                                    }
+                                }
+                                if (any_vec && !current_fn_has_simd_) {
+                                    int vec_id = metadata_counter_++;
+                                    metadata_entries_.push_back({vec_id,
+                                        "!{!\"llvm.loop.vectorize.enable\", i1 true}"});
+                                    entry_ids.push_back(vec_id);
+                                }
+                            }
+                            if (nm->llvm_meta.prefetch_distance > 0) {
+                                int pf_id = metadata_counter_++;
+                                metadata_entries_.push_back({pf_id,
+                                    "!{!\"tether.prefetch_distance\", i32 " +
+                                    std::to_string(static_cast<int32_t>(nm->llvm_meta.prefetch_distance)) + "}"});
+                                entry_ids.push_back(pf_id);
+                            }
+                            if (nm->profile.has_profile && nm->profile.loop_iteration_count >= 2) {
+                                uint64_t unroll = nm->profile.loop_iteration_count;
+                                if (unroll > 8) unroll = 8;
+                                int unroll_id = metadata_counter_++;
+                                metadata_entries_.push_back({unroll_id,
+                                    "!{!\"llvm.loop.unroll.count\", i32 " +
+                                    std::to_string(unroll) + "}"});
+                                entry_ids.push_back(unroll_id);
+                            }
+                            if (!entry_ids.empty()) {
+                                meta_loop_md_id = metadata_counter_++;
+                                std::string combined = "distinct !{";
+                                for (size_t i = 0; i < entry_ids.size(); ++i) {
+                                    if (i > 0) combined += ", ";
+                                    combined += "!" + std::to_string(entry_ids[i]);
+                                }
+                                combined += "}";
+                                metadata_entries_.push_back({meta_loop_md_id, combined});
+                                has_any_loop_md = true;
+                            }
+                        }
+                    }
+                }
+
+                if (has_any_loop_md) {
+                    // If we have both @simd and metadata engine hints,
+                    // combine them into a single loop metadata node
+                    if (simd_md_id && meta_loop_md_id) {
+                        int combined_id = metadata_counter_++;
+                        metadata_entries_.push_back({combined_id,
+                            "distinct !{!" + std::to_string(simd_md_id) +
+                            ", !" + std::to_string(meta_loop_md_id) + "}"});
+                        body_ss_ << "  br label %" << cond_l
+                                 << ", !llvm.loop !" << combined_id << "\n";
+                    } else if (simd_md_id) {
+                        body_ss_ << "  br label %" << cond_l
+                                 << ", !llvm.loop !" << simd_md_id << "\n";
+                    } else {
+                        body_ss_ << "  br label %" << cond_l
+                                 << ", !llvm.loop !" << meta_loop_md_id << "\n";
+                    }
                 } else {
                     body_ss_ << "  br label %" << cond_l << "\n";
                 }
@@ -2012,7 +2296,8 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                     TypeId ft = st.fields()[idx].type;
                     if (isAggregateType(ft)) return gep;
                     std::string loaded = nextReg();
-                    body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << "\n";
+                    std::string tbaa = emitTBAAMetadataForField(st.name(), mem.field());
+                    body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << tbaa << "\n";
                     return loaded;
                 }
             }
@@ -2054,7 +2339,8 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             TypeId ft = st.fields()[idx].type;
             if (isAggregateType(ft)) return gep;
             std::string loaded = nextReg();
-            body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << "\n";
+            std::string tbaa = emitTBAAMetadataForField(st.name(), mem.field());
+            body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << tbaa << "\n";
             return loaded;
         }
 
@@ -2078,7 +2364,8 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 TypeId ft = st.fields()[idx].type;
                 if (isAggregateType(ft)) return gep;
                 std::string loaded = nextReg();
-                body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << "\n";
+                std::string tbaa = emitTBAAMetadataForField(st.name(), mem.field());
+                body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << tbaa << "\n";
                 return loaded;
             }
 

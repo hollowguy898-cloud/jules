@@ -399,7 +399,8 @@ bool Driver::runIRGeneration() {
         std::cerr << "[tether] Phase 7: IR generation..." << std::endl;
     }
 
-    IRGenerator generator(program_, type_table_, &prellvm_annotations_);
+    IRGenerator generator(program_, type_table_, &prellvm_annotations_,
+                           &metadata_engine_.metadata());
     ir_text_ = generator.generate();
 
     if (ir_text_.empty()) {
