@@ -57,6 +57,7 @@ bool Driver::compile() {
     runLexer();
     runParser();
     runSemanticAnalysis();
+    runMetadataEngine();
     runPreLLVMOptimizations();
     runCFGBuilding();
     runBorrowChecking();
@@ -246,6 +247,37 @@ bool Driver::runSemanticAnalysis() {
     }
 
     return true;  // Always continue for error-resilient compilation
+}
+
+// ============================================================================
+// Phase 4.5: Metadata Engine (6-layer post-Moore optimization pipeline)
+// ============================================================================
+bool Driver::runMetadataEngine() {
+    if (verbose_) {
+        std::cerr << "[tether] Phase 4.5: Metadata engine..." << std::endl;
+    }
+
+    // Load profile data if specified
+    if (!profile_use_.empty()) {
+        if (!metadata_engine_.loadProfile(profile_use_)) {
+            if (verbose_) {
+                std::cerr << "[tether]   Warning: could not load profile data from: "
+                          << profile_use_ << std::endl;
+            }
+        }
+    }
+
+    // Run the full 6-layer metadata pipeline
+    metadata_engine_.run(program_, type_table_);
+
+    if (verbose_) {
+        std::cerr << "[tether]   Metadata engine completed ("
+                  << metadata_engine_.metadata().size() << " nodes annotated, "
+                  << metadata_engine_.metadata().structs().size() << " structs analyzed)"
+                  << std::endl;
+    }
+
+    return true;
 }
 
 // ============================================================================

@@ -9,6 +9,7 @@
 #include "cfg/CFG.h"
 #include "borrowck/BorrowChecker.h"
 #include "opt/PreLLVMPipeline.h"
+#include "metadata/MetadataEngine.h"
 
 #include <string>
 #include <vector>
@@ -87,6 +88,7 @@ private:
     bool runParser();
     bool runSemanticAnalysis();
     bool runPreLLVMOptimizations();  // Pre-LLVM passes (non-redundant with LLVM)
+    bool runMetadataEngine();        // 6-layer metadata engine
     bool runCFGBuilding();
     bool runBorrowChecking();
     bool runIRGeneration();
@@ -144,6 +146,9 @@ private:
 
     // Annotation map from pre-LLVM optimization passes (consumed by IR gen)
     ASTAnnotationMap prellvm_annotations_;                        // Phase 5
+
+    // Metadata engine (6-layer post-Moore optimization pipeline)
+    MetadataEngine metadata_engine_;                              // Phase 4.5
 
     // -----------------------------------------------------------------------
     // Error state
