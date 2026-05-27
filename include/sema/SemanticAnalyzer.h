@@ -17,6 +17,7 @@
 namespace tether {
 
 // ============================================================================
+
 // SemanticAnalyzer - walks the AST after parsing and performs:
 //   1. Type resolution (resolves parser's unresolved type names)
 //   2. Symbol binding (resolves identifier references to symbols)
