@@ -77,9 +77,9 @@ bool Driver::compile() {
         for (const auto& err : parse_errors_) {
             std::cerr << err.loc.toString() << ": error: " << err.message << std::endl;
         }
-        for (const auto& diag : sema_diagnostics_) {
-            if (diag.isError()) {
-                std::cerr << diag.toString() << std::endl;
+        for (const auto& diag : sema_reporter_.diagnostics()) {
+            if (diag.level == DiagLevel::Error) {
+                std::cerr << sema_reporter_.formatDiagnostic(diag) << std::endl;
             }
         }
         for (const auto& err : borrowck_errors_) {
@@ -220,11 +220,11 @@ bool Driver::runSemanticAnalysis() {
     }
 
     SemanticAnalyzer analyzer(type_table_);
+    analyzer.setErrorReporter(&sema_reporter_);
     analyzer.analyze(program_, type_annotations_, param_type_annotations_);
 
     // Error-resilient: record errors but don't abort
     sema_had_errors_ = analyzer.hasErrors();
-    sema_diagnostics_ = analyzer.diagnostics();
 
     if (sema_had_errors_) {
         // Don't abort - continue with CFG building and borrow checking
@@ -232,9 +232,9 @@ bool Driver::runSemanticAnalysis() {
 
     // Print warnings immediately (they are not errors)
     if (verbose_) {
-        for (const auto& diag : sema_diagnostics_) {
-            if (diag.isWarning()) {
-                std::cerr << diag.toString() << std::endl;
+        for (const auto& diag : sema_reporter_.diagnostics()) {
+            if (diag.level == DiagLevel::Warning) {
+                std::cerr << sema_reporter_.formatDiagnostic(diag) << std::endl;
             }
         }
     }

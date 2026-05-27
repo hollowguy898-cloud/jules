@@ -370,28 +370,34 @@ void IRGenerator::collectNeededTypes(TypeId type) {
         }
         case TypeKind::Slice: {
             auto& sl = cast<SliceType>(type);
-            collectNeededTypes(sl.element());
-            std::string ln = "%slice." + sanitizeName(sl.element()->toString());
+            TypeId elem = sl.element();
+            collectNeededTypes(elem);
+            std::string elem_name = elem.isNull() ? "unknown" : elem->toString();
+            std::string ln = "%slice." + sanitizeName(elem_name);
             needed_types_[key] = {ln, "{ ptr, i64 }"};
             type_emit_order_.push_back(key);
             break;
         }
         case TypeKind::SmartPointer: {
             auto& sp = cast<SmartPointerType>(type);
-            collectNeededTypes(sp.pointee());
+            TypeId pt = sp.pointee();
+            collectNeededTypes(pt);
             if (sp.smartPointerKind() == SmartPointerKind::Box) break;
+            std::string pt_name = pt.isNull() ? "unknown" : pt->toString();
             std::string prefix = sp.smartPointerKind() == SmartPointerKind::Rc ? "rc" : "arc";
-            std::string ln = "%" + prefix + "." + sanitizeName(sp.pointee()->toString());
+            std::string ln = "%" + prefix + "." + sanitizeName(pt_name);
             needed_types_[key] = {ln, "{ ptr, i64 }"};
             type_emit_order_.push_back(key);
             break;
         }
         case TypeKind::Error: {
             auto& err = cast<ErrorType>(type);
-            collectNeededTypes(err.successType());
-            std::string vt = llvmType(err.successType());
+            TypeId st = err.successType();
+            collectNeededTypes(st);
+            std::string vt = llvmType(st);
             std::string body = (vt == "void") ? "{ i1 }" : "{ " + vt + ", i1 }";
-            std::string ln = "%error." + sanitizeName(err.successType()->toString());
+            std::string st_name = st.isNull() ? "unknown" : st->toString();
+            std::string ln = "%error." + sanitizeName(st_name);
             needed_types_[key] = {ln, body};
             type_emit_order_.push_back(key);
             break;

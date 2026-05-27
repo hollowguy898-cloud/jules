@@ -11,6 +11,7 @@ namespace tether {
 SemanticAnalyzer::SemanticAnalyzer(TypeTable& type_table)
     : type_table_(type_table)
     , symtab_()
+    , reporter_(&default_reporter_)
     , current_fn_(nullptr)
     , in_pure_fn_(false)
     , error_prop_depth_(0)
@@ -64,25 +65,26 @@ void SemanticAnalyzer::analyze(
 }
 
 // ============================================================================
-// Diagnostic helpers
+// Diagnostic helpers (forward to ErrorReporter)
 // ============================================================================
+SourceSpan SemanticAnalyzer::locToSpan(const SourceLocation& loc) {
+    return SourceSpan(loc.line, loc.col, loc.line, loc.col, loc.filename);
+}
+
 void SemanticAnalyzer::emitError(const SourceLocation& loc, const std::string& msg) {
-    diagnostics_.emplace_back(SemaDiagnosticKind::Error, loc, msg);
+    reporter_->error(locToSpan(loc), msg);
 }
 
 void SemanticAnalyzer::emitWarning(const SourceLocation& loc, const std::string& msg) {
-    diagnostics_.emplace_back(SemaDiagnosticKind::Warning, loc, msg);
+    reporter_->warning(locToSpan(loc), msg);
 }
 
 void SemanticAnalyzer::emitNote(const SourceLocation& loc, const std::string& msg) {
-    diagnostics_.emplace_back(SemaDiagnosticKind::Note, loc, msg);
+    reporter_->note(locToSpan(loc), msg);
 }
 
 bool SemanticAnalyzer::hasErrors() const {
-    for (const auto& d : diagnostics_) {
-        if (d.isError()) return true;
-    }
-    return false;
+    return reporter_->hasErrors();
 }
 
 // ============================================================================
@@ -2153,13 +2155,46 @@ void SemanticAnalyzer::analyzeSwitchStmt(SwitchStmt& ss) {
 
             // Track enum variant coverage
             if (auto* member = dyn_cast<MemberExpr>(arm.pattern.get())) {
-                // Color.Red — track "Red" as the covered variant
-                covered_variants.insert(member->field());
+                // Color.Red — verify the base is the correct enum, then
+                // track the field name as the covered variant
+                if (!subject_type.isNull() && isa<EnumType>(subject_type)) {
+                    auto& subject_enum = cast<EnumType>(subject_type);
+                    // The pattern type should have been resolved by
+                    // analyzeExpr above. If it's the same enum type,
+                    // the field is a valid variant of the subject enum.
+                    if (!pattern_type.isNull() && typesEqual(subject_type, pattern_type)) {
+                        // Verify the field is actually a variant of the subject enum
+                        if (subject_enum.findVariant(member->field())) {
+                            covered_variants.insert(member->field());
+                        } else {
+                            emitError(arm.pattern->sourceLoc(),
+                                      "variant '" + member->field() +
+                                      "' is not a member of enum '" + subject_enum.name() + "'");
+                        }
+                    }
+                    // If pattern_type is different from subject_type, the type
+                    // mismatch error was already reported above; don't count
+                    // it as coverage.
+                } else {
+                    // Non-enum subject (int/bool): just track the field name
+                    covered_variants.insert(member->field());
+                }
             } else if (auto* ident = dyn_cast<IdentExpr>(arm.pattern.get())) {
-                covered_variants.insert(ident->name());
                 // Check for wildcard pattern (underscore or catch-all)
                 if (ident->name() == "_" || ident->name() == "else") {
                     has_wildcard = true;
+                } else if (!subject_type.isNull() && isa<EnumType>(subject_type)) {
+                    // For enum subjects, verify the identifier is a valid
+                    // variant of the subject enum before counting as covered
+                    auto& subject_enum = cast<EnumType>(subject_type);
+                    if (subject_enum.findVariant(ident->name())) {
+                        covered_variants.insert(ident->name());
+                    }
+                    // If not a valid variant, don't count it — the type
+                    // mismatch error was already reported above
+                } else {
+                    // Non-enum subject (int/bool): track the name as-is
+                    covered_variants.insert(ident->name());
                 }
             }
         }

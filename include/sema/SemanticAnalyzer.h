@@ -4,6 +4,7 @@
 #include "parser/Parser.h"
 #include "sema/Type.h"
 #include "sema/SymbolTable.h"
+#include "diag/ErrorReporter.h"
 
 #include <string>
 #include <vector>
@@ -14,37 +15,6 @@
 #include <functional>
 
 namespace tether {
-
-// ============================================================================
-// Diagnostic - represents a semantic error or warning
-// ============================================================================
-enum class SemaDiagnosticKind : uint8_t {
-    Error,
-    Warning,
-    Note
-};
-
-struct SemaDiagnostic {
-    SemaDiagnosticKind kind;
-    SourceLocation loc;
-    std::string message;
-
-    SemaDiagnostic(SemaDiagnosticKind k, SourceLocation l, std::string msg)
-        : kind(k), loc(std::move(l)), message(std::move(msg)) {}
-
-    std::string toString() const {
-        std::string prefix;
-        switch (kind) {
-            case SemaDiagnosticKind::Error:   prefix = "error"; break;
-            case SemaDiagnosticKind::Warning: prefix = "warning"; break;
-            case SemaDiagnosticKind::Note:    prefix = "note"; break;
-        }
-        return loc.toString() + ": " + prefix + ": " + message;
-    }
-
-    bool isError() const { return kind == SemaDiagnosticKind::Error; }
-    bool isWarning() const { return kind == SemaDiagnosticKind::Warning; }
-};
 
 // ============================================================================
 // SemanticAnalyzer - walks the AST after parsing and performs:
@@ -60,6 +30,11 @@ public:
     explicit SemanticAnalyzer(TypeTable& type_table);
 
     // -----------------------------------------------------------------------
+    // Set the ErrorReporter (optional; if not set, a default one is used)
+    // -----------------------------------------------------------------------
+    void setErrorReporter(ErrorReporter* reporter) { reporter_ = reporter; }
+
+    // -----------------------------------------------------------------------
     // Main entry point: analyze an entire program (list of top-level decls)
     // -----------------------------------------------------------------------
     void analyze(Program& program,
@@ -70,7 +45,8 @@ public:
     // Query results after analysis
     // -----------------------------------------------------------------------
     bool hasErrors() const;
-    const std::vector<SemaDiagnostic>& diagnostics() const { return diagnostics_; }
+    const ErrorReporter& errorReporter() const { return *reporter_; }
+    ErrorReporter& errorReporter() { return *reporter_; }
 
     // -----------------------------------------------------------------------
     // Symbol table access (for downstream passes like borrow checking)
@@ -102,11 +78,14 @@ public:
 
 private:
     // -----------------------------------------------------------------------
-    // Diagnostic helpers
+    // Diagnostic helpers (forward to ErrorReporter)
     // -----------------------------------------------------------------------
     void emitError(const SourceLocation& loc, const std::string& msg);
     void emitWarning(const SourceLocation& loc, const std::string& msg);
     void emitNote(const SourceLocation& loc, const std::string& msg);
+
+    // Convert a SourceLocation to a SourceSpan for ErrorReporter
+    static SourceSpan locToSpan(const SourceLocation& loc);
 
     // -----------------------------------------------------------------------
     // Type resolution
@@ -265,7 +244,8 @@ private:
     // -----------------------------------------------------------------------
     TypeTable& type_table_;
     SymbolTable symtab_;
-    std::vector<SemaDiagnostic> diagnostics_;
+    ErrorReporter* reporter_;  // Non-owning pointer to shared ErrorReporter
+    ErrorReporter default_reporter_;  // Fallback if no reporter is set
 
     // Current function being analyzed
     FnDecl* current_fn_ = nullptr;

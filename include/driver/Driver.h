@@ -4,6 +4,7 @@
 #include "ast/AST.h"
 #include "parser/Parser.h"
 #include "sema/Type.h"
+#include "diag/ErrorReporter.h"
 #include "sema/SemanticAnalyzer.h"
 #include "cfg/CFG.h"
 #include "borrowck/BorrowChecker.h"
@@ -154,7 +155,7 @@ private:
     bool sema_had_errors_ = false;
     bool borrowck_had_errors_ = false;
     std::vector<ParseError> parse_errors_;
-    std::vector<SemaDiagnostic> sema_diagnostics_;
+    ErrorReporter sema_reporter_;  // Unified reporter for semantic analysis
     std::vector<BorrowError> borrowck_errors_;
 };
 

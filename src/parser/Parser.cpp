@@ -1605,10 +1605,25 @@ std::unique_ptr<Expr> Parser::parseCallExpr(std::unique_ptr<Expr> callee) {
 std::unique_ptr<Expr> Parser::parseMemberExpr(std::unique_ptr<Expr> object) {
     SourceLocation dot_loc = loc();
     advance(); // consume .
-    Token field = consume(TokenKind::IDENTIFIER,
-                          "expected field name after '.'");
+
+    // Allow keywords as field names after '.' (e.g., obj.val, obj.type)
+    // This is standard practice — field names should not conflict with keywords.
+    std::string field_name;
+    if (peek().kind() == TokenKind::IDENTIFIER) {
+        field_name = std::string(peek().text());
+        advance();
+    } else if (peek().isKeyword()) {
+        field_name = std::string(peek().text());
+        advance();
+    } else {
+        error("expected field name after '.'");
+        // Try to recover: skip the token
+        advance();
+        field_name = "_error_";
+    }
+
     return std::make_unique<MemberExpr>(
-        std::move(dot_loc), std::move(object), std::string(field.text()));
+        std::move(dot_loc), std::move(object), std::move(field_name));
 }
 
 std::unique_ptr<Expr> Parser::parseIndexExpr(std::unique_ptr<Expr> object) {
@@ -1954,9 +1969,20 @@ std::vector<DesignatedInit> Parser::parseDesignatedInits() {
 
         // Expect .fieldname = value (Zig-style designated initializer)
         if (match(TokenKind::DOT)) {
-            Token field = consume(TokenKind::IDENTIFIER,
-                                  "expected field name after '.'");
-            init.field_name = std::string(field.text());
+            // Allow keywords as field names in struct init (e.g., .val = 5)
+            std::string fname;
+            if (peek().kind() == TokenKind::IDENTIFIER) {
+                fname = std::string(peek().text());
+                advance();
+            } else if (peek().isKeyword()) {
+                fname = std::string(peek().text());
+                advance();
+            } else {
+                error("expected field name after '.'");
+                advance();
+                fname = "_error_";
+            }
+            init.field_name = std::move(fname);
             consume(TokenKind::EQ, "expected '=' after field name in struct init");
         } else {
             // Could also support positional init, but spec says designated
