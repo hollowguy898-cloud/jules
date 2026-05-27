@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Tether pre-commit hook — block leaked file patterns from ever entering the repo
+# =============================================================================
+
+set -euo pipefail
+
+BLOCKED_PATTERNS=(
+    "skills/"
+    "download/"
+    ".env"
+    ".env."
+    "tetherc_asan"
+    "__pycache__/"
+    "*.pyc"
+    "*.pyo"
+    "node_modules/"
+    ".DS_Store"
+    "install/"
+    "package-lock.json"
+)
+
+BLOCKED_EXTENSIONS=(
+    ".ts"
+    ".js"
+    ".mjs"
+)
+
+# Exemptions — these paths are allowed even if they match above
+EXEMPT_PATTERNS=(
+    "runtime/"
+    "benchmarks/"
+)
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
+
+if [ -z "$staged_files" ]; then
+    exit 0
+fi
+
+errors=0
+
+for file in $staged_files; do
+    # Check blocked directory/prefix patterns
+    for pattern in "${BLOCKED_PATTERNS[@]}"; do
+        case "$file" in
+            $pattern)
+                # Check if exempt
+                exempt=false
+                for ex in "${EXEMPT_PATTERNS[@]}"; do
+                    case "$file" in
+                        $ex*) exempt=true; break ;;
+                    esac
+                done
+                if [ "$exempt" = false ]; then
+                    echo "BLOCKED: '$file' matches blocked pattern '$pattern'"
+                    errors=$((errors + 1))
+                fi
+                ;;
+        esac
+    done
+
+    # Check blocked extensions (only outside exempted dirs)
+    in_exempt=false
+    for ex in "${EXEMPT_PATTERNS[@]}"; do
+        case "$file" in
+            $ex*) in_exempt=true; break ;;
+        esac
+    done
+
+    if [ "$in_exempt" = false ]; then
+        for ext in "${BLOCKED_EXTENSIONS[@]}"; do
+            case "$file" in
+                *$ext)
+                    echo "BLOCKED: '$file' has blocked extension '$ext' (not in exempted dirs)"
+                    errors=$((errors + 1))
+                    break
+                    ;;
+            esac
+        done
+    fi
+
+    # Block binary files over 1MB (likely built artifacts)
+    if [ -f "$file" ]; then
+        size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+        if [ "$size" -gt 1048576 ]; then
+            echo "BLOCKED: '$file' is larger than 1MB ($(( size / 1024 ))KB) — likely a build artifact"
+            errors=$((errors + 1))
+        fi
+    fi
+done
+
+if [ "$errors" -gt 0 ]; then
+    echo ""
+    echo "Commit ABORTED: $errors blocked file(s) detected."
+    echo "If this is intentional, use: git commit --no-verify"
+    echo "But ask yourself: does this really belong in the Tether repo?"
+    exit 1
+fi
+
+exit 0
