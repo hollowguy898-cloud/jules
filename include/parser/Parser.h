@@ -155,6 +155,9 @@ private:
     TypeId parseType();
     TypeId resolveNamedType(const std::string& name);
 
+    // Check if a TypeId has null inner types (forward reference in compound type)
+    bool hasNullInnerTypeHelper(TypeId type) const;
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------

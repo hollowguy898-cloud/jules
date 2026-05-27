@@ -1,0 +1,14 @@
+// Test inline and noalloc keywords
+
+inline fn square(x: i32) i32 {
+    return x * x;
+}
+
+noalloc fn double_it(x: i32) i32 {
+    return x + x;
+}
+
+fn main() void {
+    val sq: i32 = square(7);
+    val doubled: i32 = double_it(21);
+}

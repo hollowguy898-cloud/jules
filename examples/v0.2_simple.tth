@@ -1,0 +1,35 @@
+// Simplified v0.2 feature test
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+fn color_to_code(c: Color) i32 {
+    switch (c) {
+        Color.Red -> {
+            return 1;
+        }
+        Color.Green -> {
+            return 2;
+        }
+        Color.Blue -> {
+            return 3;
+        }
+    }
+}
+
+inline fn square(x: i32) i32 {
+    return x * x;
+}
+
+noalloc fn compute_hash(v: i32) i64 {
+    return v cast i64 * 1099511628211;
+}
+
+fn main() i32 {
+    val code: i32 = color_to_code(Color.Red);
+    val sq: i32 = square(7);
+    return code + sq;
+}

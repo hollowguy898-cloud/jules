@@ -1,0 +1,73 @@
+// ============================================================================
+// TechEmpower FrameworkBenchmarks — Database Single Query test
+// ============================================================================
+// Spec: Fetch one World row by random ID (1-10000),
+//       return as JSON: { "id": N, "randomNumber": N }
+// ============================================================================
+
+struct World {
+    id: i32,
+    random_number: i32
+}
+
+struct DbConn {
+    handle: usize
+}
+
+struct DbResult {
+    world: World,
+    ok: bool
+}
+
+// xorshift PRNG for random IDs (1-10000)
+noalloc fn xorshift64(seed: u64) u64 {
+    var x: u64 = seed * seed + 1;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    return x;
+}
+
+fn random_world_id(seed: u64) i32 {
+    val x: u64 = xorshift64(seed);
+    val result: i32 = (x & 9999) + 1;
+    return result;
+}
+
+// Simulate database query
+fn db_query_world(id: i32) DbResult {
+    var result: DbResult = DbResult{ .world = World{ .id = id, .random_number = id * 17 % 10000 }, .ok = true };
+    return result;
+}
+
+// Main benchmark: Single database query — returns byte count
+fn handle_single_query(seed: u64) i32 {
+    val id: i32 = random_world_id(seed);
+    val result: DbResult = db_query_world(id);
+
+    if (!result.ok) {
+        return 0;
+    }
+
+    // Simulate JSON output size: {"id":NNNN,"randomNumber":NNNN}
+    val json_size: i32 = 30 + result.world.id + result.world.random_number;
+    return json_size;
+}
+
+// Server loop
+fn bench_single_query(n: usize) usize {
+    var total_bytes: usize = 0;
+    var i: usize = 0;
+
+    while (i < n) : (i += 1) {
+        val bytes: i32 = handle_single_query(42);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    return total_bytes;
+}
+
+fn main() i32 {
+    val bytes: usize = bench_single_query(1000);
+    return bytes cast i32;
+}

@@ -18,32 +18,32 @@ namespace tether {
 // ============================================================================
 // Diagnostic - represents a semantic error or warning
 // ============================================================================
-enum class DiagnosticKind : uint8_t {
+enum class SemaDiagnosticKind : uint8_t {
     Error,
     Warning,
     Note
 };
 
-struct Diagnostic {
-    DiagnosticKind kind;
+struct SemaDiagnostic {
+    SemaDiagnosticKind kind;
     SourceLocation loc;
     std::string message;
 
-    Diagnostic(DiagnosticKind k, SourceLocation l, std::string msg)
+    SemaDiagnostic(SemaDiagnosticKind k, SourceLocation l, std::string msg)
         : kind(k), loc(std::move(l)), message(std::move(msg)) {}
 
     std::string toString() const {
         std::string prefix;
         switch (kind) {
-            case DiagnosticKind::Error:   prefix = "error"; break;
-            case DiagnosticKind::Warning: prefix = "warning"; break;
-            case DiagnosticKind::Note:    prefix = "note"; break;
+            case SemaDiagnosticKind::Error:   prefix = "error"; break;
+            case SemaDiagnosticKind::Warning: prefix = "warning"; break;
+            case SemaDiagnosticKind::Note:    prefix = "note"; break;
         }
         return loc.toString() + ": " + prefix + ": " + message;
     }
 
-    bool isError() const { return kind == DiagnosticKind::Error; }
-    bool isWarning() const { return kind == DiagnosticKind::Warning; }
+    bool isError() const { return kind == SemaDiagnosticKind::Error; }
+    bool isWarning() const { return kind == SemaDiagnosticKind::Warning; }
 };
 
 // ============================================================================
@@ -70,7 +70,7 @@ public:
     // Query results after analysis
     // -----------------------------------------------------------------------
     bool hasErrors() const;
-    const std::vector<Diagnostic>& diagnostics() const { return diagnostics_; }
+    const std::vector<SemaDiagnostic>& diagnostics() const { return diagnostics_; }
 
     // -----------------------------------------------------------------------
     // Symbol table access (for downstream passes like borrow checking)
@@ -118,6 +118,16 @@ private:
     // Resolve a type name string to a TypeId (looks up struct/enum in symtab)
     TypeId resolveTypeName(const std::string& name, const SourceLocation& loc);
 
+    // Recursively re-resolve null inner types in compound types
+    // (e.g., MutReferenceType(null) -> MutReferenceType(StructType) after registration)
+    TypeId reresolveType(TypeId type);
+
+    // Check if a compound type contains null inner types (forward refs)
+    bool hasNullInnerType(TypeId type) const;
+
+    // Parse and resolve a compound type string like "&mut JsonBuffer", "*World", "&[u8]"
+    TypeId resolveCompoundTypeName(const std::string& name, const SourceLocation& loc);
+
     // -----------------------------------------------------------------------
     // Top-level declaration analysis
     // -----------------------------------------------------------------------
@@ -150,6 +160,10 @@ private:
     void analyzeErrdeferStmt(ErrdeferStmt& es);
     void analyzeAtomicStmt(AtomicStmt& as);
     void analyzeYieldStmt(YieldStmt& ys);
+    void analyzeSwitchStmt(SwitchStmt& ss);
+    void analyzeSpawnStmt(SpawnStmt& ss);
+    void analyzeTraitDecl(TraitDecl& td);
+    void analyzeImplDecl(ImplDecl& id);
 
     // -----------------------------------------------------------------------
     // Expression analysis — returns the TypeId of the expression
@@ -176,6 +190,8 @@ private:
     TypeId analyzeUnsafeExpr(UnsafeExpr& ue);
     TypeId analyzePoisonExpr(PoisonExpr& pe);
     TypeId analyzeTryExpr(TryExpr& te);
+    TypeId analyzeComptimeExpr(ComptimeExpr& ce);
+    TypeId analyzeReduceExpr(ReduceExpr& re);
 
     // -----------------------------------------------------------------------
     // Type checking helpers
@@ -249,7 +265,7 @@ private:
     // -----------------------------------------------------------------------
     TypeTable& type_table_;
     SymbolTable symtab_;
-    std::vector<Diagnostic> diagnostics_;
+    std::vector<SemaDiagnostic> diagnostics_;
 
     // Current function being analyzed
     FnDecl* current_fn_ = nullptr;
@@ -274,6 +290,12 @@ private:
 
     // Set of nodes whose types have been resolved (to avoid re-resolution)
     std::unordered_set<const ASTNode*> resolved_nodes_;
+
+    // Whether we're inside a noalloc function
+    bool in_noalloc_fn_ = false;
+
+    // Set of function names that are declared noalloc
+    std::unordered_set<std::string> noalloc_functions_;
 };
 
 } // namespace tether

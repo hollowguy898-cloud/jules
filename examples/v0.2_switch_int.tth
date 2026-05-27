@@ -1,0 +1,19 @@
+// Test switch with integer subject
+
+fn classify(x: i32) i32 {
+    switch (x) {
+        0 -> {
+            return 0;
+        }
+        1 -> {
+            return 1;
+        }
+        2 -> {
+            return 2;
+        }
+    }
+}
+
+fn main() void {
+    val result: i32 = classify(1);
+}

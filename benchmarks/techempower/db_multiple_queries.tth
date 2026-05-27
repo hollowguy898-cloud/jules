@@ -1,0 +1,103 @@
+// ============================================================================
+// TechEmpower FrameworkBenchmarks — Database Multiple Queries test
+// ============================================================================
+// Spec: Fetch N random World rows (N from query param, 1-500, default 5),
+//       return as JSON array: [{"id":N,"randomNumber":N}, ...]
+//
+// Tests: Repeated DB queries, JSON array serialization, dynamic request count
+// ============================================================================
+
+struct World {
+    id: i32,
+    random_number: i32
+}
+
+struct DbConn {
+    handle: usize
+}
+
+struct DbResult {
+    world: World,
+    ok: bool
+}
+
+// xorshift PRNG for random IDs (1-10000)
+noalloc fn xorshift64(seed: u64) u64 {
+    var x: u64 = seed * seed + 1;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    return x;
+}
+
+fn random_world_id(seed: u64) i32 {
+    val x: u64 = xorshift64(seed);
+    val result: i32 = (x & 9999) + 1;
+    return result;
+}
+
+// Simulate database query
+fn db_query_world(id: i32) DbResult {
+    var result: DbResult = DbResult{ .world = World{ .id = id, .random_number = id * 17 % 10000 }, .ok = true };
+    return result;
+}
+
+// Clamp count to [1, 500]
+inline fn clamp_count(count: i32) i32 {
+    if (count < 1) {
+        return 1;
+    }
+    if (count > 500) {
+        return 500;
+    }
+    return count;
+}
+
+// Core: Multiple queries handler — returns byte count
+fn handle_multiple_queries(seed: u64, count: i32) i32 {
+    val n: i32 = clamp_count(count);
+    var total_json_size: i32 = 0;
+
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        val id: i32 = random_world_id(seed + i cast u64);
+        val result: DbResult = db_query_world(id);
+
+        if (!result.ok) {
+            return 0;
+        }
+
+        // Simulate JSON output size per item: {"id":NNNN,"randomNumber":NNNN}
+        val item_size: i32 = 30 + result.world.id + result.world.random_number;
+
+        // Add comma separator for items after the first
+        if (i > 0) {
+            total_json_size = total_json_size + 1;
+        }
+
+        total_json_size = total_json_size + item_size;
+    }
+
+    // Add [ and ] brackets
+    total_json_size = total_json_size + 2;
+
+    return total_json_size;
+}
+
+// Server loop
+fn bench_multiple_queries(n: usize) usize {
+    var total_bytes: usize = 0;
+    var i: usize = 0;
+
+    while (i < n) : (i += 1) {
+        val bytes: i32 = handle_multiple_queries(42, 5);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    return total_bytes;
+}
+
+fn main() i32 {
+    val bytes: usize = bench_multiple_queries(1000);
+    return bytes cast i32;
+}

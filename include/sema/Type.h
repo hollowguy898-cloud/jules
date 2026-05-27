@@ -60,7 +60,10 @@ enum class TypeKind : uint8_t {
     Error,
     Allocator,
     Opaque,
-    Aligned
+    Aligned,
+    Shape,
+    Stride,
+    Tensor
 };
 
 // ============================================================================
@@ -117,6 +120,9 @@ class ErrorType;
 class AllocatorType;
 class OpaqueType;
 class AlignedType;
+class ShapeType;
+class StrideType;
+class TensorType;
 
 // ============================================================================
 // Type base class
@@ -538,6 +544,8 @@ struct FnParam {
     std::string name;
     TypeId type;
     bool is_mutable;
+    bool is_restrict = false;  // restrict keyword: pointer no-alias guarantee for vectorization
+    std::string unresolved_type_name;  // Full type text for later resolution (e.g. "&mut JsonBuffer")
 };
 
 // ============================================================================
@@ -783,6 +791,154 @@ public:
 private:
     TypeId inner_;
     uint32_t alignment_;
+};
+
+// ============================================================================
+// ShapeType - represents the multi-dimensional boundary properties of a tensor
+//
+// shape[N] or shape[N, M, K] — describes the dimensions of a tensor.
+// This is a compile-time constant that carries dimension information for
+// array/tensor types. The compiler uses this for:
+//   - Bounds checking at compile time when possible
+//   - Stride computation for multi-dimensional indexing
+//   - Loop unrolling and vectorization hints
+// ============================================================================
+class ShapeType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Shape;
+    }
+
+    ShapeType(std::vector<uint64_t> dimensions)
+        : Type(TypeKind::Shape)
+        , dimensions_(std::move(dimensions))
+    {}
+
+    const std::vector<uint64_t>& dimensions() const { return dimensions_; }
+    size_t rank() const { return dimensions_.size(); }
+
+    // Total number of elements (product of all dimensions)
+    uint64_t totalElements() const {
+        uint64_t total = 1;
+        for (auto d : dimensions_) total *= d;
+        return total;
+    }
+
+    std::string toString() const override {
+        std::string result = "shape:[";
+        for (size_t i = 0; i < dimensions_.size(); ++i) {
+            if (i > 0) result += ",";
+            result += std::to_string(dimensions_[i]);
+        }
+        result += "]";
+        return result;
+    }
+
+    uint64_t bitWidth() const override { return 64 * dimensions_.size(); }
+    bool isInteger() const override { return true; }
+    bool isNumeric() const override { return true; }
+
+private:
+    std::vector<uint64_t> dimensions_;
+};
+
+// ============================================================================
+// StrideType - represents the physical memory stride for tensor layouts
+//
+// stride[N] or stride[N, M, K] — describes how many elements to skip in
+// each dimension when traversing a multi-dimensional array in memory.
+// Used for:
+//   - row_major / column_major layout specification
+//   - Non-contiguous views and sub-tensors
+//   - Cache-aware access pattern generation
+// ============================================================================
+class StrideType : public Type {
+public:
+    enum class Layout : uint8_t {
+        RowMajor,      // C-style: last dimension is contiguous
+        ColumnMajor    // Fortran-style: first dimension is contiguous
+    };
+
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Stride;
+    }
+
+    StrideType(std::vector<uint64_t> strides, Layout layout = Layout::RowMajor)
+        : Type(TypeKind::Stride)
+        , strides_(std::move(strides))
+        , layout_(layout)
+    {}
+
+    const std::vector<uint64_t>& strides() const { return strides_; }
+    Layout layout() const { return layout_; }
+    size_t rank() const { return strides_.size(); }
+
+    std::string toString() const override {
+        std::string result = "stride:[";
+        for (size_t i = 0; i < strides_.size(); ++i) {
+            if (i > 0) result += ",";
+            result += std::to_string(strides_[i]);
+        }
+        result += ",";
+        result += (layout_ == Layout::RowMajor) ? "row_major" : "column_major";
+        result += "]";
+        return result;
+    }
+
+    uint64_t bitWidth() const override { return 64 * strides_.size(); }
+    bool isInteger() const override { return true; }
+    bool isNumeric() const override { return true; }
+
+private:
+    std::vector<uint64_t> strides_;
+    Layout layout_;
+};
+
+// ============================================================================
+// TensorType - represents a multi-dimensional tensor with shape, stride, and element type
+//
+// tensor<Shape, Stride, ElementType> — a full tensor descriptor combining
+// dimensional bounds, memory layout, and element type.
+// ============================================================================
+class TensorType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Tensor;
+    }
+
+    TensorType(TypeId element_type, TypeId shape, TypeId stride)
+        : Type(TypeKind::Tensor)
+        , element_type_(element_type)
+        , shape_(shape)
+        , stride_(stride)
+    {}
+
+    TypeId elementType() const { return element_type_; }
+    TypeId shape() const { return shape_; }
+    TypeId stride() const { return stride_; }
+
+    std::string toString() const override {
+        std::string result = "tensor<";
+        if (element_type_) result += element_type_->toString();
+        else result += "<null>";
+        result += ",";
+        if (shape_) result += shape_->toString();
+        else result += "<null>";
+        result += ",";
+        if (stride_) result += stride_->toString();
+        else result += "<null>";
+        result += ">";
+        return result;
+    }
+
+    bool isNumeric() const override { return element_type_ ? element_type_->isNumeric() : false; }
+    bool isFloat() const override { return element_type_ ? element_type_->isFloat() : false; }
+    bool isInteger() const override { return element_type_ ? element_type_->isInteger() : false; }
+
+private:
+    TypeId element_type_;
+    TypeId shape_;
+    TypeId stride_;
 };
 
 // ============================================================================
@@ -1089,6 +1245,48 @@ public:
         }
 
         auto type = std::make_unique<ErrorType>(success_type);
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // Intern a shape type
+    TypeId getShape(std::vector<uint64_t> dimensions) {
+        ShapeType temp(dimensions);
+        std::string key = temp.toString();
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+        auto type = std::make_unique<ShapeType>(std::move(dimensions));
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // Intern a stride type
+    TypeId getStride(std::vector<uint64_t> strides, StrideType::Layout layout = StrideType::Layout::RowMajor) {
+        StrideType temp(strides, layout);
+        std::string key = temp.toString();
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+        auto type = std::make_unique<StrideType>(std::move(strides), layout);
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // Intern a tensor type
+    TypeId getTensor(TypeId element_type, TypeId shape, TypeId stride) {
+        TensorType temp(element_type, shape, stride);
+        std::string key = temp.toString();
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+        auto type = std::make_unique<TensorType>(element_type, shape, stride);
         Type* raw = type.get();
         type_map_[std::move(key)] = std::move(type);
         return TypeId(raw);

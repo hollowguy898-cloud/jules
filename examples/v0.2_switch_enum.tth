@@ -1,0 +1,17 @@
+// Test switch with enum - minimal
+
+enum Color {
+    Red,
+    Green
+}
+
+fn test(c: Color) i32 {
+    switch (c) {
+        Color.Red -> {
+            return 1;
+        }
+        Color.Green -> {
+            return 2;
+        }
+    }
+}

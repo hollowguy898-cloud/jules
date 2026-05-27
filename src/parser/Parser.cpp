@@ -324,6 +324,14 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
             param_type_annotations_[final_key] = it->second;
             param_type_annotations_.erase(it);
         }
+        // Also handle compound type annotations
+        std::string pending_full_key = "__pending__" + std::to_string(i) + "_full";
+        auto it2 = param_type_annotations_.find(pending_full_key);
+        if (it2 != param_type_annotations_.end()) {
+            std::string final_key = fn_name + ":" + std::to_string(i) + "_full";
+            param_type_annotations_[final_key] = it2->second;
+            param_type_annotations_.erase(it2);
+        }
     }
 
     // Check for error-returning function: ! before return type
@@ -332,8 +340,18 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
 
     // Parse return type (optional)
     TypeId return_type;
+    std::string return_type_text;  // Store text for later resolution
     if (!check(TokenKind::LBRACE) && !check(TokenKind::KW_PURE)) {
+        size_t rt_start = pos_;
         return_type = parseType();
+        size_t rt_end = pos_;
+        // If return type is null or has null inner types, store the text
+        if (return_type.isNull() || hasNullInnerTypeHelper(return_type)) {
+            for (size_t i = rt_start; i < rt_end; ++i) {
+                if (i > rt_start) return_type_text += " ";
+                return_type_text += std::string(tokens_[i].text());
+            }
+        }
     } else {
         return_type = type_table_.getVoid();
     }
@@ -356,6 +374,9 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
         std::move(directives));
     result->setInline(is_inline);
     result->setNoalloc(is_noalloc);
+    if (!return_type_text.empty()) {
+        result->unresolved_return_type_name = return_type_text;
+    }
     return result;
 }
 
@@ -1434,6 +1455,73 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
         case TokenKind::KW_SIZEOF:
             return parseSizeofExpr();
 
+        // comptime expression: comptime expr
+        case TokenKind::KW_COMPTIME: {
+            SourceLocation comptime_loc = loc();
+            advance(); // consume 'comptime'
+            std::unique_ptr<Expr> inner;
+            if (check(TokenKind::LBRACE)) {
+                // comptime { block } — wrap block statements into an expression
+                // by creating a block and treating the last expression as the value.
+                // For now, parse the first expression from the block.
+                auto block = parseBlockStmt();
+                // Create a ComptimeExpr wrapping a PoisonExpr with a note that
+                // full block-as-expression support requires the comptime interpreter.
+                // The block is analyzed normally by the semantic analyzer.
+                auto poison = std::make_unique<PoisonExpr>(comptime_loc,
+                    "comptime block evaluation requires interpreter");
+                inner = std::move(poison);
+            } else {
+                inner = parseExpr();
+            }
+            return std::make_unique<ComptimeExpr>(std::move(comptime_loc), std::move(inner));
+        }
+
+        // reduce expression: reduce(op, iterable, axis=N)
+        case TokenKind::KW_REDUCE: {
+            SourceLocation reduce_loc = loc();
+            advance(); // consume 'reduce'
+            consume(TokenKind::LPAREN, "expected '(' after 'reduce'");
+
+            // Parse reduction operation: add, mul, max, min, and, or, bit_and, bit_or
+            Token op_tok = consume(TokenKind::IDENTIFIER, "expected reduction operation (add, mul, max, min, and, or, bit_and, bit_or)");
+            std::string_view op_text = op_tok.text();
+            ReduceExpr::ReduceOp op;
+            if (op_text == "add") op = ReduceExpr::ReduceOp::Add;
+            else if (op_text == "mul") op = ReduceExpr::ReduceOp::Mul;
+            else if (op_text == "max") op = ReduceExpr::ReduceOp::Max;
+            else if (op_text == "min") op = ReduceExpr::ReduceOp::Min;
+            else if (op_text == "and") op = ReduceExpr::ReduceOp::And;
+            else if (op_text == "or") op = ReduceExpr::ReduceOp::Or;
+            else if (op_text == "bit_and" || op_text == "band") op = ReduceExpr::ReduceOp::BitAnd;
+            else if (op_text == "bit_or" || op_text == "bor") op = ReduceExpr::ReduceOp::BitOr;
+            else {
+                std::string err_msg = "unknown reduction operation '";
+                err_msg.append(op_text);
+                err_msg += "'";
+                errorAt(op_tok, err_msg);
+                op = ReduceExpr::ReduceOp::Add; // fallback
+            }
+
+            consume(TokenKind::COMMA, "expected ',' after reduction operation");
+            auto iterable = parseExpr();
+
+            // Optional axis parameter
+            std::unique_ptr<Expr> axis;
+            if (match(TokenKind::COMMA)) {
+                // axis = N
+                if (check(TokenKind::IDENTIFIER) && peek().text() == "axis") {
+                    advance(); // consume 'axis'
+                    consume(TokenKind::EQ, "expected '=' after 'axis'");
+                }
+                axis = parseExpr();
+            }
+
+            consume(TokenKind::RPAREN, "expected ')' after reduce arguments");
+            return std::make_unique<ReduceExpr>(std::move(reduce_loc), op,
+                                                 std::move(iterable), std::move(axis));
+        }
+
         // Identifier or struct init
         case TokenKind::IDENTIFIER: {
             Token ident_tok = peek();
@@ -1665,6 +1753,57 @@ TypeId Parser::parseType() {
             return type_table_.getAllocator();
         }
 
+        // shape[N, M, K] — multi-dimensional tensor boundary type
+        if (name == "shape" && peekNext().kind() == TokenKind::LBRACKET) {
+            advance(); // consume 'shape'
+            consume(TokenKind::LBRACKET, "expected '[' after 'shape'");
+            std::vector<uint64_t> dims;
+            if (!check(TokenKind::RBRACKET)) {
+                Token dim_tok = consume(TokenKind::INT_LITERAL, "expected dimension value");
+                dims.push_back(std::stoull(std::string(dim_tok.text())));
+                while (match(TokenKind::COMMA)) {
+                    dim_tok = consume(TokenKind::INT_LITERAL, "expected dimension value");
+                    dims.push_back(std::stoull(std::string(dim_tok.text())));
+                }
+            }
+            consume(TokenKind::RBRACKET, "expected ']' after shape dimensions");
+            return type_table_.getShape(std::move(dims));
+        }
+
+        // stride[N, M, row_major] — tensor memory stride type
+        if (name == "stride" && peekNext().kind() == TokenKind::LBRACKET) {
+            advance(); // consume 'stride'
+            consume(TokenKind::LBRACKET, "expected '[' after 'stride'");
+            std::vector<uint64_t> strides;
+            StrideType::Layout layout = StrideType::Layout::RowMajor;
+            if (!check(TokenKind::RBRACKET)) {
+                Token stride_tok = consume(TokenKind::INT_LITERAL, "expected stride value");
+                strides.push_back(std::stoull(std::string(stride_tok.text())));
+                while (match(TokenKind::COMMA)) {
+                    // Check for layout specifier instead of another number
+                    if (check(TokenKind::IDENTIFIER)) {
+                        std::string layout_name(peek().text());
+                        if (layout_name == "row_major" || layout_name == "row") {
+                            advance();
+                            layout = StrideType::Layout::RowMajor;
+                        } else if (layout_name == "column_major" || layout_name == "col") {
+                            advance();
+                            layout = StrideType::Layout::ColumnMajor;
+                        } else {
+                            // Treat as another stride value
+                            stride_tok = consume(TokenKind::INT_LITERAL, "expected stride value");
+                            strides.push_back(std::stoull(std::string(stride_tok.text())));
+                        }
+                    } else {
+                        stride_tok = consume(TokenKind::INT_LITERAL, "expected stride value");
+                        strides.push_back(std::stoull(std::string(stride_tok.text())));
+                    }
+                }
+            }
+            consume(TokenKind::RBRACKET, "expected ']' after stride values");
+            return type_table_.getStride(std::move(strides), layout);
+        }
+
         // Smart pointer types: Box<T>, Rc<T>, Arc<T>
         if ((name == "Box" || name == "Rc" || name == "Arc") &&
             peekNext().kind() == TokenKind::LT) {
@@ -1719,10 +1858,17 @@ std::vector<FnParam> Parser::parseFnParams() {
     do {
         FnParam param;
         param.is_mutable = false;
+        param.is_restrict = false;
 
         // Check for 'var' keyword for mutable parameter
         if (check(TokenKind::KW_VAR)) {
             param.is_mutable = true;
+            advance();
+        }
+
+        // Check for 'restrict' keyword for no-alias pointer parameter
+        if (check(TokenKind::KW_RESTRICT)) {
+            param.is_restrict = true;
             advance();
         }
 
@@ -1731,13 +1877,63 @@ std::vector<FnParam> Parser::parseFnParams() {
         param.name = std::string(name_tok.text());
 
         consume(TokenKind::COLON, "expected ':' after parameter name");
+        size_t type_start = pos_;  // Record position before type parsing
         Token type_name_tok = peek();
         param.type = parseType();
-        // If the type couldn't be resolved, record the type name for later resolution
-        if (param.type.isNull() && type_name_tok.kind() == TokenKind::IDENTIFIER) {
-            // We need the function name, which is set after parseFnParams returns.
-            // Store by param index temporarily; parseFnDecl will add the function name prefix.
-            param_type_annotations_["__pending__" + std::to_string(params.size())] = std::string(type_name_tok.text());
+        size_t type_end = pos_;  // Record position after type parsing
+
+        // If the type couldn't be resolved (null), or is a compound type that
+        // might have unresolved inner types, record the full type text for
+        // later resolution by the semantic analyzer.
+        bool needs_annotation = param.type.isNull();
+        // Also check if the type is a compound type with null inner parts
+        if (!needs_annotation && param.type) {
+            // Walk the type tree to check for null inner types
+            TypeId check_type = param.type;
+            while (check_type) {
+                if (isa<PointerType>(check_type)) {
+                    TypeId inner = cast<PointerType>(check_type).pointee();
+                    if (inner.isNull()) { needs_annotation = true; break; }
+                    check_type = inner;
+                } else if (isa<ReferenceType>(check_type)) {
+                    TypeId inner = cast<ReferenceType>(check_type).referent();
+                    if (inner.isNull()) { needs_annotation = true; break; }
+                    check_type = inner;
+                } else if (isa<MutReferenceType>(check_type)) {
+                    TypeId inner = cast<MutReferenceType>(check_type).referent();
+                    if (inner.isNull()) { needs_annotation = true; break; }
+                    check_type = inner;
+                } else if (isa<SliceType>(check_type)) {
+                    TypeId inner = cast<SliceType>(check_type).element();
+                    if (inner.isNull()) { needs_annotation = true; break; }
+                    check_type = inner;
+                } else if (isa<SmartPointerType>(check_type)) {
+                    TypeId inner = cast<SmartPointerType>(check_type).pointee();
+                    if (inner.isNull()) { needs_annotation = true; break; }
+                    check_type = inner;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if (needs_annotation) {
+            // Reconstruct the full type text from the tokens consumed
+            std::string full_type_text;
+            for (size_t i = type_start; i < type_end; ++i) {
+                if (i > type_start) full_type_text += " ";
+                full_type_text += std::string(tokens_[i].text());
+            }
+            // Store the unresolved type name on the param itself
+            param.unresolved_type_name = full_type_text;
+            // Also store via the old annotation mechanism for backward compat
+            if (type_name_tok.kind() == TokenKind::IDENTIFIER && param.type.isNull()) {
+                param_type_annotations_["__pending__" + std::to_string(params.size())] = std::string(type_name_tok.text());
+            }
+            // For compound types, store the full type text
+            if (!full_type_text.empty()) {
+                param_type_annotations_["__pending__" + std::to_string(params.size()) + "_full"] = full_type_text;
+            }
         }
 
         params.push_back(std::move(param));
@@ -1792,6 +1988,37 @@ std::vector<std::unique_ptr<Expr>> Parser::parseCallArgs() {
 void Parser::recordTypeAnnotation(const ASTNode* node,
                                   const std::string& type_text) {
     type_annotations_[node] = type_text;
+}
+
+bool Parser::hasNullInnerTypeHelper(TypeId type) const {
+    if (type.isNull()) return true;
+    TypeId check = type;
+    while (check) {
+        if (isa<PointerType>(check)) {
+            TypeId inner = cast<PointerType>(check).pointee();
+            if (inner.isNull()) return true;
+            check = inner;
+        } else if (isa<ReferenceType>(check)) {
+            TypeId inner = cast<ReferenceType>(check).referent();
+            if (inner.isNull()) return true;
+            check = inner;
+        } else if (isa<MutReferenceType>(check)) {
+            TypeId inner = cast<MutReferenceType>(check).referent();
+            if (inner.isNull()) return true;
+            check = inner;
+        } else if (isa<SliceType>(check)) {
+            TypeId inner = cast<SliceType>(check).element();
+            if (inner.isNull()) return true;
+            check = inner;
+        } else if (isa<SmartPointerType>(check)) {
+            TypeId inner = cast<SmartPointerType>(check).pointee();
+            if (inner.isNull()) return true;
+            check = inner;
+        } else {
+            break;
+        }
+    }
+    return false;
 }
 
 BinaryOp Parser::tokenToBinaryOp(TokenKind kind) const {
@@ -1864,12 +2091,11 @@ std::unique_ptr<Stmt> Parser::parseSwitchStmt() {
         } else {
             arm.pattern = parseExpr();
         }
-        consume(TokenKind::ARROW, "expected '=>' in switch arm");
+        consume(TokenKind::ARROW, "expected '->' in switch arm");
         arm.body = parseBlockStmt();
         arms.push_back(std::move(arm));
-        if (!match(TokenKind::COMMA)) {
-            break;
-        }
+        // Commas between switch arms are optional
+        match(TokenKind::COMMA);
     }
 
     consume(TokenKind::RBRACE, "expected '}' after switch arms");

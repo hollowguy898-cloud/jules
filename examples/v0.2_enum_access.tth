@@ -1,0 +1,11 @@
+// Test enum variant access
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+fn main() void {
+    val c: Color = Color.Red;
+}

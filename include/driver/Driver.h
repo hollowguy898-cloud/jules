@@ -154,7 +154,7 @@ private:
     bool sema_had_errors_ = false;
     bool borrowck_had_errors_ = false;
     std::vector<ParseError> parse_errors_;
-    std::vector<Diagnostic> sema_diagnostics_;
+    std::vector<SemaDiagnostic> sema_diagnostics_;
     std::vector<BorrowError> borrowck_errors_;
 };
 

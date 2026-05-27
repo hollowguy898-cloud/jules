@@ -1386,6 +1386,7 @@ public:
 
     const std::string& name() const { return name_; }
     const std::vector<FnParam>& params() const { return params_; }
+    std::vector<FnParam>& params() { return params_; }
     void setParamType(size_t index, TypeId type) {
         if (index < params_.size()) params_[index].type = type;
     }
@@ -1422,6 +1423,10 @@ public:
     static bool classof(const ASTNode* n) {
         return n->getKind() == NodeKind::FnDecl;
     }
+
+    // Unresolved return type name (for forward references)
+    std::string unresolved_return_type_name;
+    void setReturnType(TypeId type) { return_type_ = type; }
 
     void accept(ASTVisitor& visitor) override;
     void accept(ConstASTVisitor& visitor) const override;

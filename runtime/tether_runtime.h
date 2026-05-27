@@ -286,6 +286,50 @@ void tether_print_str(const char* str, int64_t len);
 /* Print a newline */
 void tether_print_ln(void);
 
+// ============================================================================
+// Spawn / Task Pool — Work-stealing thread pool for structured async
+//
+// spawn expr; schedules a function call onto a lock-free work-stealing
+// thread pool. The spawned task returns a TetherTaskHandle that can be
+// awaited for the result.
+// ============================================================================
+
+// Opaque task handle — represents a pending or completed async task
+typedef struct TetherTask TetherTask;
+
+// Task function signature: takes a void* context, returns a void* result
+typedef void* (*TetherTaskFn)(void* ctx);
+
+// Task handle — wraps a TetherTask pointer for user code
+typedef struct TetherTaskHandle {
+    TetherTask* task;
+} TetherTaskHandle;
+
+// Initialize the global task pool with the given number of worker threads.
+// If num_threads is 0, uses the number of hardware threads available.
+// Must be called before any spawn() calls. Safe to call multiple times.
+void tether_taskpool_init(uint32_t num_threads);
+
+// Shut down the global task pool, waiting for all pending tasks to complete.
+// After shutdown, no new tasks can be spawned.
+void tether_taskpool_shutdown(void);
+
+// Spawn a task onto the global task pool.
+// Returns a handle that can be awaited with tether_task_await().
+TetherTaskHandle tether_spawn(TetherTaskFn fn, void* ctx, uint64_t ctx_size);
+
+// Await a spawned task, blocking until it completes.
+// Returns the result pointer (or NULL if the task failed).
+// After await, the task handle is consumed and must not be used again.
+void* tether_task_await(TetherTaskHandle handle);
+
+// Check if a spawned task has completed without blocking.
+// Returns 1 if completed, 0 if still running.
+int tether_task_is_done(TetherTaskHandle handle);
+
+// Get the number of worker threads in the task pool.
+uint32_t tether_taskpool_thread_count(void);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

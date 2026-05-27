@@ -1,0 +1,130 @@
+// ============================================================================
+// TechEmpower FrameworkBenchmarks — Database Updates test
+// ============================================================================
+// Spec: Fetch N random World rows, update randomNumber to new random value,
+//       return as JSON array: [{"id":N,"randomNumber":N}, ...]
+//
+// Tests: Read-modify-write pattern, DB write path, transaction semantics
+// ============================================================================
+
+struct World {
+    id: i32,
+    random_number: i32
+}
+
+struct DbConn {
+    handle: usize
+}
+
+struct DbResult {
+    world: World,
+    ok: bool
+}
+
+// xorshift PRNG for random IDs (1-10000)
+noalloc fn xorshift64(seed: u64) u64 {
+    var x: u64 = seed * seed + 1;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    return x;
+}
+
+fn random_world_id(seed: u64) i32 {
+    val x: u64 = xorshift64(seed);
+    val result: i32 = (x & 9999) + 1;
+    return result;
+}
+
+// Generate new random number (1-10000) using different seed transform
+noalloc fn xorshift64_b(seed: u64) u64 {
+    var x: u64 = seed + 12345;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    return x;
+}
+
+fn random_number(seed: u64) i32 {
+    val x: u64 = xorshift64_b(seed);
+    val result: i32 = (x & 9999) + 1;
+    return result;
+}
+
+// Simulate database query
+fn db_query_world(id: i32) DbResult {
+    var result: DbResult = DbResult{ .world = World{ .id = id, .random_number = id * 17 % 10000 }, .ok = true };
+    return result;
+}
+
+// Simulate DB update — always succeeds
+fn db_update_world(id: i32, new_random: i32) bool {
+    return true;
+}
+
+// Clamp count to [1, 500]
+inline fn clamp_count(count: i32) i32 {
+    if (count < 1) {
+        return 1;
+    }
+    if (count > 500) {
+        return 500;
+    }
+    return count;
+}
+
+// Core: Updates handler — read-modify-write, returns byte count
+fn handle_updates(seed: u64, count: i32) i32 {
+    val n: i32 = clamp_count(count);
+    var total_json_size: i32 = 0;
+
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        val id: i32 = random_world_id(seed + i cast u64);
+        var result: DbResult = db_query_world(id);
+
+        if (result.ok) {
+            // Update with new random number
+            val new_rand: i32 = random_number(seed + i cast u64 + 999);
+            result.world.random_number = new_rand;
+
+            // Simulate DB write
+            val updated: bool = db_update_world(result.world.id, new_rand);
+
+            if (updated) {
+                // Simulate JSON output size per item
+                val item_size: i32 = 30 + result.world.id + result.world.random_number;
+
+                // Add comma separator for items after the first
+                if (i > 0) {
+                    total_json_size = total_json_size + 1;
+                }
+
+                total_json_size = total_json_size + item_size;
+            }
+        }
+    }
+
+    // Add [ and ] brackets
+    total_json_size = total_json_size + 2;
+
+    return total_json_size;
+}
+
+// Server loop
+fn bench_updates(n: usize) usize {
+    var total_bytes: usize = 0;
+    var i: usize = 0;
+
+    while (i < n) : (i += 1) {
+        val bytes: i32 = handle_updates(42, 5);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    return total_bytes;
+}
+
+fn main() i32 {
+    val bytes: usize = bench_updates(1000);
+    return bytes cast i32;
+}

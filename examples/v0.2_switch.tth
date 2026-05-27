@@ -1,0 +1,25 @@
+// Test switch keyword
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+fn color_code(c: Color) i32 {
+    switch (c) {
+        Color.Red -> {
+            return 1;
+        }
+        Color.Green -> {
+            return 2;
+        }
+        Color.Blue -> {
+            return 3;
+        }
+    }
+}
+
+fn main() void {
+    val code: i32 = color_code(Color.Red);
+}

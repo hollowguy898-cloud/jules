@@ -1,0 +1,14 @@
+// Test if-else on enum - does this work?
+
+enum Color {
+    Red,
+    Green
+}
+
+fn test(c: Color) i32 {
+    if (c == Color.Red) {
+        return 1;
+    } else {
+        return 2;
+    }
+}

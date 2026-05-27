@@ -14,6 +14,7 @@ SemanticAnalyzer::SemanticAnalyzer(TypeTable& type_table)
     , current_fn_(nullptr)
     , in_pure_fn_(false)
     , error_prop_depth_(0)
+    , in_noalloc_fn_(false)
 {}
 
 // ============================================================================
@@ -50,6 +51,12 @@ void SemanticAnalyzer::analyze(
             case NodeKind::ImportDecl:
                 analyzeImportDecl(static_cast<ImportDecl&>(*decl));
                 break;
+            case NodeKind::TraitDecl:
+                analyzeTraitDecl(static_cast<TraitDecl&>(*decl));
+                break;
+            case NodeKind::ImplDecl:
+                analyzeImplDecl(static_cast<ImplDecl&>(*decl));
+                break;
             default:
                 break;
         }
@@ -60,15 +67,15 @@ void SemanticAnalyzer::analyze(
 // Diagnostic helpers
 // ============================================================================
 void SemanticAnalyzer::emitError(const SourceLocation& loc, const std::string& msg) {
-    diagnostics_.emplace_back(DiagnosticKind::Error, loc, msg);
+    diagnostics_.emplace_back(SemaDiagnosticKind::Error, loc, msg);
 }
 
 void SemanticAnalyzer::emitWarning(const SourceLocation& loc, const std::string& msg) {
-    diagnostics_.emplace_back(DiagnosticKind::Warning, loc, msg);
+    diagnostics_.emplace_back(SemaDiagnosticKind::Warning, loc, msg);
 }
 
 void SemanticAnalyzer::emitNote(const SourceLocation& loc, const std::string& msg) {
-    diagnostics_.emplace_back(DiagnosticKind::Note, loc, msg);
+    diagnostics_.emplace_back(SemaDiagnosticKind::Note, loc, msg);
 }
 
 bool SemanticAnalyzer::hasErrors() const {
@@ -135,37 +142,200 @@ void SemanticAnalyzer::resolveTypeAnnotations(
 }
 
 TypeId SemanticAnalyzer::resolveTypeName(const std::string& name, const SourceLocation& /*loc*/) {
+    // Trim whitespace from the name (token reconstruction may add spaces)
+    std::string trimmed = name;
+    while (!trimmed.empty() && trimmed.front() == ' ')
+        trimmed = trimmed.substr(1);
+    while (!trimmed.empty() && trimmed.back() == ' ')
+        trimmed = trimmed.substr(0, trimmed.size() - 1);
+
     // Check primitives first
-    if (name == "u8")    return type_table_.getU8();
-    if (name == "u16")   return type_table_.getU16();
-    if (name == "u32")   return type_table_.getU32();
-    if (name == "u64")   return type_table_.getU64();
-    if (name == "usize") return type_table_.getUSize();
-    if (name == "i8")    return type_table_.getI8();
-    if (name == "i16")   return type_table_.getI16();
-    if (name == "i32")   return type_table_.getI32();
-    if (name == "i64")   return type_table_.getI64();
-    if (name == "isize") return type_table_.getISize();
-    if (name == "f32")   return type_table_.getF32();
-    if (name == "f64")   return type_table_.getF64();
-    if (name == "bool")  return type_table_.getBool();
-    if (name == "void")  return type_table_.getVoid();
+    if (trimmed == "u8")    return type_table_.getU8();
+    if (trimmed == "u16")   return type_table_.getU16();
+    if (trimmed == "u32")   return type_table_.getU32();
+    if (trimmed == "u64")   return type_table_.getU64();
+    if (trimmed == "usize") return type_table_.getUSize();
+    if (trimmed == "i8")    return type_table_.getI8();
+    if (trimmed == "i16")   return type_table_.getI16();
+    if (trimmed == "i32")   return type_table_.getI32();
+    if (trimmed == "i64")   return type_table_.getI64();
+    if (trimmed == "isize") return type_table_.getISize();
+    if (trimmed == "f32")   return type_table_.getF32();
+    if (trimmed == "f64")   return type_table_.getF64();
+    if (trimmed == "bool")  return type_table_.getBool();
+    if (trimmed == "void")  return type_table_.getVoid();
 
     // Check the type table for a canonical match
-    auto found = type_table_.lookup(name);
+    auto found = type_table_.lookup(trimmed);
     if (found) return *found;
 
     // Check the type table aliases (e.g., "Vec2" -> struct:Vec2{...})
-    auto alias = type_table_.lookupAlias(name);
+    auto alias = type_table_.lookupAlias(trimmed);
     if (alias) return *alias;
 
     // Check symbol table for struct/enum types
-    Symbol* sym = symtab_.lookupGlobal(name);
+    Symbol* sym = symtab_.lookupGlobal(trimmed);
     if (sym && sym->isTypeSymbol()) {
         return sym->type();
     }
 
     return TypeId(); // null = unresolved
+}
+
+// ============================================================================
+// reresolveType — recursively fix null inner types in compound types
+// ============================================================================
+bool SemanticAnalyzer::hasNullInnerType(TypeId type) const {
+    if (type.isNull()) return true;
+
+    if (isa<PointerType>(type)) {
+        return cast<PointerType>(type).pointee().isNull();
+    } else if (isa<ReferenceType>(type)) {
+        return cast<ReferenceType>(type).referent().isNull();
+    } else if (isa<MutReferenceType>(type)) {
+        return cast<MutReferenceType>(type).referent().isNull();
+    } else if (isa<SliceType>(type)) {
+        return cast<SliceType>(type).element().isNull();
+    } else if (isa<SmartPointerType>(type)) {
+        return cast<SmartPointerType>(type).pointee().isNull();
+    }
+    return false;
+}
+
+TypeId SemanticAnalyzer::reresolveType(TypeId type) {
+    if (type.isNull()) return type;
+    if (!hasNullInnerType(type)) return type;
+
+    if (isa<PointerType>(type)) {
+        TypeId inner = cast<PointerType>(type).pointee();
+        if (inner.isNull()) return type; // Can't resolve
+        TypeId resolved_inner = reresolveType(inner);
+        if (resolved_inner != inner) {
+            return type_table_.getPointer(resolved_inner);
+        }
+    } else if (isa<ReferenceType>(type)) {
+        TypeId inner = cast<ReferenceType>(type).referent();
+        if (inner.isNull()) return type; // Can't resolve
+        TypeId resolved_inner = reresolveType(inner);
+        if (resolved_inner != inner) {
+            return type_table_.getReference(resolved_inner);
+        }
+    } else if (isa<MutReferenceType>(type)) {
+        TypeId inner = cast<MutReferenceType>(type).referent();
+        if (inner.isNull()) {
+            // The inner type is null — we can't re-resolve without knowing
+            // the name. This type was created by the parser before the struct
+            // was registered. We need to return it as-is and handle null
+            // gracefully in analyzeMemberExpr.
+            return type;
+        }
+        TypeId resolved_inner = reresolveType(inner);
+        if (resolved_inner != inner) {
+            return type_table_.getMutReference(resolved_inner);
+        }
+    } else if (isa<SliceType>(type)) {
+        TypeId inner = cast<SliceType>(type).element();
+        if (inner.isNull()) return type;
+        TypeId resolved_inner = reresolveType(inner);
+        if (resolved_inner != inner) {
+            return type_table_.getSlice(resolved_inner);
+        }
+    } else if (isa<SmartPointerType>(type)) {
+        TypeId inner = cast<SmartPointerType>(type).pointee();
+        if (inner.isNull()) return type;
+        TypeId resolved_inner = reresolveType(inner);
+        if (resolved_inner != inner) {
+            auto kind = cast<SmartPointerType>(type).smartPointerKind();
+            return type_table_.getSmartPointer(resolved_inner, kind);
+        }
+    }
+    return type;
+}
+
+// ============================================================================
+// resolveCompoundTypeName — parse and resolve compound type strings
+// ============================================================================
+TypeId SemanticAnalyzer::resolveCompoundTypeName(const std::string& name, const SourceLocation& loc) {
+    // Handle pointer types: *T or * T
+    if (name.size() > 1 && name[0] == '*') {
+        std::string inner_name = name.substr(1);
+        // Trim leading whitespace
+        while (!inner_name.empty() && inner_name[0] == ' ') {
+            inner_name = inner_name.substr(1);
+        }
+        TypeId inner = resolveCompoundTypeName(inner_name, loc);
+        if (!inner.isNull()) {
+            return type_table_.getPointer(inner);
+        }
+        return TypeId();
+    }
+
+    // Handle mutable reference types: &mut T or & mut T
+    if (name.size() > 1 && name[0] == '&') {
+        size_t pos = 1;
+        // Skip whitespace after &
+        while (pos < name.size() && name[pos] == ' ') pos++;
+        // Check for "mut"
+        if (pos + 3 <= name.size() && name.substr(pos, 3) == "mut") {
+            pos += 3;
+            // Skip whitespace after mut
+            while (pos < name.size() && name[pos] == ' ') pos++;
+            std::string inner_name = name.substr(pos);
+            TypeId inner = resolveCompoundTypeName(inner_name, loc);
+            if (!inner.isNull()) {
+                return type_table_.getMutReference(inner);
+            }
+            return TypeId();
+        }
+        // Just &T (immutable reference)
+        std::string inner_name = name.substr(pos);
+        TypeId inner = resolveCompoundTypeName(inner_name, loc);
+        if (!inner.isNull()) {
+            return type_table_.getReference(inner);
+        }
+        return TypeId();
+    }
+
+    // Handle slice types: []T or [ ] T
+    if (name.size() > 1 && name[0] == '[') {
+        size_t pos = 1;
+        // Skip whitespace
+        while (pos < name.size() && name[pos] == ' ') pos++;
+        if (pos < name.size() && name[pos] == ']') {
+            pos++;
+            // Skip whitespace
+            while (pos < name.size() && name[pos] == ' ') pos++;
+            std::string inner_name = name.substr(pos);
+            TypeId inner = resolveCompoundTypeName(inner_name, loc);
+            if (!inner.isNull()) {
+                return type_table_.getSlice(inner);
+            }
+            return TypeId();
+        }
+    }
+
+    // Handle array types: [T; N] or [ T ; N ] — complex, try to parse
+    if (name.size() > 1 && name[0] == '[') {
+        // Find the ; separator
+        size_t semicolon_pos = name.find(';');
+        if (semicolon_pos != std::string::npos) {
+            std::string element_type_str = name.substr(1, semicolon_pos - 1);
+            // Trim whitespace
+            while (!element_type_str.empty() && element_type_str.front() == ' ')
+                element_type_str = element_type_str.substr(1);
+            while (!element_type_str.empty() && element_type_str.back() == ' ')
+                element_type_str = element_type_str.substr(0, element_type_str.size() - 1);
+
+            TypeId element_type = resolveCompoundTypeName(element_type_str, loc);
+            if (!element_type.isNull()) {
+                // For now, return a slice type for arrays (arrays not fully supported)
+                return type_table_.getSlice(element_type);
+            }
+        }
+    }
+
+    // Fall through to simple name resolution
+    return resolveTypeName(name, loc);
 }
 
 // ============================================================================
@@ -214,21 +384,78 @@ void SemanticAnalyzer::registerTopLevelDecls(Program& program) {
                 std::vector<FnParam> params = fn.params();
                 // Resolve null parameter types using param_type_annotations_
                 for (size_t i = 0; i < params.size(); i++) {
+                    // Step 1: If type is completely null, try annotation resolution
                     if (params[i].type.isNull()) {
-                        std::string key = fn.name() + ":" + std::to_string(i);
-                        auto it = param_type_annotations_.find(key);
-                        if (it != param_type_annotations_.end()) {
-                            params[i].type = resolveTypeName(it->second, fn.sourceLoc());
+                        // Try compound type annotation first
+                        std::string full_key = fn.name() + ":" + std::to_string(i) + "_full";
+                        auto it_full = param_type_annotations_.find(full_key);
+                        if (it_full != param_type_annotations_.end()) {
+                            params[i].type = resolveCompoundTypeName(it_full->second, fn.sourceLoc());
+                        }
+                        // Fall back to simple annotation
+                        if (params[i].type.isNull()) {
+                            std::string key = fn.name() + ":" + std::to_string(i);
+                            auto it = param_type_annotations_.find(key);
+                            if (it != param_type_annotations_.end()) {
+                                params[i].type = resolveTypeName(it->second, fn.sourceLoc());
+                            }
+                        }
+                        // Also try the unresolved_type_name from the FnParam
+                        if (params[i].type.isNull() && !params[i].unresolved_type_name.empty()) {
+                            params[i].type = resolveCompoundTypeName(params[i].unresolved_type_name, fn.sourceLoc());
                         }
                         // If still null, use a placeholder that will be fixed later
                         if (params[i].type.isNull()) {
                             params[i].type = type_table_.getU8();
                         }
                     }
+                    // Step 2: If type is a compound type with null inner, re-resolve
+                    if (hasNullInnerType(params[i].type)) {
+                        // Try compound type annotation first
+                        std::string full_key = fn.name() + ":" + std::to_string(i) + "_full";
+                        auto it_full = param_type_annotations_.find(full_key);
+                        if (it_full != param_type_annotations_.end()) {
+                            TypeId resolved = resolveCompoundTypeName(it_full->second, fn.sourceLoc());
+                            if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+                                params[i].type = resolved;
+                            }
+                        }
+                        // Try unresolved_type_name from the FnParam
+                        if (hasNullInnerType(params[i].type) && !params[i].unresolved_type_name.empty()) {
+                            TypeId resolved = resolveCompoundTypeName(params[i].unresolved_type_name, fn.sourceLoc());
+                            if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+                                params[i].type = resolved;
+                            }
+                        }
+                        // Try re-resolving inner types
+                        if (hasNullInnerType(params[i].type)) {
+                            TypeId resolved = reresolveType(params[i].type);
+                            if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+                                params[i].type = resolved;
+                            }
+                        }
+                        // If still has null inner, use placeholder
+                        if (hasNullInnerType(params[i].type)) {
+                            params[i].type = type_table_.getU8();
+                        }
+                    }
                 }
                 TypeId ret_type = fn.returnType();
+                // Resolve null return type using stored annotation
                 if (ret_type.isNull()) {
-                    ret_type = type_table_.getVoid();
+                    if (!fn.unresolved_return_type_name.empty()) {
+                        ret_type = resolveCompoundTypeName(fn.unresolved_return_type_name, fn.sourceLoc());
+                    }
+                    if (ret_type.isNull()) {
+                        ret_type = type_table_.getVoid();
+                    }
+                }
+                // Also resolve compound return types with null inner
+                if (hasNullInnerType(ret_type) && !fn.unresolved_return_type_name.empty()) {
+                    TypeId resolved = resolveCompoundTypeName(fn.unresolved_return_type_name, fn.sourceLoc());
+                    if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+                        ret_type = resolved;
+                    }
                 }
                 bool is_pure = fn.isPure();
                 TypeId err_type = fn.errorType();
@@ -310,27 +537,81 @@ void SemanticAnalyzer::registerTopLevelDecls(Program& program) {
 void SemanticAnalyzer::analyzeFnDecl(FnDecl& fn) {
     FnDecl* prev_fn = current_fn_;
     bool prev_pure = in_pure_fn_;
+    bool prev_noalloc = in_noalloc_fn_;
     current_fn_ = &fn;
     in_pure_fn_ = fn.isPure();
+    in_noalloc_fn_ = fn.isNoalloc();
+
+    // Register noalloc functions for cross-function checking
+    if (fn.isNoalloc()) {
+        noalloc_functions_.insert(fn.name());
+    }
 
     // Push a function scope
     auto guard = symtab_.scopedScope(Scope::ScopeKind::Fn);
 
     // Resolve parameter types that may be unresolved
     for (size_t i = 0; i < fn.params().size(); i++) {
+        // Step 1: If type is completely null, try resolution
         if (fn.params()[i].type.isNull()) {
-            // Try the param_type_annotations_ from the parser
-            std::string key = fn.name() + ":" + std::to_string(i);
-            auto it = param_type_annotations_.find(key);
-            if (it != param_type_annotations_.end()) {
-                TypeId resolved = resolveTypeName(it->second, fn.sourceLoc());
+            // Try compound type annotation first
+            std::string full_key = fn.name() + ":" + std::to_string(i) + "_full";
+            auto it_full = param_type_annotations_.find(full_key);
+            if (it_full != param_type_annotations_.end()) {
+                TypeId resolved = resolveCompoundTypeName(it_full->second, fn.sourceLoc());
                 if (!resolved.isNull()) {
                     fn.setParamType(i, resolved);
-                } else {
-                    emitError(fn.sourceLoc(),
-                              "cannot resolve type for parameter '" + fn.params()[i].name + "'");
-                    fn.setParamType(i, type_table_.getU8());
                 }
+            }
+            // Fall back to simple annotation
+            if (fn.params()[i].type.isNull()) {
+                std::string key = fn.name() + ":" + std::to_string(i);
+                auto it = param_type_annotations_.find(key);
+                if (it != param_type_annotations_.end()) {
+                    TypeId resolved = resolveTypeName(it->second, fn.sourceLoc());
+                    if (!resolved.isNull()) {
+                        fn.setParamType(i, resolved);
+                    }
+                }
+            }
+            // Try unresolved_type_name from the FnParam
+            if (fn.params()[i].type.isNull() && !fn.params()[i].unresolved_type_name.empty()) {
+                TypeId resolved = resolveCompoundTypeName(fn.params()[i].unresolved_type_name, fn.sourceLoc());
+                if (!resolved.isNull()) {
+                    fn.setParamType(i, resolved);
+                }
+            }
+            // Last resort placeholder
+            if (fn.params()[i].type.isNull()) {
+                emitError(fn.sourceLoc(),
+                          "cannot resolve type for parameter '" + fn.params()[i].name + "'");
+                fn.setParamType(i, type_table_.getU8());
+            }
+        }
+        // Step 2: If type is a compound type with null inner, re-resolve
+        if (hasNullInnerType(fn.params()[i].type)) {
+            // Try compound type annotation
+            std::string full_key = fn.name() + ":" + std::to_string(i) + "_full";
+            auto it_full = param_type_annotations_.find(full_key);
+            if (it_full != param_type_annotations_.end()) {
+                TypeId resolved = resolveCompoundTypeName(it_full->second, fn.sourceLoc());
+                if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+                    fn.setParamType(i, resolved);
+                }
+            }
+            // Try unresolved_type_name
+            if (hasNullInnerType(fn.params()[i].type) && !fn.params()[i].unresolved_type_name.empty()) {
+                TypeId resolved = resolveCompoundTypeName(fn.params()[i].unresolved_type_name, fn.sourceLoc());
+                if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+                    fn.setParamType(i, resolved);
+                }
+            }
+            // Last resort: replace with placeholder to avoid crashes
+            if (hasNullInnerType(fn.params()[i].type)) {
+                emitError(fn.sourceLoc(),
+                          "cannot fully resolve compound type for parameter '" +
+                          fn.params()[i].name + "'");
+                fn.setParamType(i, type_table_.getU8());
             }
         }
     }
@@ -345,6 +626,22 @@ void SemanticAnalyzer::analyzeFnDecl(FnDecl& fn) {
         }
     }
 
+    // Resolve return type if needed
+    if (fn.returnType().isNull() && !fn.unresolved_return_type_name.empty()) {
+        TypeId resolved = resolveCompoundTypeName(fn.unresolved_return_type_name, fn.sourceLoc());
+        if (!resolved.isNull()) {
+            fn.setReturnType(resolved);
+        } else {
+            fn.setReturnType(type_table_.getVoid());
+        }
+    }
+    if (hasNullInnerType(fn.returnType()) && !fn.unresolved_return_type_name.empty()) {
+        TypeId resolved = resolveCompoundTypeName(fn.unresolved_return_type_name, fn.sourceLoc());
+        if (!resolved.isNull() && !hasNullInnerType(resolved)) {
+            fn.setReturnType(resolved);
+        }
+    }
+
     // Analyze the function body
     if (fn.body()) {
         analyzeBlockStmt(*fn.body());
@@ -356,6 +653,7 @@ void SemanticAnalyzer::analyzeFnDecl(FnDecl& fn) {
 
     current_fn_ = prev_fn;
     in_pure_fn_ = prev_pure;
+    in_noalloc_fn_ = prev_noalloc;
 }
 
 void SemanticAnalyzer::analyzeStructDecl(StructDecl& sd) {
@@ -434,6 +732,12 @@ void SemanticAnalyzer::analyzeStmt(Stmt& stmt) {
             break;
         case NodeKind::YieldStmt:
             analyzeYieldStmt(static_cast<YieldStmt&>(stmt));
+            break;
+        case NodeKind::SwitchStmt:
+            analyzeSwitchStmt(static_cast<SwitchStmt&>(stmt));
+            break;
+        case NodeKind::SpawnStmt:
+            analyzeSpawnStmt(static_cast<SpawnStmt&>(stmt));
             break;
         default:
             emitError(stmt.sourceLoc(), "unknown statement kind");
@@ -560,8 +864,14 @@ void SemanticAnalyzer::analyzeAssignStmt(AssignStmt& as) {
     if (lval_name) {
         Symbol* sym = symtab_.lookup(*lval_name);
         if (sym && !sym->isAssignable()) {
-            emitError(as.sourceLoc(),
-                      "cannot assign to immutable variable '" + *lval_name + "'");
+            // Special case: if the variable has type &mut T, we can assign through it
+            // (e.g., buf.len = 0 where buf: &mut JsonBuffer)
+            TypeId sym_type = sym->type();
+            bool is_mut_ref = !sym_type.isNull() && isa<MutReferenceType>(sym_type);
+            if (!is_mut_ref) {
+                emitError(as.sourceLoc(),
+                          "cannot assign to immutable variable '" + *lval_name + "'");
+            }
         }
 
         // Pure function check: no mutation allowed
@@ -711,6 +1021,10 @@ TypeId SemanticAnalyzer::analyzeExpr(Expr& expr) {
             return analyzePoisonExpr(static_cast<PoisonExpr&>(expr));
         case NodeKind::TryExpr:
             return analyzeTryExpr(static_cast<TryExpr&>(expr));
+        case NodeKind::ComptimeExpr:
+            return analyzeComptimeExpr(static_cast<ComptimeExpr&>(expr));
+        case NodeKind::ReduceExpr:
+            return analyzeReduceExpr(static_cast<ReduceExpr&>(expr));
         default:
             emitError(expr.sourceLoc(), "unknown expression kind");
             return type_table_.getPoison();
@@ -1012,6 +1326,24 @@ TypeId SemanticAnalyzer::analyzeCallExpr(CallExpr& ce) {
         return result;
     }
 
+    // Noalloc function check: calling a function that may allocate is forbidden
+    // inside a noalloc function (unless the callee is also noalloc or pure)
+    if (in_noalloc_fn_ && isa<IdentExpr>(ce.callee())) {
+        auto& callee_ident = cast<IdentExpr>(*ce.callee());
+        const std::string& callee_name = callee_ident.name();
+        bool callee_is_noalloc = noalloc_functions_.count(callee_name) > 0;
+        bool callee_is_pure = pure_functions_.count(callee_name) > 0;
+        // Runtime functions (tether_print_*, tether_box_new, etc.) always allocate or
+        // call into libc which may allocate. Warn if the callee is not explicitly safe.
+        if (!callee_is_noalloc && !callee_is_pure) {
+            // Emit a warning rather than an error for now — full noalloc
+            // verification requires interprocedural escape analysis
+            emitWarning(ce.sourceLoc(),
+                        "calling non-noalloc function '" + callee_name +
+                        "' inside noalloc function — may allocate on the heap");
+        }
+    }
+
     if (callee_type.isNull()) {
         ce.setType(TypeId());
         return TypeId();
@@ -1103,6 +1435,30 @@ TypeId SemanticAnalyzer::analyzeMemberExpr(MemberExpr& me) {
         base_type = cast<ReferenceType>(base_type).referent();
     } else if (isa<MutReferenceType>(base_type)) {
         base_type = cast<MutReferenceType>(base_type).referent();
+    }
+
+    // Null check after dereferencing (compound type with unresolved inner)
+    if (base_type.isNull()) {
+        emitError(me.sourceLoc(),
+                  "member access on unresolved type (inner type of pointer/reference is null)");
+        me.setType(type_table_.getPoison());
+        return type_table_.getPoison();
+    }
+
+    // --- Enum variant access: EnumType.VariantName ---
+    if (isa<EnumType>(base_type)) {
+        auto& enum_type = cast<EnumType>(base_type);
+        const EnumVariant* variant = enum_type.findVariant(me.field());
+        if (!variant) {
+            emitError(me.sourceLoc(),
+                      "enum '" + enum_type.name() + "' has no variant '" +
+                      me.field() + "'");
+            me.setType(type_table_.getPoison());
+            return type_table_.getPoison();
+        }
+        // Enum variant expressions have the enum type itself
+        me.setType(base_type);
+        return base_type;
     }
 
     // Look up the field in the struct type
@@ -1753,6 +2109,262 @@ void SemanticAnalyzer::analyzeYieldStmt(YieldStmt& ys) {
         // yield can only be used in functions with appropriate return context
         (void)val_type; // Type checking happens at a higher level
     }
+}
+
+// ============================================================================
+// Switch statement analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeSwitchStmt(SwitchStmt& ss) {
+    // Analyze the subject expression
+    TypeId subject_type = analyzeExpr(*ss.subject());
+
+    if (isPoisonType(subject_type)) {
+        // Propagate poison through all arms
+        for (auto& arm : ss.arms()) {
+            if (arm.body) analyzeBlockStmt(*arm.body);
+        }
+        return;
+    }
+
+    // The subject must be of enum type, integer type, or bool for exhaustive matching
+    if (!subject_type.isNull() &&
+        !subject_type->isInteger() && !subject_type->isBool() &&
+        !isa<EnumType>(subject_type)) {
+        emitError(ss.sourceLoc(),
+                  "switch subject must be an integer, bool, or enum type, got '" +
+                  subject_type->toString() + "'");
+    }
+
+    // Track which enum variants are covered (for exhaustive checking)
+    std::unordered_set<std::string> covered_variants;
+    bool has_wildcard = false;
+
+    // Analyze each arm
+    for (auto& arm : ss.arms()) {
+        if (arm.pattern) {
+            TypeId pattern_type = analyzeExpr(*arm.pattern);
+            if (!isPoisonType(pattern_type) && !subject_type.isNull() && !pattern_type.isNull()) {
+                if (!typesCompatible(subject_type, pattern_type)) {
+                    emitError(arm.pattern->sourceLoc(),
+                              "switch arm pattern type '" + pattern_type->toString() +
+                              "' does not match subject type '" + subject_type->toString() + "'");
+                }
+            }
+
+            // Track enum variant coverage
+            if (auto* member = dyn_cast<MemberExpr>(arm.pattern.get())) {
+                // Color.Red — track "Red" as the covered variant
+                covered_variants.insert(member->field());
+            } else if (auto* ident = dyn_cast<IdentExpr>(arm.pattern.get())) {
+                covered_variants.insert(ident->name());
+                // Check for wildcard pattern (underscore or catch-all)
+                if (ident->name() == "_" || ident->name() == "else") {
+                    has_wildcard = true;
+                }
+            }
+        }
+
+        if (arm.body) {
+            auto guard = symtab_.scopedScope(Scope::ScopeKind::Block);
+            analyzeBlockStmt(*arm.body);
+        }
+    }
+
+    // Exhaustive checking: if the subject is an enum, verify all variants are covered
+    if (!subject_type.isNull() && isa<EnumType>(subject_type) && !has_wildcard) {
+        auto& enum_type = cast<EnumType>(subject_type);
+        for (const auto& variant : enum_type.variants()) {
+            if (covered_variants.find(variant.name) == covered_variants.end()) {
+                emitWarning(ss.sourceLoc(),
+                            "switch does not cover enum variant '" + variant.name +
+                            "' of enum '" + enum_type.name() + "'");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Spawn statement analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeSpawnStmt(SpawnStmt& ss) {
+    // Analyze the task expression (must be a function call)
+    TypeId task_type = analyzeExpr(*ss.task());
+
+    if (isPoisonType(task_type)) return;
+
+    // Noalloc function check: spawn allocates a task context on the heap,
+    // so it's forbidden inside noalloc functions
+    if (in_noalloc_fn_) {
+        emitError(ss.sourceLoc(),
+                  "cannot spawn task inside noalloc function: spawn requires heap allocation for task context");
+    }
+
+    // The task expression should be a call expression
+    if (!isa<CallExpr>(ss.task())) {
+        emitWarning(ss.sourceLoc(),
+                    "spawn expects a function call expression, got '" +
+                    (task_type.isNull() ? std::string("<null>") : task_type->toString()) + "'");
+    }
+}
+
+// ============================================================================
+// Trait declaration analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeTraitDecl(TraitDecl& td) {
+    // Register the trait name in the symbol table as a type alias
+    // Traits are compile-time constructs — they define method signatures
+    // that implementing types must satisfy.
+
+    // Build a placeholder struct type for the trait (no fields, just method signatures)
+    TypeId trait_type = type_table_.getStruct(td.name(), {});
+    type_table_.registerAlias(td.name(), trait_type);
+    symtab_.declareStruct(td.name(), trait_type, td.sourceLoc());
+
+    // Verify all method signatures have valid types
+    for (const auto& method : td.methods()) {
+        for (const auto& param : method.params) {
+            if (param.type.isNull()) {
+                emitError(method.loc,
+                          "unresolved type for parameter '" + param.name +
+                          "' in trait method '" + method.name + "'");
+            }
+        }
+        if (method.return_type.isNull()) {
+            emitError(method.loc,
+                      "unresolved return type for trait method '" + method.name + "'");
+        }
+    }
+}
+
+// ============================================================================
+// Impl declaration analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeImplDecl(ImplDecl& id) {
+    // Verify that the struct being implemented exists
+    Symbol* struct_sym = symtab_.lookupGlobal(id.structName());
+    if (!struct_sym) {
+        emitError(id.sourceLoc(),
+                  "impl for unknown struct '" + id.structName() + "'");
+    }
+
+    // If a trait is specified, verify it exists
+    if (!id.traitName().empty()) {
+        Symbol* trait_sym = symtab_.lookupGlobal(id.traitName());
+        if (!trait_sym) {
+            emitError(id.sourceLoc(),
+                      "impl of unknown trait '" + id.traitName() + "'");
+        }
+    }
+
+    // Analyze each method body in the impl block
+    for (auto& method : id.methods()) {
+        if (method) {
+            analyzeFnDecl(*method);
+        }
+    }
+}
+
+// ============================================================================
+// Comptime expression analysis
+// ============================================================================
+TypeId SemanticAnalyzer::analyzeComptimeExpr(ComptimeExpr& ce) {
+    // Analyze the inner expression to determine its type
+    TypeId inner_type = analyzeExpr(*ce.inner());
+
+    if (isPoisonType(inner_type)) {
+        ce.setType(type_table_.getPoison());
+        return type_table_.getPoison();
+    }
+
+    // comptime expressions have the same type as their inner expression,
+    // but the compiler will verify that they can be evaluated at compile time.
+    // For now, we just propagate the type and defer full comptime evaluation
+    // to a future pass (the interpreter).
+    ce.setType(inner_type);
+
+    // Check that the inner expression is potentially evaluable at compile time:
+    // - Literals (int, float, bool, string) are always comptime
+    // - Calls to pure functions with comptime arguments are comptime
+    // - Arithmetic/comparison on comptime values is comptime
+    // - Runtime-dependent values (variables, I/O) are NOT comptime
+    if (auto* ident = dyn_cast<IdentExpr>(ce.inner())) {
+        // Identifiers are generally not comptime unless they're const values
+        // For now, emit a warning rather than an error (future: full const evaluation)
+        emitWarning(ce.sourceLoc(),
+                    "comptime expression references identifier '" + ident->name() +
+                    "' — full compile-time evaluation not yet implemented");
+    }
+
+    return inner_type;
+}
+
+// ============================================================================
+// Reduce expression analysis
+// ============================================================================
+TypeId SemanticAnalyzer::analyzeReduceExpr(ReduceExpr& re) {
+    // Analyze the iterable expression
+    TypeId iterable_type = analyzeExpr(*re.iterable());
+
+    if (isPoisonType(iterable_type)) {
+        re.setType(type_table_.getPoison());
+        return type_table_.getPoison();
+    }
+
+    // Analyze the axis expression if present
+    if (re.hasAxis()) {
+        TypeId axis_type = analyzeExpr(*re.axis());
+        if (!isPoisonType(axis_type) && !axis_type.isNull() && !axis_type->isInteger()) {
+            emitError(re.sourceLoc(),
+                      "reduce axis must be an integer, got '" + axis_type->toString() + "'");
+        }
+    }
+
+    // Determine the result type based on the reduction operation and iterable type
+    TypeId element_type = iterable_type;
+
+    // Unwrap slice/array types to get the element type
+    if (isa<SliceType>(iterable_type)) {
+        element_type = cast<SliceType>(iterable_type).element();
+    }
+
+    // For numeric reductions, the result type is the same as the element type
+    // For logical reductions (And, Or), the result type is bool
+    TypeId result_type;
+    switch (re.op()) {
+        case ReduceExpr::ReduceOp::Add:
+        case ReduceExpr::ReduceOp::Mul:
+        case ReduceExpr::ReduceOp::Max:
+        case ReduceExpr::ReduceOp::Min:
+            // Result type is the element type
+            if (!element_type.isNull() && !element_type->isNumeric()) {
+                emitError(re.sourceLoc(),
+                          "numeric reduce requires numeric element type, got '" +
+                          element_type->toString() + "'");
+            }
+            result_type = element_type;
+            break;
+        case ReduceExpr::ReduceOp::And:
+        case ReduceExpr::ReduceOp::Or:
+            // Logical reductions produce bool
+            result_type = type_table_.getBool();
+            break;
+        case ReduceExpr::ReduceOp::BitAnd:
+        case ReduceExpr::ReduceOp::BitOr:
+            // Bitwise reductions require integer elements
+            if (!element_type.isNull() && !element_type->isInteger()) {
+                emitError(re.sourceLoc(),
+                          "bitwise reduce requires integer element type, got '" +
+                          element_type->toString() + "'");
+            }
+            result_type = element_type;
+            break;
+        default:
+            result_type = element_type;
+            break;
+    }
+
+    re.setType(result_type);
+    return result_type;
 }
 
 } // namespace tether

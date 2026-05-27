@@ -1,0 +1,174 @@
+// ============================================================================
+// TechEmpower FrameworkBenchmarks — Fortunes test
+// ============================================================================
+// Spec: Fetch all Fortune rows from DB, add a new fortune,
+//       sort by message, render as HTML table using server-side templates.
+//
+// Tests: Sorting logic, comparison operations, dynamic content generation
+// Simplified: Since we can't use arrays, we use named variables for a small
+// fixed set of fortunes and test sorting with compare-and-swap operations.
+// ============================================================================
+
+struct Fortune {
+    id: i32,
+    sort_key: i32
+}
+
+struct DbConn {
+    handle: usize
+}
+
+// Compare two fortunes by sort_key (simulates lexicographic comparison on message)
+noalloc fn fortune_compare(a: Fortune, b: Fortune) i32 {
+    if (a.sort_key < b.sort_key) {
+        return -1;
+    }
+    if (a.sort_key > b.sort_key) {
+        return 1;
+    }
+    return 0;
+}
+
+// Simulate fetching fortune count from DB (typical TFB dataset: 12 fortunes)
+fn db_fortune_count() i32 {
+    return 12;
+}
+
+// Core: Fortunes handler — count fortunes, test sorting, return byte count
+fn handle_fortunes() i32 {
+    // Total fortune count (12 from DB + 1 additional)
+    val base_count: i32 = db_fortune_count();
+    val total_count: i32 = base_count + 1;
+
+    // Create 5 sample fortunes with different sort keys
+    // (In real benchmark, these would be sorted by message text;
+    //  here we use sort_key as a proxy for message ordering)
+    var f0: Fortune = Fortune{ .id = 1, .sort_key = 50 };
+    var f1: Fortune = Fortune{ .id = 2, .sort_key = 30 };
+    var f2: Fortune = Fortune{ .id = 3, .sort_key = 70 };
+    var f3: Fortune = Fortune{ .id = 9, .sort_key = 20 };
+    var f4: Fortune = Fortune{ .id = 13, .sort_key = 40 };
+
+    // Bubble sort: 4 passes of 4 compare-and-swap operations each
+    // This tests the sorting logic thoroughly
+
+    // Pass 1
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Pass 2
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Pass 3
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Pass 4
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // After sorting: f0.sort_key=20, f1.sort_key=30, f2.sort_key=40,
+    //                f3.sort_key=50, f4.sort_key=70
+    // Verify sort correctness with a checksum
+    val sort_checksum: i32 = f0.sort_key + f1.sort_key * 2 + f2.sort_key * 3 + f3.sort_key * 4 + f4.sort_key * 5;
+
+    // Simulate HTML output: base header/footer + per-fortune row bytes
+    // Each fortune row: <tr><td>NN</td><td>message</td></tr> ≈ 50 bytes
+    val header_size: i32 = 104;
+    val footer_size: i32 = 22;
+    val row_size: i32 = 50;
+    val html_size: i32 = header_size + total_count * row_size + footer_size + sort_checksum;
+
+    return html_size;
+}
+
+// Server loop
+fn bench_fortunes(n: usize) usize {
+    var total_bytes: usize = 0;
+    var i: usize = 0;
+
+    while (i < n) : (i += 1) {
+        val bytes: i32 = handle_fortunes();
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    return total_bytes;
+}
+
+fn main() i32 {
+    val bytes: usize = bench_fortunes(1000);
+    return bytes cast i32;
+}

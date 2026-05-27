@@ -1,0 +1,353 @@
+// ============================================================================
+// TechEmpower FrameworkBenchmarks — Full Database Suite (Combined)
+// ============================================================================
+// Tests all 4 DB benchmarks plus JSON serialization:
+//   1. Single Query
+//   2. Multiple Queries
+//   3. Updates
+//   4. Fortunes
+//   5. JSON serialization (non-DB baseline)
+//
+// Exercises v0.2 features: switch on enum, inline, noalloc, struct init,
+// postfix cast, while-with-increment, val/var declarations
+// ============================================================================
+
+// ---- Core domain types ----
+struct World {
+    id: i32,
+    random_number: i32
+}
+
+struct Fortune {
+    id: i32,
+    sort_key: i32
+}
+
+struct DbResult {
+    world: World,
+    ok: bool
+}
+
+// ---- Benchmark type as enum for switch test ----
+enum BenchmarkType {
+    SingleQuery,
+    MultipleQueries,
+    Updates,
+    Fortunes,
+    JsonSerialization
+}
+
+// ---- Inline helpers (performance-critical paths) ----
+inline fn clamp_i32(count: i32, lo: i32, hi: i32) i32 {
+    if (count < lo) {
+        return lo;
+    }
+    if (count > hi) {
+        return hi;
+    }
+    return count;
+}
+
+// ---- Noalloc helpers (HFT-critical paths) ----
+noalloc fn xorshift64(seed: u64) u64 {
+    var x: u64 = seed * seed + 1;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    return x;
+}
+
+noalloc fn random_world_id(seed: u64) i32 {
+    val x: u64 = xorshift64(seed);
+    val result: i32 = (x & 9999) + 1;
+    return result;
+}
+
+// Second PRNG for generating update values
+noalloc fn xorshift64_b(seed: u64) u64 {
+    var x: u64 = seed + 12345;
+    x = x ^ (x >> 12);
+    x = x ^ (x << 25);
+    x = x ^ (x >> 27);
+    return x;
+}
+
+noalloc fn random_number(seed: u64) i32 {
+    val x: u64 = xorshift64_b(seed);
+    val result: i32 = (x & 9999) + 1;
+    return result;
+}
+
+// ---- DB operations ----
+fn db_query_world(id: i32) DbResult {
+    var result: DbResult = DbResult{ .world = World{ .id = id, .random_number = id * 17 % 10000 }, .ok = true };
+    return result;
+}
+
+fn db_update_world(id: i32, new_random: i32) bool {
+    return true;
+}
+
+// ---- Fortune compare (noalloc for HFT path) ----
+noalloc fn fortune_compare(a: Fortune, b: Fortune) i32 {
+    if (a.sort_key < b.sort_key) {
+        return -1;
+    }
+    if (a.sort_key > b.sort_key) {
+        return 1;
+    }
+    return 0;
+}
+
+// ==== TEST 1: Single Query ====
+fn handle_single_query(seed: u64) i32 {
+    val id: i32 = random_world_id(seed);
+    val result: DbResult = db_query_world(id);
+
+    if (!result.ok) {
+        return 0;
+    }
+
+    val json_size: i32 = 30 + result.world.id + result.world.random_number;
+    return json_size;
+}
+
+// ==== TEST 2: Multiple Queries ====
+fn handle_multiple_queries(seed: u64, count: i32) i32 {
+    val n: i32 = clamp_i32(count, 1, 500);
+    var total_json_size: i32 = 0;
+
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        val id: i32 = random_world_id(seed + i cast u64);
+        val result: DbResult = db_query_world(id);
+
+        if (!result.ok) {
+            return 0;
+        }
+
+        val item_size: i32 = 30 + result.world.id + result.world.random_number;
+
+        if (i > 0) {
+            total_json_size = total_json_size + 1;
+        }
+
+        total_json_size = total_json_size + item_size;
+    }
+
+    total_json_size = total_json_size + 2;
+    return total_json_size;
+}
+
+// ==== TEST 3: Updates ====
+fn handle_updates(seed: u64, count: i32) i32 {
+    val n: i32 = clamp_i32(count, 1, 500);
+    var total_json_size: i32 = 0;
+
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        val id: i32 = random_world_id(seed + i cast u64);
+        var result: DbResult = db_query_world(id);
+
+        if (result.ok) {
+            val new_rand: i32 = random_number(seed + i cast u64 + 999);
+            result.world.random_number = new_rand;
+
+            val updated: bool = db_update_world(result.world.id, new_rand);
+
+            if (updated) {
+                val item_size: i32 = 30 + result.world.id + result.world.random_number;
+
+                if (i > 0) {
+                    total_json_size = total_json_size + 1;
+                }
+
+                total_json_size = total_json_size + item_size;
+            }
+        }
+    }
+
+    total_json_size = total_json_size + 2;
+    return total_json_size;
+}
+
+// ==== TEST 4: Fortunes ====
+fn handle_fortunes() i32 {
+    val total_count: i32 = 13;
+
+    // Create 5 sample fortunes with different sort keys
+    var f0: Fortune = Fortune{ .id = 1, .sort_key = 50 };
+    var f1: Fortune = Fortune{ .id = 2, .sort_key = 30 };
+    var f2: Fortune = Fortune{ .id = 3, .sort_key = 70 };
+    var f3: Fortune = Fortune{ .id = 9, .sort_key = 20 };
+    var f4: Fortune = Fortune{ .id = 13, .sort_key = 40 };
+
+    // Bubble sort: 4 passes of 4 compare-and-swap operations
+    // Pass 1
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Pass 2
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Pass 3
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Pass 4
+    if (f0.sort_key > f1.sort_key) {
+        var tmp: Fortune = f0;
+        f0 = f1;
+        f1 = tmp;
+    }
+    if (f1.sort_key > f2.sort_key) {
+        var tmp: Fortune = f1;
+        f1 = f2;
+        f2 = tmp;
+    }
+    if (f2.sort_key > f3.sort_key) {
+        var tmp: Fortune = f2;
+        f2 = f3;
+        f3 = tmp;
+    }
+    if (f3.sort_key > f4.sort_key) {
+        var tmp: Fortune = f3;
+        f3 = f4;
+        f4 = tmp;
+    }
+
+    // Verify sort correctness with checksum
+    val sort_checksum: i32 = f0.sort_key + f1.sort_key * 2 + f2.sort_key * 3 + f3.sort_key * 4 + f4.sort_key * 5;
+
+    val header_size: i32 = 104;
+    val footer_size: i32 = 22;
+    val row_size: i32 = 50;
+    val html_size: i32 = header_size + total_count * row_size + footer_size + sort_checksum;
+
+    return html_size;
+}
+
+// ==== TEST 5: JSON Serialization (non-DB baseline) ====
+fn handle_json_serialization() i32 {
+    // {"message":"Hello, World!"} = 26 bytes
+    return 26;
+}
+
+// ==== Dispatcher using switch on enum ====
+fn handle_benchmark(btype: BenchmarkType, seed: u64) i32 {
+    switch (btype) {
+        BenchmarkType.SingleQuery -> {
+            return handle_single_query(seed);
+        }
+        BenchmarkType.MultipleQueries -> {
+            return handle_multiple_queries(seed, 5);
+        }
+        BenchmarkType.Updates -> {
+            return handle_updates(seed, 5);
+        }
+        BenchmarkType.Fortunes -> {
+            return handle_fortunes();
+        }
+        BenchmarkType.JsonSerialization -> {
+            return handle_json_serialization();
+        }
+    }
+}
+
+// ==== Main: Run full benchmark suite ====
+fn main() i32 {
+    val seed: u64 = 42;
+    var total_bytes: usize = 0;
+    var i: usize = 0;
+
+    // Single query bench
+    while (i < 100) : (i += 1) {
+        val bytes: i32 = handle_benchmark(BenchmarkType.SingleQuery, seed);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    // Multiple queries bench
+    i = 0;
+    while (i < 100) : (i += 1) {
+        val bytes: i32 = handle_benchmark(BenchmarkType.MultipleQueries, seed);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    // Updates bench
+    i = 0;
+    while (i < 100) : (i += 1) {
+        val bytes: i32 = handle_benchmark(BenchmarkType.Updates, seed);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    // Fortunes bench
+    i = 0;
+    while (i < 100) : (i += 1) {
+        val bytes: i32 = handle_benchmark(BenchmarkType.Fortunes, seed);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    // JSON serialization bench
+    i = 0;
+    while (i < 100) : (i += 1) {
+        val bytes: i32 = handle_benchmark(BenchmarkType.JsonSerialization, seed);
+        total_bytes = total_bytes + bytes cast usize;
+    }
+
+    return total_bytes cast i32;
+}

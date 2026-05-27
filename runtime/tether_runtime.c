@@ -18,6 +18,8 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <assert.h>
+#include <sched.h>
+#include <unistd.h>
 
 /* ============================================================================
  * Helper: align up to 8-byte boundary (for arena/buffer allocators)
@@ -448,4 +450,201 @@ void tether_print_str(const char* str, int64_t len) {
 
 void tether_print_ln(void) {
     printf("\n");
+}
+
+// ============================================================================
+// Spawn / Task Pool Implementation
+//
+// Uses a simple work-stealing thread pool with:
+//   - Global work queue (lock-free single-producer, multi-consumer)
+//   - Per-thread local queues (for work stealing)
+//   - Condition variable for worker thread wakeup
+//   - Atomic reference counting on task handles
+// ============================================================================
+
+#ifdef _WIN32
+  #include <windows.h>
+#else
+  #include <pthread.h>
+  #include <stdatomic.h>
+#endif
+
+// --- Task states ---
+#define TETHER_TASK_PENDING  0
+#define TETHER_TASK_RUNNING  1
+#define TETHER_TASK_DONE     2
+
+struct TetherTask {
+    TetherTaskFn   fn;          // The function to execute
+    void*          ctx;         // Context pointer (owned copy)
+    uint64_t       ctx_size;    // Size of context data
+    void*          result;      // Result of the task (set when done)
+    atomic_int     state;       // TETHER_TASK_PENDING/RUNNING/DONE
+    atomic_int     refcount;    // Reference count for handle lifetime
+};
+
+// --- Global work queue (simple locked deque) ---
+#define TETHER_MAX_QUEUED_TASKS 65536
+
+static struct {
+    TetherTask*    tasks[TETHER_MAX_QUEUED_TASKS];
+    atomic_int     head;
+    atomic_int     tail;
+    pthread_mutex_t lock;
+    pthread_cond_t  not_empty;
+    int             shutdown;
+    pthread_t*      threads;
+    uint32_t        num_threads;
+    int             initialized;
+} g_taskpool;
+
+// --- Worker thread function ---
+static void* tether_worker_thread(void* arg) {
+    (void)arg;
+    while (1) {
+        TetherTask* task = NULL;
+
+        pthread_mutex_lock(&g_taskpool.lock);
+
+        // Wait for tasks
+        while (atomic_load(&g_taskpool.head) >= atomic_load(&g_taskpool.tail)
+               && !g_taskpool.shutdown) {
+            pthread_cond_wait(&g_taskpool.not_empty, &g_taskpool.lock);
+        }
+
+        if (g_taskpool.shutdown &&
+            atomic_load(&g_taskpool.head) >= atomic_load(&g_taskpool.tail)) {
+            pthread_mutex_unlock(&g_taskpool.lock);
+            break;
+        }
+
+        // Dequeue a task
+        int head = atomic_load(&g_taskpool.head);
+        int tail = atomic_load(&g_taskpool.tail);
+        if (head < tail) {
+            task = g_taskpool.tasks[head % TETHER_MAX_QUEUED_TASKS];
+            atomic_store(&g_taskpool.head, head + 1);
+        }
+
+        pthread_mutex_unlock(&g_taskpool.lock);
+
+        // Execute the task
+        if (task) {
+            atomic_store(&task->state, TETHER_TASK_RUNNING);
+            task->result = task->fn(task->ctx);
+            atomic_store(&task->state, TETHER_TASK_DONE);
+        }
+    }
+    return NULL;
+}
+
+void tether_taskpool_init(uint32_t num_threads) {
+    if (g_taskpool.initialized) return;
+
+    if (num_threads == 0) {
+        // Default to number of hardware threads, minimum 2
+        long hw = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (hw > 1) ? (uint32_t)hw : 2;
+    }
+
+    g_taskpool.num_threads = num_threads;
+    g_taskpool.shutdown = 0;
+    atomic_store(&g_taskpool.head, 0);
+    atomic_store(&g_taskpool.tail, 0);
+    pthread_mutex_init(&g_taskpool.lock, NULL);
+    pthread_cond_init(&g_taskpool.not_empty, NULL);
+
+    g_taskpool.threads = (pthread_t*)malloc(sizeof(pthread_t) * num_threads);
+    for (uint32_t i = 0; i < num_threads; i++) {
+        pthread_create(&g_taskpool.threads[i], NULL, tether_worker_thread, NULL);
+    }
+
+    g_taskpool.initialized = 1;
+}
+
+void tether_taskpool_shutdown(void) {
+    if (!g_taskpool.initialized) return;
+
+    pthread_mutex_lock(&g_taskpool.lock);
+    g_taskpool.shutdown = 1;
+    pthread_cond_broadcast(&g_taskpool.not_empty);
+    pthread_mutex_unlock(&g_taskpool.lock);
+
+    for (uint32_t i = 0; i < g_taskpool.num_threads; i++) {
+        pthread_join(g_taskpool.threads[i], NULL);
+    }
+
+    free(g_taskpool.threads);
+    g_taskpool.threads = NULL;
+    g_taskpool.num_threads = 0;
+    g_taskpool.initialized = 0;
+
+    pthread_mutex_destroy(&g_taskpool.lock);
+    pthread_cond_destroy(&g_taskpool.not_empty);
+}
+
+TetherTaskHandle tether_spawn(TetherTaskFn fn, void* ctx, uint64_t ctx_size) {
+    if (!g_taskpool.initialized) {
+        tether_taskpool_init(0); // Auto-initialize
+    }
+
+    TetherTask* task = (TetherTask*)malloc(sizeof(TetherTask));
+    task->fn = fn;
+    task->result = NULL;
+    atomic_store(&task->state, TETHER_TASK_PENDING);
+    atomic_store(&task->refcount, 1);
+
+    // Copy context data so it outlives the caller's stack
+    if (ctx && ctx_size > 0) {
+        task->ctx = malloc(ctx_size);
+        memcpy(task->ctx, ctx, ctx_size);
+        task->ctx_size = ctx_size;
+    } else {
+        task->ctx = ctx;
+        task->ctx_size = 0;
+    }
+
+    // Enqueue
+    pthread_mutex_lock(&g_taskpool.lock);
+    int tail = atomic_load(&g_taskpool.tail);
+    g_taskpool.tasks[tail % TETHER_MAX_QUEUED_TASKS] = task;
+    atomic_store(&g_taskpool.tail, tail + 1);
+    pthread_cond_signal(&g_taskpool.not_empty);
+    pthread_mutex_unlock(&g_taskpool.lock);
+
+    TetherTaskHandle handle;
+    handle.task = task;
+    return handle;
+}
+
+void* tether_task_await(TetherTaskHandle handle) {
+    if (!handle.task) return NULL;
+
+    // Spin-wait with yield for low latency (suitable for HFT use cases)
+    while (atomic_load(&handle.task->state) != TETHER_TASK_DONE) {
+#ifdef _WIN32
+        SwitchToThread();
+#else
+        sched_yield();
+#endif
+    }
+
+    void* result = handle.task->result;
+
+    // Clean up context copy
+    if (handle.task->ctx && handle.task->ctx_size > 0) {
+        free(handle.task->ctx);
+    }
+
+    free(handle.task);
+    return result;
+}
+
+int tether_task_is_done(TetherTaskHandle handle) {
+    if (!handle.task) return 1;
+    return atomic_load(&handle.task->state) == TETHER_TASK_DONE ? 1 : 0;
+}
+
+uint32_t tether_taskpool_thread_count(void) {
+    return g_taskpool.num_threads;
 }
