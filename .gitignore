@@ -2,10 +2,43 @@
 build/
 *.o
 tetherc
+tetherc_asan
 bench_speed
 benchmarks/ecs/tether_ecs
 benchmarks/ecs/rust_ecs/target/
 julesc
-tetherc
 *.ll
 jules
+
+# Install directory
+install/
+
+# Platform skill leaks (these are NOT part of Tether)
+skills/
+
+# Download artifacts
+download/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+package-lock.json
+
+# Env / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
