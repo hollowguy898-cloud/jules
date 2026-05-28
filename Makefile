@@ -48,30 +48,30 @@ all: $(TARGET) $(RUNTIME_LIB)
 # ============================================================================
 
 $(TARGET): $(CXX_OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^
+        $(CXX) $(CXXFLAGS) -o $@ $^
 
 # ============================================================================
 # Compile C++ sources
 # ============================================================================
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c -MMD -MP -o $@ $<
+        @mkdir -p $(dir $@)
+        $(CXX) $(CXXFLAGS) -c -MMD -MP -o $@ $<
 
 # ============================================================================
 # Compile C runtime
 # ============================================================================
 
 $(BUILDDIR)/runtime/%.o: $(RUNTIMEDIR)/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+        @mkdir -p $(dir $@)
+        $(CC) $(CFLAGS) -c -o $@ $<
 
 # ============================================================================
 # Build runtime static library
 # ============================================================================
 
 $(RUNTIME_LIB): $(C_OBJ)
-	ar rcs $@ $<
+        ar rcs $@ $<
 
 # ============================================================================
 # Dependency tracking (auto-generated .d files from -MMD -MP)
@@ -85,7 +85,7 @@ $(RUNTIME_LIB): $(C_OBJ)
 
 .PHONY: clean
 clean:
-	rm -rf $(BUILDDIR) $(TARGET)
+        rm -rf $(BUILDDIR) $(TARGET)
 
 # ============================================================================
 # Test target
@@ -93,12 +93,12 @@ clean:
 
 .PHONY: test
 test: $(TARGET)
-	@echo "=== Testing compiler on examples ==="
-	@for f in examples/*.tth; do \
-	        echo "  Compiling $$f ..."; \
-	        ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
-	done
-	@echo "=== Tests complete ==="
+        @echo "=== Testing compiler on examples ==="
+        @for f in examples/*.tth; do \
+                echo "  Compiling $$f ..."; \
+                ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
+        done
+        @echo "=== Tests complete ==="
 
 # ============================================================================
 # Install
@@ -108,12 +108,12 @@ PREFIX ?= /usr/local
 
 .PHONY: install
 install: $(TARGET) $(RUNTIME_LIB)
-	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/tetherc
-	install -d $(DESTDIR)$(PREFIX)/lib
-	install -m 644 $(RUNTIME_LIB) $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
-	install -d $(DESTDIR)$(PREFIX)/include/tether
-	install -m 644 $(RUNTIMEDIR)/tether_runtime.h $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
+        install -d $(DESTDIR)$(PREFIX)/bin
+        install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/tetherc
+        install -d $(DESTDIR)$(PREFIX)/lib
+        install -m 644 $(RUNTIME_LIB) $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
+        install -d $(DESTDIR)$(PREFIX)/include/tether
+        install -m 644 $(RUNTIMEDIR)/tether_runtime.h $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
 
 # ============================================================================
 # Uninstall
@@ -121,9 +121,9 @@ install: $(TARGET) $(RUNTIME_LIB)
 
 .PHONY: uninstall
 uninstall:
-	rm -f $(DESTDIR)$(PREFIX)/bin/tetherc
-	rm -f $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
-	rm -f $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
+        rm -f $(DESTDIR)$(PREFIX)/bin/tetherc
+        rm -f $(DESTDIR)$(PREFIX)/lib/libtether_runtime.a
+        rm -f $(DESTDIR)$(PREFIX)/include/tether/tether_runtime.h
 
 # ============================================================================
 # Benchmarks
@@ -132,58 +132,109 @@ uninstall:
 # Speed benchmark (compiler phase throughput)
 BENCH_SPEED = build/bench_speed
 $(BENCH_SPEED): benchmarks/speed_benchmark.cpp $(LIB_OBJS)
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -O2 -o $@ $< $(LIB_OBJS)
+        @mkdir -p $(dir $@)
+        $(CXX) $(CXXFLAGS) -O2 -o $@ $< $(LIB_OBJS)
 
 # Real-workload benchmark (compile real .tth programs)
 BENCH_REAL = build/bench_real
 $(BENCH_REAL): benchmarks/real_workload_bench.cpp $(LIB_OBJS)
-	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -O2 -o $@ $< $(LIB_OBJS)
+        @mkdir -p $(dir $@)
+        $(CXX) $(CXXFLAGS) -O2 -o $@ $< $(LIB_OBJS)
 
 # ECS SoA vs AoS benchmark (standalone C++ runtime benchmark)
 BENCH_ECS = build/bench_ecs
 $(BENCH_ECS): benchmarks/ecs/tether_ecs.cpp
-	@mkdir -p $(dir $@)
-	$(CXX) -std=c++17 -O3 -march=native -o $@ $< -lm
+        @mkdir -p $(dir $@)
+        $(CXX) -std=c++17 -O3 -march=native -o $@ $< -lm
 
 .PHONY: bench
 bench: $(BENCH_SPEED) $(BENCH_REAL) $(BENCH_ECS) $(TARGET)
-	@echo "=============================================="
-	@echo "  Tether Compiler Benchmark Suite"
-	@echo "=============================================="
-	@echo ""
-	@echo "--- 1. Compiler Phase Throughput ---"
-	@$(BENCH_SPEED)
-	@echo ""
-	@echo "--- 2. Real Workload Compilation ---"
-	@$(BENCH_REAL)
-	@echo ""
-	@echo "--- 3. ECS SoA vs AoS Runtime ---"
-	@$(BENCH_ECS)
-	@echo ""
-	@echo "--- 4. End-to-End Compilation ---"
-	@for f in benchmarks/real_workload/*.tth; do \
-	        echo "  Compiling $$f (-O3) ..."; \
-	        ./$(TARGET) -O3 --emit-ir -v "$$f" -o /tmp/bench_out.ll 2>&1 | head -5; \
-	        echo "  IR size: $$(wc -c < /tmp/bench_out.ll) bytes"; \
-	        echo ""; \
-	done
-	@echo "=============================================="
-	@echo "  Benchmark Suite Complete"
-	@echo "=============================================="
+        @echo "=============================================="
+        @echo "  Tether Compiler Benchmark Suite"
+        @echo "=============================================="
+        @echo ""
+        @echo "--- 1. Compiler Phase Throughput ---"
+        @$(BENCH_SPEED)
+        @echo ""
+        @echo "--- 2. Real Workload Compilation ---"
+        @$(BENCH_REAL)
+        @echo ""
+        @echo "--- 3. ECS SoA vs AoS Runtime ---"
+        @$(BENCH_ECS)
+        @echo ""
+        @echo "--- 4. End-to-End Compilation ---"
+        @for f in benchmarks/real_workload/*.tth; do \
+                echo "  Compiling $$f (-O3) ..."; \
+                ./$(TARGET) -O3 --emit-ir -v "$$f" -o /tmp/bench_out.ll 2>&1 | head -5; \
+                echo "  IR size: $$(wc -c < /tmp/bench_out.ll) bytes"; \
+                echo ""; \
+        done
+        @echo "=============================================="
+        @echo "  Benchmark Suite Complete"
+        @echo "=============================================="
 
 .PHONY: bench-speed
 bench-speed: $(BENCH_SPEED)
-	@$(BENCH_SPEED)
+        @$(BENCH_SPEED)
 
 .PHONY: bench-real
 bench-real: $(BENCH_REAL)
-	@$(BENCH_REAL)
+        @$(BENCH_REAL)
 
 .PHONY: bench-ecs
 bench-ecs: $(BENCH_ECS)
-	@$(BENCH_ECS)
+        @$(BENCH_ECS)
+
+# ============================================================================
+# Propeller — Profile-Guided Code Layout Optimization
+# ============================================================================
+#
+# The Propeller pipeline optimizes I-cache hit rates, branch prediction, and
+# code layout by:
+#   1. Building an instrumented binary (IR-level PGO)
+#   2. Collecting runtime profiles with representative workloads
+#   3. Rebuilding with PGO feedback + BB section reordering + lld linking
+#
+# Prerequisites: LLVM 19 with lld, llvm-profdata (set LLVM_BIN below)
+# ============================================================================
+
+LLVM_BIN  ?= /tmp/my-project/llvm-bin/LLVM-19.1.7-Linux-X64/bin
+PROPELLER ?= scripts/propeller_build.sh
+
+# Propeller: full pipeline (instrument → profile → optimize)
+# Usage: make propeller-full INPUT=benchmarks/propeller_bench.tth [ARGS=]
+.PHONY: propeller-full
+propeller-full: $(TARGET)
+        @bash $(PROPELLER) full $(INPUT) $(ARGS)
+
+# Propeller: instrument only (Phase 1)
+# Usage: make propeller-instrument INPUT=benchmarks/propeller_bench.tth
+.PHONY: propeller-instrument
+propeller-instrument: $(TARGET)
+        @bash $(PROPELLER) instrument $(INPUT)
+
+# Propeller: collect profiles (Phase 2)
+# Usage: make propeller-profile BINARY=/tmp/propeller_bench_inst
+.PHONY: propeller-profile
+propeller-profile: $(TARGET)
+        @bash $(PROPELLER) profile $(BINARY) $(ARGS)
+
+# Propeller: rebuild with profiles (Phase 3)
+# Usage: make propeller-optimize INPUT=benchmarks/propeller_bench.tth
+.PHONY: propeller-optimize
+propeller-optimize: $(TARGET)
+        @bash $(PROPELLER) optimize $(INPUT)
+
+# Propeller: benchmark baseline vs PGO vs Propeller
+# Usage: make propeller-bench INPUT=benchmarks/propeller_bench.tth
+.PHONY: propeller-bench
+propeller-bench: $(TARGET)
+        @bash $(PROPELLER) bench $(INPUT) $(ARGS)
+
+# Propeller: clean temp files
+.PHONY: propeller-clean
+propeller-clean:
+        @bash $(PROPELLER) clean
 
 # ============================================================================
 # Help
@@ -191,29 +242,37 @@ bench-ecs: $(BENCH_ECS)
 
 .PHONY: setup
 setup:
-	git config core.hooksPath .githooks
-	@echo "Git hooks configured. Pre-commit hook will block leaked file patterns."
+        git config core.hooksPath .githooks
+        @echo "Git hooks configured. Pre-commit hook will block leaked file patterns."
 
 .PHONY: help
 help:
-	@echo "Tether Compiler Build System"
-	@echo ""
-	@echo "Targets:"
-	@echo "  all         - Build the compiler and runtime (default)"
-	@echo "  clean       - Remove build artifacts"
-	@echo "  test        - Build and run tests"
-	@echo "  bench       - Run all benchmarks"
-	@echo "  bench-speed - Run compiler phase throughput benchmark"
-	@echo "  bench-real  - Run real-workload compilation benchmark"
-	@echo "  bench-ecs   - Run ECS SoA vs AoS runtime benchmark"
-	@echo "  install     - Install to PREFIX (default: /usr/local)"
-	@echo "  uninstall   - Remove installed files"
-	@echo "  setup       - Configure git hooks (run after clone)"
-	@echo "  help        - Show this message"
-	@echo ""
-	@echo "Variables:"
-	@echo "  CXX       - C++ compiler (default: g++)"
-	@echo "  CC        - C compiler (default: gcc)"
-	@echo "  CXXFLAGS  - C++ compiler flags"
-	@echo "  CFLAGS    - C compiler flags"
-	@echo "  PREFIX    - Install prefix (default: /usr/local)"
+        @echo "Tether Compiler Build System"
+        @echo ""
+        @echo "Targets:"
+        @echo "  all         - Build the compiler and runtime (default)"
+        @echo "  clean       - Remove build artifacts"
+        @echo "  test        - Build and run tests"
+        @echo "  bench       - Run all benchmarks"
+        @echo "  bench-speed - Run compiler phase throughput benchmark"
+        @echo "  bench-real  - Run real-workload compilation benchmark"
+        @echo "  bench-ecs   - Run ECS SoA vs AoS runtime benchmark"
+        @echo "  install     - Install to PREFIX (default: /usr/local)"
+        @echo "  uninstall   - Remove installed files"
+        @echo "  setup       - Configure git hooks (run after clone)"
+        @echo "  help        - Show this message"
+        @echo ""
+        @echo "Propeller (PGO + Code Layout Optimization):"
+        @echo "  propeller-full      - Full pipeline: instrument → profile → optimize"
+        @echo "  propeller-instrument- Phase 1: Build instrumented binary"
+        @echo "  propeller-profile   - Phase 2: Collect runtime profiles"
+        @echo "  propeller-optimize  - Phase 3: Rebuild with PGO + BB sections + lld"
+        @echo "  propeller-bench     - Benchmark: baseline vs PGO vs Propeller"
+        @echo "  propeller-clean     - Clean Propeller temp files"
+        @echo ""
+        @echo "Variables:"
+        @echo "  CXX       - C++ compiler (default: g++)"
+        @echo "  CC        - C compiler (default: gcc)"
+        @echo "  CXXFLAGS  - C++ compiler flags"
+        @echo "  CFLAGS    - C compiler flags"
+        @echo "  PREFIX    - Install prefix (default: /usr/local)"

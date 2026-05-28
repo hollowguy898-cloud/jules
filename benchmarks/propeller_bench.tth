@@ -1,0 +1,133 @@
+// Propeller Benchmark — Branch-heavy workload for code layout optimization
+// Exercises: indirect branches, hot/cold paths, nested loops with predictable
+// branch patterns that Propeller's BB section reordering can optimize.
+
+fn collatz_steps(n: i64) i64 {
+    var steps: i64 = 0;
+    var current: i64 = n;
+    while (current > 1) {
+        if (current % 2 == 0) {
+            current = current / 2;
+        } else {
+            current = 3 * current + 1;
+        }
+        steps += 1;
+    }
+    return steps;
+}
+
+fn is_prime(n: i64) bool {
+    if (n < 2) { return false; }
+    if (n < 4) { return true; }
+    if (n % 2 == 0) { return false; }
+    if (n % 3 == 0) { return false; }
+    var i: i64 = 5;
+    while (i * i <= n) {
+        if (n % i == 0) { return false; }
+        if (n % (i + 2) == 0) { return false; }
+        i += 6;
+    }
+    return true;
+}
+
+fn count_primes(start: i64, end: i64) i64 {
+    var count: i64 = 0;
+    var i: i64 = start;
+    while (i <= end) {
+        if (is_prime(i)) {
+            count += 1;
+        }
+        i += 1;
+    }
+    return count;
+}
+
+fn fibonacci(n: i64) i64 {
+    if (n <= 1) { return n; }
+    var a: i64 = 0;
+    var b: i64 = 1;
+    var i: i64 = 2;
+    while (i <= n) {
+        var temp: i64 = b;
+        b = a + b;
+        a = temp;
+        i += 1;
+    }
+    return b;
+}
+
+fn sum_of_squares(n: i64) i64 {
+    var total: i64 = 0;
+    var i: i64 = 1;
+    while (i <= n) {
+        total += i * i;
+        i += 1;
+    }
+    return total;
+}
+
+fn gcd(a: i64, b: i64) i64 {
+    var x: i64 = a;
+    var y: i64 = b;
+    while (y != 0) {
+        var temp: i64 = y;
+        y = x % y;
+        x = temp;
+    }
+    return x;
+}
+
+fn euler_totient(n: i64) i64 {
+    var result: i64 = n;
+    var p: i64 = 2;
+    var num: i64 = n;
+    while (p * p <= num) {
+        if (num % p == 0) {
+            while (num % p == 0) {
+                num = num / p;
+            }
+            result -= result / p;
+        }
+        p += 1;
+    }
+    if (num > 1) {
+        result -= result / num;
+    }
+    return result;
+}
+
+fn main() i32 {
+    var total: i64 = 0;
+
+    // Collatz: lots of unpredictable branches
+    var i: i64 = 1;
+    while (i <= 10000) {
+        total += collatz_steps(i);
+        i += 1;
+    }
+
+    // Prime counting: nested branches with early returns
+    total += count_primes(2, 50000);
+
+    // Fibonacci: tight loop
+    total += fibonacci(50);
+
+    // GCD: many iterations
+    i = 1;
+    while (i <= 10000) {
+        total += gcd(i, 10000);
+        i += 1;
+    }
+
+    // Euler totient: complex branching
+    i = 1;
+    while (i <= 5000) {
+        total += euler_totient(i);
+        i += 1;
+    }
+
+    // Sum of squares
+    total += sum_of_squares(10000);
+
+    return 0;
+}

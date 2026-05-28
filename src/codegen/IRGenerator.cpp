@@ -956,7 +956,16 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     //   main      → external (must be visible to the linker entry point)
     //   pure      → alwaysinline (no side effects → always profitable to inline)
     //   small fn  → inlinehint (let LLVM know it's small and likely worth inlining)
-    //   otherwise → internal (allows aggressive inlining by LLVM)
+    //   otherwise → external with inlinehint (allows PGO to profile functions
+    //                while still hinting LLVM to inline when profitable)
+    //
+    // NOTE: We use external linkage (not internal) for non-main functions because:
+    //   1. IR-level PGO (-fprofile-generate) requires visible symbols to profile
+    //   2. Propeller/PGO code layout optimization needs function-level profiles
+    //   3. LLVM's inliner still respects inlinehint/alwaysinline attributes
+    //   4. -ffunction-sections + lld --gc-sections eliminates unused externals
+    // Internal linkage prevented PGO from collecting profile data (0 functions
+    // profiled), which is why we switched to external + inline attributes.
     std::string linkage;
     std::string inlining_attr;
     bool is_small_fn = fn->body() && fn->body()->stmts().size() <= 3;
@@ -965,17 +974,18 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     } else if (fn->isPure()) {
         // Pure functions have no side effects → always profitable to inline.
         // Use alwaysinline for small pure fns, inlinehint for larger ones.
-        linkage = "internal ";  // internal > linkonce_odr for inlining
+        linkage = "";  // external for PGO compatibility
         inlining_attr = is_small_fn ? " alwaysinline" : " inlinehint";
     } else if (fn->isInline()) {
         // Explicit inline keyword: force inlining at call site
-        linkage = "internal ";
+        linkage = "";  // external for PGO compatibility
         inlining_attr = " alwaysinline";
     } else if (is_small_fn) {
-        linkage = "internal ";
+        linkage = "";  // external for PGO compatibility
         inlining_attr = " alwaysinline";  // tiny functions → always inline
     } else {
-        linkage = "internal ";  // internal linkage enables aggressive inlining
+        linkage = "";  // external: PGO-compatible, inlinehint guides inliner
+        inlining_attr = " inlinehint";  // hint that inlining is profitable
     }
 
     std::string sig = "define " + linkage + "dso_local " + ret_type + " @" + sanitizeName(fn->name()) + "(";
