@@ -108,11 +108,6 @@ bool YieldPointInserterPass::walkStmt(Stmt* stmt, TypeTable& type_table) {
             // Check if this is a potentially long-running function call
             if (auto* call = dyn_cast<CallExpr>(expr_stmt.expr())) {
                 // Annotate the call as a yield point candidate
-                if (annotations_) {
-                    annotations_->annotate(call,
-                        ASTAnnotationKind::YieldPoint,
-                        "pre_call_yield");
-                }
                 if (meta_map_) {
                     meta_map_->getOrCreate(call).yield_point = true;
                 }
@@ -162,11 +157,6 @@ bool YieldPointInserterPass::processWhileLoop(WhileStmt& loop, TypeTable& /*type
 
     // Annotate the while loop for yield point insertion
     // The IR generator will emit a yield check at the top of the loop body
-    if (annotations_) {
-        std::string detail = "loop_yield:interval:" + std::to_string(YIELD_INTERVAL);
-        annotations_->annotate(&loop,
-            ASTAnnotationKind::YieldPoint, detail);
-    }
     if (meta_map_) {
         meta_map_->getOrCreate(&loop).yield_point = true;
     }

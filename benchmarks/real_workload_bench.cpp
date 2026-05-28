@@ -106,7 +106,8 @@ static CompileResult compileWorkload(const std::string& source,
     auto t6 = hrclock_t::now();
     PreLLVMPipeline pipeline(pre_level, type_table);
     auto pipe_result = pipeline.run(program);
-    auto annotations = std::move(pipeline.annotations());
+    auto& metadata = pipeline.metadata();
+    (void)metadata; // Available for inspection if needed
     auto t7 = hrclock_t::now();
     result.phases.push_back({"PreLLVM", us_t(t7 - t6).count(),
                               static_cast<size_t>(pipe_result.passes_run)});
@@ -138,7 +139,7 @@ static CompileResult compileWorkload(const std::string& source,
 
     // Phase 7: IR generation
     auto t12 = hrclock_t::now();
-    IRGenerator generator(program, type_table, &annotations);
+    IRGenerator generator(program, type_table, &pipeline.metadata());
     auto ir_text = generator.generate();
     auto t13 = hrclock_t::now();
     result.phases.push_back({"IRGen", us_t(t13 - t12).count(), ir_text.size()});

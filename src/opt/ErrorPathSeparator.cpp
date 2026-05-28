@@ -43,11 +43,6 @@ void ErrorPathSeparatorPass::walkFn(FnDecl& fn) {
         // from try expressions are cold paths. We annotate the function
         // body so the IR generator knows to lay out the error return block
         // in a cold section.
-        if (annotations_) {
-            annotations_->annotate(fn.body(),
-                ASTAnnotationKind::ColdPath,
-                "error_function:" + fn.name());
-        }
         if (meta_map_) {
             meta_map_->getOrCreate(fn.body()).llvm_meta.cold_path = true;
         }
@@ -286,15 +281,10 @@ void ErrorPathSeparatorPass::annotateTryExpr(TryExpr& expr) {
     // The IR generator will emit:
     //   - br i1 %is_error, label %error_return, label %success, !prof !{!"branch_weights", i32 1, i32 1000}
     //   - The error_return block gets the `cold` attribute
-    if (annotations_) {
-        // Branch weights: 1 (error) : 1000 (success)
-        // This tells LLVM the error path is extremely unlikely
-        annotations_->annotate(&expr,
-            ASTAnnotationKind::ColdPath,
-            "try_error_branch:1:1000");
-    }
     if (meta_map_) {
-        meta_map_->getOrCreate(&expr).llvm_meta.cold_path = true;
+        auto& nm = meta_map_->getOrCreate(&expr);
+        nm.llvm_meta.cold_path = true;
+        nm.branch_prob = BranchProbability::Unlikely;
     }
     annotated_tries_++;
 }
@@ -329,11 +319,6 @@ void ErrorPathSeparatorPass::annotateBlock(BlockStmt* block) {
     }
 
     if (is_error_block) {
-        if (annotations_) {
-            annotations_->annotate(block,
-                ASTAnnotationKind::ColdPath,
-                "catch_block");
-        }
         if (meta_map_) {
             meta_map_->getOrCreate(block).llvm_meta.cold_path = true;
         }
@@ -346,11 +331,6 @@ void ErrorPathSeparatorPass::annotateBlock(BlockStmt* block) {
 // ============================================================================
 void ErrorPathSeparatorPass::annotateErrdefer(ErrdeferStmt& stmt) {
     // Errdefer blocks only execute on error paths, so they are inherently cold
-    if (annotations_) {
-        annotations_->annotate(&stmt,
-            ASTAnnotationKind::ColdPath,
-            "errdefer_cleanup");
-    }
     if (meta_map_) {
         meta_map_->getOrCreate(&stmt).llvm_meta.cold_path = true;
     }

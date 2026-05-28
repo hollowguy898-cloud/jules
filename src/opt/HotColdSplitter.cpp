@@ -90,19 +90,9 @@ bool HotColdSplitterPass::processStructDecl(StructDecl& decl, TypeTable& type_ta
         detail += cold_fields[i];
     }
 
-    if (annotations_) {
-        // Annotate the struct for splitting
-        annotations_->annotate(&decl,
-            ASTAnnotationKind::HotField, detail);
-
-        // Also annotate individual field names in the struct's detail
-        // (StructFieldDecl is not an ASTNode, so we include the field
-        // classification info in the struct-level annotation detail)
-    }
-
     // Write hot/cold field classification to MetadataMap's StructMeta
+    // Using mergeStructMeta to avoid clobbering existing data
     if (meta_map_) {
-        // Register or update the struct metadata with hot/cold field info
         MetadataMap::StructMeta smeta;
         smeta.name = decl.name();
         smeta.layout = LayoutKind::Hybrid;  // Hot/cold split = hybrid layout
@@ -115,7 +105,7 @@ bool HotColdSplitterPass::processStructDecl(StructDecl& decl, TypeTable& type_ta
         smeta.transform.hot_fields = hot_fields;
         smeta.transform.cold_fields = cold_fields;
         smeta.transform.detail = detail;
-        meta_map_->registerStruct(decl.name(), std::move(smeta));
+        meta_map_->mergeStructMeta(decl.name(), std::move(smeta));
     }
 
     structs_split_++;

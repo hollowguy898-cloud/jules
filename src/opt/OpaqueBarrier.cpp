@@ -54,11 +54,6 @@ bool OpaqueBarrierPass::processFnDecl(FnDecl& fn, TypeTable& type_table) {
         // 1. Add `inaccessiblememonly` attribute to the function
         // 2. Insert memory fences around calls to this function
         // 3. Prevent store-to-load forwarding across this function's calls
-        if (annotations_) {
-            annotations_->annotate(&fn,
-                ASTAnnotationKind::OpaqueBarrier,
-                "opaque_function:" + fn.name());
-        }
         if (meta_map_) {
             meta_map_->getOrCreate(&fn).opaque_barrier = true;
         }
@@ -98,11 +93,6 @@ bool OpaqueBarrierPass::walkStmt(Stmt* stmt, TypeTable& type_table) {
             // Check if the variable's type is opaque
             if (var.hasType() && isOpaqueType(var.declaredType())) {
                 // Insert a barrier annotation around this variable
-                if (annotations_) {
-                    annotations_->annotate(&var,
-                        ASTAnnotationKind::OpaqueBarrier,
-                        "opaque_var:" + var.name());
-                }
                 if (meta_map_) {
                     meta_map_->getOrCreate(&var).opaque_barrier = true;
                 }
@@ -118,11 +108,6 @@ bool OpaqueBarrierPass::walkStmt(Stmt* stmt, TypeTable& type_table) {
         case NodeKind::ValDeclStmt: {
             auto& val = cast<ValDeclStmt>(*stmt);
             if (val.hasType() && isOpaqueType(val.declaredType())) {
-                if (annotations_) {
-                    annotations_->annotate(&val,
-                        ASTAnnotationKind::OpaqueBarrier,
-                        "opaque_val:" + val.name());
-                }
                 if (meta_map_) {
                     meta_map_->getOrCreate(&val).opaque_barrier = true;
                 }
@@ -210,11 +195,6 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
     // Check if this expression's type is opaque
     if (expr->hasType() && isOpaqueType(expr->getType())) {
         // Found an expression that produces/uses an opaque value
-        if (annotations_) {
-            annotations_->annotate(expr,
-                ASTAnnotationKind::OpaqueBarrier,
-                "opaque_expr");
-        }
         if (meta_map_) {
             meta_map_->getOrCreate(expr).opaque_barrier = true;
         }
@@ -239,11 +219,6 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
                     }
                 }
                 if (has_opaque_param || isOpaqueType(fn_type.returnType())) {
-                    if (annotations_) {
-                        annotations_->annotate(call,
-                            ASTAnnotationKind::OpaqueBarrier,
-                            "ffi_call");
-                    }
                     if (meta_map_) {
                         meta_map_->getOrCreate(call).opaque_barrier = true;
                     }
@@ -281,11 +256,6 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
     else if (auto* cast_expr = dyn_cast<CastExpr>(expr)) {
         // Casts to/from opaque types need barriers
         if (isOpaqueType(cast_expr->targetType())) {
-            if (annotations_) {
-                annotations_->annotate(cast_expr,
-                    ASTAnnotationKind::OpaqueBarrier,
-                    "opaque_cast");
-            }
             if (meta_map_) {
                 meta_map_->getOrCreate(cast_expr).opaque_barrier = true;
             }

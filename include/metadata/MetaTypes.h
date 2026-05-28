@@ -269,9 +269,84 @@ public:
         std::vector<bool> field_is_hot;  // per-field hot classification
     };
 
-    // Register struct metadata
+    // Register struct metadata (initial registration — fails if already exists)
     void registerStruct(const std::string& name, StructMeta meta) {
         structs_[name] = std::move(meta);
+    }
+
+    // Register or merge struct metadata — does NOT clobber existing data.
+    // Merges field_is_hot (OR), preserves higher-priority transforms,
+    // and accumulates field_names if not already present.
+    void mergeStructMeta(const std::string& name, StructMeta meta) {
+        auto it = structs_.find(name);
+        if (it == structs_.end()) {
+            // Not present — just register
+            structs_[name] = std::move(meta);
+            return;
+        }
+
+        // Merge into existing entry
+        StructMeta& existing = it->second;
+
+        // Merge alignment: take the larger value
+        if (meta.alignment > existing.alignment) {
+            existing.alignment = meta.alignment;
+        }
+
+        // Merge layout: take the more specific one
+        // Priority: SoA > Hybrid > Chunked > AoS
+        if (meta.layout == LayoutKind::SoA && existing.layout != LayoutKind::SoA) {
+            existing.layout = LayoutKind::SoA;
+        } else if (meta.layout == LayoutKind::Hybrid && existing.layout == LayoutKind::AoS) {
+            existing.layout = LayoutKind::Hybrid;
+        }
+
+        // Merge field_is_hot: OR (a field is hot if ANY pass says it's hot)
+        if (meta.field_is_hot.size() > existing.field_is_hot.size()) {
+            existing.field_is_hot.resize(meta.field_is_hot.size(), false);
+        }
+        for (size_t i = 0; i < meta.field_is_hot.size(); ++i) {
+            if (meta.field_is_hot[i]) {
+                existing.field_is_hot[i] = true;
+            }
+        }
+
+        // Merge field_names: only if existing is empty
+        if (existing.field_names.empty() && !meta.field_names.empty()) {
+            existing.field_names = std::move(meta.field_names);
+        }
+
+        // Merge transform: take the higher-priority one
+        // Priority: SoATransform > HotColdSplit > FieldReorder > PackedBitfield > None
+        auto transformPriority = [](TransformKind k) -> int {
+            switch (k) {
+                case TransformKind::SoATransform:  return 4;
+                case TransformKind::HotColdSplit:  return 3;
+                case TransformKind::FieldReorder:  return 2;
+                case TransformKind::PackedBitfield: return 1;
+                case TransformKind::None:           return 0;
+            }
+            return 0;
+        };
+
+        if (transformPriority(meta.transform.kind) > transformPriority(existing.transform.kind)) {
+            existing.transform = std::move(meta.transform);
+        } else if (meta.transform.kind == existing.transform.kind &&
+                   meta.transform.kind != TransformKind::None) {
+            // Same transform kind — merge details
+            if (!meta.transform.hot_fields.empty()) {
+                existing.transform.hot_fields = std::move(meta.transform.hot_fields);
+            }
+            if (!meta.transform.cold_fields.empty()) {
+                existing.transform.cold_fields = std::move(meta.transform.cold_fields);
+            }
+            if (!meta.transform.reorder_map.empty()) {
+                existing.transform.reorder_map = std::move(meta.transform.reorder_map);
+            }
+            if (!meta.transform.detail.empty()) {
+                existing.transform.detail = std::move(meta.transform.detail);
+            }
+        }
     }
 
     const StructMeta* getStructMeta(const std::string& name) const {

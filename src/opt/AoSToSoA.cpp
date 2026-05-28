@@ -64,25 +64,13 @@ bool AoSToSoAPass::transformStruct(StructDecl& decl, TypeTable& type_table) {
         // transformation can still proceed at the AST level
     }
 
-    // For each field, create a separate array type in the type table.
-    // The IR generator will use the SoATransform metadata to emit
-    // separate arrays instead of a single array of structs.
-    for (size_t i = 0; i < fields.size(); ++i) {
-        // Annotate the struct decl so the IR generator knows about the transformation
-        if (annotations_) {
-            std::string detail = transform.field_array_names[i] + ":" +
-                                 transform.field_types[i]->toString();
-            annotations_->annotate(&decl, ASTAnnotationKind::SoATransformed, detail);
-        }
-    }
-
-    // Write SoA transform to MetadataMap
+    // Write SoA transform to MetadataMap (using mergeStructMeta — no clobbering)
     if (meta_map_) {
         auto& nm = meta_map_->getOrCreate(&decl);
         nm.soa_transformed = true;
         nm.layout = LayoutKind::SoA;
 
-        // Also register/update the struct metadata
+        // Merge struct-level metadata (does NOT clobber existing entries)
         MetadataMap::StructMeta smeta;
         smeta.name = decl.name();
         smeta.layout = LayoutKind::SoA;
@@ -92,7 +80,7 @@ bool AoSToSoAPass::transformStruct(StructDecl& decl, TypeTable& type_table) {
         smeta.transform.kind = TransformKind::SoATransform;
         smeta.transform.struct_name = decl.name();
         smeta.transform.detail = "soa_transform";
-        meta_map_->registerStruct(decl.name(), std::move(smeta));
+        meta_map_->mergeStructMeta(decl.name(), std::move(smeta));
     }
 
     transform.was_transformed = true;
@@ -136,12 +124,6 @@ bool AoSToSoAPass::transformAccesses(Program& program, const SoATransform& trans
                             for (size_t i = 0; i < transform.field_names.size(); ++i) {
                                 if (transform.field_names[i] == field_name) {
                                     // Annotate this member access for SoA rewriting
-                                    if (annotations_) {
-                                        std::string detail = transform.struct_name + ":" +
-                                                             transform.field_array_names[i];
-                                        annotations_->annotate(member,
-                                            ASTAnnotationKind::SoATransformed, detail);
-                                    }
                                     if (meta_map_) {
                                         auto& nm = meta_map_->getOrCreate(member);
                                         nm.soa_transformed = true;

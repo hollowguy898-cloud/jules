@@ -9,7 +9,6 @@
 #include "cfg/CFG.h"
 #include "borrowck/BorrowChecker.h"
 #include "opt/PreLLVMPipeline.h"
-#include "metadata/MetadataEngine.h"
 
 #include <string>
 #include <vector>
@@ -36,12 +35,13 @@ enum class EmitType : uint8_t {
 //   2. Running the lexer
 //   3. Running the parser
 //   4. Running semantic analysis
-//   5. Building CFGs for each function
-//   6. Running the borrow checker
-//   7. Generating LLVM IR
-//   8. Writing the .ll file
-//   9. (Optionally) invoking clang/llc to compile .ll to .o/.s
-//  10. (Optionally) linking to produce an executable
+//   5. Running the unified pre-LLVM optimization pipeline
+//   6. Building CFGs for each function
+//   7. Running the borrow checker
+//   8. Generating LLVM IR
+//   9. Writing the .ll file
+//  10. (Optionally) invoking clang/llc to compile .ll to .o/.s
+//  11. (Optionally) linking to produce an executable
 //
 // Each phase reports errors and aborts if there are failures.
 // ============================================================================
@@ -49,15 +49,6 @@ class Driver {
 public:
     // -----------------------------------------------------------------------
     // Constructor
-    //
-    // input_file:  path to the .tth source file
-    // output_file: path for the output (empty string = derive from input)
-    // opt_level:   optimization level 0-3
-    // emit_type:   what to emit (object, assembly, IR, executable)
-    // verbose:     print each compilation phase as it runs
-    // profile_generate: pass -fprofile-generate to clang for PGO
-    // profile_use: path to profile data for -fprofile-use
-    // target_triple: cross-compilation target (x86_64, aarch64, riscv64, wasm32)
     // -----------------------------------------------------------------------
     Driver(const std::string& input_file,
            const std::string& output_file,
@@ -68,97 +59,69 @@ public:
            const std::string& profile_use = "",
            const std::string& target_triple = "");
 
-    // -----------------------------------------------------------------------
     // Run the full compilation pipeline.
-    // Returns true on success, false on error.
-    // -----------------------------------------------------------------------
     bool compile();
 
-    // -----------------------------------------------------------------------
     // Access the error message (set when compile() returns false)
-    // -----------------------------------------------------------------------
     const std::string& errorMessage() const { return error_message_; }
 
 private:
-    // -----------------------------------------------------------------------
     // Pipeline phases (each returns true on success)
-    // -----------------------------------------------------------------------
     bool readSource();
     bool runLexer();
     bool runParser();
     bool runSemanticAnalysis();
-    bool runPreLLVMOptimizations();  // Pre-LLVM passes (non-redundant with LLVM)
-    bool runMetadataEngine();        // 6-layer metadata engine
+    bool runPreLLVMOptimizations();  // Unified pipeline (analysis + transforms)
     bool runCFGBuilding();
     bool runBorrowChecking();
     bool runIRGeneration();
     bool writeIRFile();
-    bool runBackend();          // Compile .ll to .o/.s via clang/llc
-    bool runLinker();           // Link .o + runtime to produce executable
+    bool runBackend();
+    bool runLinker();
 
-    // -----------------------------------------------------------------------
     // Utility helpers
-    // -----------------------------------------------------------------------
-
-    // Find an executable on PATH. Returns empty string if not found.
     static std::string findExecutable(const std::string& name);
-
-    // Find clang on the system
     std::string findClang() const;
-
-    // Find llc on the system
     std::string findLlc() const;
-
-    // Derive output path from input path and emit type
     std::string deriveOutputPath() const;
-
-    // Remove a file (used for intermediate cleanup)
     static bool removeFile(const std::string& path);
 
-    // -----------------------------------------------------------------------
     // Configuration
-    // -----------------------------------------------------------------------
     std::string input_file_;
     std::string output_file_;
-    int opt_level_;            // 0-5: 0=none, 1=basic, 2=standard, 3=aggressive, 4=size, 5=aggressive-size
+    int opt_level_;
     EmitType emit_type_;
     bool verbose_;
-    bool profile_generate_;    // -fprofile-generate
-    std::string profile_use_;  // -fprofile-use=path
-    std::string target_triple_; // cross-compilation target
+    bool profile_generate_;
+    std::string profile_use_;
+    std::string target_triple_;
 
-    // -----------------------------------------------------------------------
-    // Intermediate data (populated during compilation)
-    // -----------------------------------------------------------------------
-    std::string source_text_;                                    // Phase 1
-    std::shared_ptr<std::string> filename_ptr_;                   // Kept alive for Token string_views
-    std::vector<Token> tokens_;                                  // Phase 2
-    Program program_;                                            // Phase 3
-    TypeTable type_table_;                                       // Shared type table
-    std::unordered_map<const ASTNode*, std::string> type_annotations_; // From parser
-    std::unordered_map<std::string, std::string> param_type_annotations_; // From parser
+    // Intermediate data
+    std::string source_text_;
+    std::shared_ptr<std::string> filename_ptr_;
+    std::vector<Token> tokens_;
+    Program program_;
+    TypeTable type_table_;
+    std::unordered_map<const ASTNode*, std::string> type_annotations_;
+    std::unordered_map<std::string, std::string> param_type_annotations_;
 
-    std::vector<std::unique_ptr<CFG>> cfgs_;                     // Phase 5: per-function CFGs
+    std::vector<std::unique_ptr<CFG>> cfgs_;
 
-    std::string ir_text_;                                        // Phase 7
-    std::string ir_file_path_;                                   // Phase 8
-    std::string obj_file_path_;                                  // Phase 9
+    std::string ir_text_;
+    std::string ir_file_path_;
+    std::string obj_file_path_;
 
-    // Metadata engine (6-layer post-Moore optimization pipeline)
-    // Also serves as the unified metadata store for Pre-LLVM passes
-    MetadataEngine metadata_engine_;                              // Phase 4.5
+    // Unified pre-LLVM optimization pipeline
+    // Owns the MetadataMap and all analysis/transform layers
+    std::unique_ptr<PreLLVMPipeline> pipeline_;
 
-    // -----------------------------------------------------------------------
     // Error state
-    // -----------------------------------------------------------------------
     std::string error_message_;
-
-    // Error-resilient compilation: track errors from each phase
     bool parser_had_errors_ = false;
     bool sema_had_errors_ = false;
     bool borrowck_had_errors_ = false;
     std::vector<ParseError> parse_errors_;
-    ErrorReporter sema_reporter_;  // Unified reporter for semantic analysis
+    ErrorReporter sema_reporter_;
     std::vector<BorrowError> borrowck_errors_;
 };
 

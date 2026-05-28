@@ -131,38 +131,6 @@ bool EscapeAnalysisPass::analyzeFn(FnDecl& fn, TypeTable& /*type_table*/) {
             }
         }
 
-        // Compute the size annotation detail string
-        std::string kind_str;
-        switch (sp_kind) {
-            case SmartPointerKind::Box: kind_str = "box"; break;
-            case SmartPointerKind::Rc:  kind_str = "rc";  break;
-            case SmartPointerKind::Arc: kind_str = "arc"; break;
-        }
-
-        // Include the pointee size if available
-        uint64_t pointee_size = 0;
-        TypeId pointee_type;
-        if (var_type && isa<SmartPointerType>(var_type)) {
-            pointee_type = cast<SmartPointerType>(var_type).pointee();
-        } else if (init_expr && init_expr->hasType() &&
-                   isa<SmartPointerType>(init_expr->getType())) {
-            pointee_type = cast<SmartPointerType>(init_expr->getType()).pointee();
-        }
-
-        if (pointee_type) {
-            pointee_size = pointee_type->bitWidth() / 8; // bits to bytes
-            if (pointee_type->bitWidth() % 8 != 0) {
-                pointee_size++; // round up partial bytes
-            }
-        }
-
-        std::string detail = kind_str + "_stack:" + std::to_string(pointee_size);
-
-        if (annotations_) {
-            annotations_->annotate(alloc_call,
-                ASTAnnotationKind::StackAllocated,
-                detail);
-        }
         if (meta_map_) {
             meta_map_->getOrCreate(alloc_call).stack_allocated = true;
         }

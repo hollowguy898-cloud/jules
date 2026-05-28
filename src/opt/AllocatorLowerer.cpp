@@ -275,11 +275,6 @@ bool AllocatorLowererPass::lowerCallExpr(CallExpr& call, TypeTable& /*type_table
         //   %aligned = add ptr %old, alignUp(alloc_size, 8)
         //   store %aligned, ptr %arena.offset
         //   result = %old
-        if (annotations_) {
-            std::string detail = "arena_inline:" + std::to_string(alloc_size);
-            annotations_->annotate(&call,
-                ASTAnnotationKind::AllocatorInlined, detail);
-        }
         if (meta_map_) {
             auto& nm = meta_map_->getOrCreate(&call);
             nm.allocator_inlined = true;

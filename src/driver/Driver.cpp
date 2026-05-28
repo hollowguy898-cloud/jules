@@ -57,7 +57,6 @@ bool Driver::compile() {
     runLexer();
     runParser();
     runSemanticAnalysis();
-    runMetadataEngine();
     runPreLLVMOptimizations();
     runCFGBuilding();
     runBorrowChecking();
@@ -250,55 +249,18 @@ bool Driver::runSemanticAnalysis() {
 }
 
 // ============================================================================
-// Phase 4.5: Metadata Engine (6-layer post-Moore optimization pipeline)
-// ============================================================================
-bool Driver::runMetadataEngine() {
-    if (verbose_) {
-        std::cerr << "[tether] Phase 4.5: Metadata engine..." << std::endl;
-    }
-
-    // Load profile data if specified
-    if (!profile_use_.empty()) {
-        if (!metadata_engine_.loadProfile(profile_use_)) {
-            if (verbose_) {
-                std::cerr << "[tether]   Warning: could not load profile data from: "
-                          << profile_use_ << std::endl;
-            }
-        }
-    }
-
-    // Run the full 6-layer metadata pipeline
-    metadata_engine_.run(program_, type_table_);
-
-    if (verbose_) {
-        std::cerr << "[tether]   Metadata engine completed ("
-                  << metadata_engine_.metadata().size() << " nodes annotated, "
-                  << metadata_engine_.metadata().structs().size() << " structs analyzed)"
-                  << std::endl;
-    }
-
-    return true;
-}
-
-// ============================================================================
-// Phase 5: Pre-LLVM optimizations
+// Phase 4.5: Pre-LLVM optimizations (UNIFIED pipeline)
 //
-// These are optimizations that LLVM CANNOT perform because they require
-// semantic knowledge about the Tether language (data layout, error paths,
-// allocator types, alignment hints, cooperative scheduling, etc.).
-// They run AFTER semantic analysis but BEFORE IR generation.
+// The unified pipeline includes both the MetadataEngine analysis layers
+// (L1-L6) AND the pre-LLVM transform passes in a single correct order.
+// No more two-track duplication or stale metadata.
 // ============================================================================
 bool Driver::runPreLLVMOptimizations() {
     if (verbose_) {
-        std::cerr << "[tether] Phase 5: Pre-LLVM optimizations..." << std::endl;
+        std::cerr << "[tether] Phase 4.5: Pre-LLVM optimizations (unified pipeline)..." << std::endl;
     }
 
-    // Map LLVM opt level to Tether pre-LLVM opt level:
-    // -O0 → None
-    // -O1 → Basic
-    // -O2/-O3 → Aggressive
-    // -Os (4) → Basic (size optimizations, no aggressive transforms like SoA)
-    // -Oz (5) → Basic (minimal, size-first)
+    // Map LLVM opt level to Tether pre-LLVM opt level
     PreLLVMOptLevel pre_level = PreLLVMOptLevel::None;
     if (opt_level_ == 1 || opt_level_ == 4 || opt_level_ == 5) {
         pre_level = PreLLVMOptLevel::Basic;
@@ -313,13 +275,23 @@ bool Driver::runPreLLVMOptimizations() {
         return true;
     }
 
-    PreLLVMPipeline pipeline(pre_level, type_table_);
-    pipeline.setMetadataMap(&metadata_engine_.metadata());
-    auto result = pipeline.run(program_);
+    pipeline_ = std::make_unique<PreLLVMPipeline>(pre_level, type_table_);
+
+    // Load profile data if specified
+    if (!profile_use_.empty()) {
+        if (!pipeline_->loadProfile(profile_use_)) {
+            if (verbose_) {
+                std::cerr << "[tether]   Warning: could not load profile data from: "
+                          << profile_use_ << std::endl;
+            }
+        }
+    }
+
+    auto result = pipeline_->run(program_);
 
     if (verbose_) {
         std::cerr << "[tether]   Ran " << result.passes_run
-                  << " pre-LLVM passes, "
+                  << " unified pipeline passes, "
                   << result.transformations_made << " transformations made"
                   << std::endl;
         for (const auto& log_entry : result.pass_log) {
@@ -398,7 +370,7 @@ bool Driver::runIRGeneration() {
     }
 
     IRGenerator generator(program_, type_table_,
-                           &metadata_engine_.metadata());
+                           pipeline_ ? &pipeline_->metadata() : nullptr);
     ir_text_ = generator.generate();
 
     if (ir_text_.empty()) {

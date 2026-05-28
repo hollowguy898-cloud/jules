@@ -170,14 +170,6 @@ bool DeferCoalescerPass::coalesceBlock(BlockStmt& block) {
                 stmts[run_start]->sourceLoc(),
                 std::move(coalesced_block));
 
-            // Annotate the coalesced defer so the IR generator knows
-            // this is a coalesced cleanup block
-            if (annotations_) {
-                annotations_->annotate(coalesced_defer.get(),
-                    ASTAnnotationKind::ColdPath,
-                    "coalesced_defer:" + std::to_string(run_length));
-            }
-
             // Replace the first statement with the coalesced defer
             stmts[run_start] = std::move(coalesced_defer);
 

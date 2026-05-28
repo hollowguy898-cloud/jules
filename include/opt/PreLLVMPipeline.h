@@ -7,6 +7,12 @@
 #include <vector>
 #include <memory>
 #include "metadata/MetaTypes.h"
+#include "metadata/SemanticCollector.h"
+#include "metadata/ControlFlowSimplifier.h"
+#include "metadata/MemoryTopologyAnalyzer.h"
+#include "metadata/LayoutTransformer.h"
+#include "metadata/LLVMMetadataEmitter.h"
+#include "metadata/ProfileGuidedOptimizer.h"
 
 #include <string>
 #include <unordered_map>
@@ -25,63 +31,14 @@ enum class PreLLVMOptLevel : uint8_t {
 };
 
 // ============================================================================
-// AST Annotation Map
-//
-// A side-table for storing metadata on AST nodes that the pre-LLVM passes
-// compute and the IR generator later consumes. This avoids modifying the
-// existing AST node hierarchy.
-// ============================================================================
-enum class ASTAnnotationKind : uint8_t {
-    ColdPath,           // This node is on an error/cold path
-    OpaqueBarrier,      // This node crosses an opaque FFI boundary
-    PrefetchSite,       // Insert prefetch at this loop boundary
-    YieldPoint,         // Insert yield check at this point
-    SoATransformed,     // This struct has been SoA-transformed
-    AllocatorInlined,   // This allocation call was inlined
-    HotField,           // This field access is on the hot path (PGO)
-    ColdField,          // This field access is on the cold path (PGO)
-    StackAllocated      // This smart pointer allocation can use stack instead of heap
-};
-
-struct ASTAnnotation {
-    ASTAnnotationKind kind;
-    std::string detail;  // Optional detail string (e.g., branch weight, prefetch distance)
-};
-
-class ASTAnnotationMap {
-public:
-    void annotate(const ASTNode* node, ASTAnnotationKind kind, std::string detail = "") {
-        annotations_[node].push_back({kind, std::move(detail)});
-    }
-
-    bool hasAnnotation(const ASTNode* node, ASTAnnotationKind kind) const {
-        auto it = annotations_.find(node);
-        if (it == annotations_.end()) return false;
-        for (const auto& ann : it->second) {
-            if (ann.kind == kind) return true;
-        }
-        return false;
-    }
-
-    const std::vector<ASTAnnotation>* getAnnotations(const ASTNode* node) const {
-        auto it = annotations_.find(node);
-        if (it == annotations_.end()) return nullptr;
-        return &it->second;
-    }
-
-    void clear() { annotations_.clear(); }
-    size_t size() const { return annotations_.size(); }
-
-private:
-    std::unordered_map<const ASTNode*, std::vector<ASTAnnotation>> annotations_;
-};
-
-// ============================================================================
 // PreLLVMPass - base class for all pre-LLVM optimization passes
 //
 // These passes run on the AST BEFORE LLVM IR emission. They perform
 // transformations that LLVM cannot do because they require semantic
 // knowledge that is lost once we lower to LLVM IR.
+//
+// UNIFIED PIPELINE: All passes write to MetadataMap only.
+// The old ASTAnnotationMap dual-channel has been eliminated.
 // ============================================================================
 class PreLLVMPass {
 public:
@@ -98,14 +55,10 @@ public:
     // only if a pass does something LLVM already handles.
     virtual bool isRedundantWithLLVM() const { return false; }
 
-    // Set the annotation map for this pass to write metadata into
-    void setAnnotationMap(ASTAnnotationMap* annotations) { annotations_ = annotations; }
-
     // Set the metadata map for this pass to write typed metadata into
     void setMetadataMap(MetadataMap* meta_map) { meta_map_ = meta_map; }
 
 protected:
-    ASTAnnotationMap* annotations_ = nullptr;
     MetadataMap* meta_map_ = nullptr;
 };
 
@@ -119,18 +72,25 @@ struct PreLLVMPipelineResult {
 };
 
 // ============================================================================
-// PreLLVMPipeline - orchestrates all pre-LLVM optimization passes
+// PreLLVMPipeline - UNIFIED pre-LLVM optimization pipeline
 //
-// The pipeline runs passes in a specific order:
-//   1. Hot/Cold Field Splitting (PGO)   - splits structs before reordering
-//   2. Field Reordering                  - reorders for minimal padding
-//   3. AoS->SoA Transformation           - splits arrays of structs
-//   4. Error Path Separation             - annotates cold paths
-//   5. Opaque Type Barrier               - marks FFI boundaries
-//   6. Defer Chain Coalescing            - merges defer chains
-//   7. Allocator Inline Lowering         - inlines arena bump allocation
-//   8. Align-Guided Prefetch Insertion   - inserts prefetch instructions
-//   9. Yield Point Insertion             - inserts cooperative yield checks
+// This is a single coherent pipeline that runs both the MetadataEngine
+// analysis layers AND the pre-LLVM transform passes in the correct order.
+//
+// The old two-track system (MetadataEngine + PreLLVMPipeline running
+// separately with shared MetadataMap) caused clobbering, stale metadata,
+// and duplicated analysis. This unified pipeline fixes all of that.
+//
+// Pipeline ordering principle:
+//   1. Collect facts (semantic analysis, PGO, escape analysis)
+//   2. Refine facts (access patterns, control flow, error paths)
+//   3. Transform (layout changes: hot/cold split, reorder, SoA, bitfield)
+//   4. Tether-specific transforms (opaque barrier, defer, allocator)
+//   5. IR hints (prefetch, yield points)
+//   6. Emit LLVM metadata (MUST be last — sees final state)
+//
+// Every pass writes to a single MetadataMap. No dual-channel output.
+// L5 (LLVMMetadataEmitter) runs LAST so it sees all accumulated data.
 // ============================================================================
 class PreLLVMPipeline {
 public:
@@ -138,21 +98,42 @@ public:
 
     PreLLVMPipelineResult run(Program& program);
 
-    void addPass(std::unique_ptr<PreLLVMPass> pass);
+    // Access the unified metadata map
+    MetadataMap& metadata() { return metadata_; }
+    const MetadataMap& metadata() const { return metadata_; }
 
-    // Access the annotation map for downstream IR generation
-    ASTAnnotationMap& annotations() { return annotations_; }
-    const ASTAnnotationMap& annotations() const { return annotations_; }
+    // Load profile data (call before run() for PGO)
+    bool loadProfile(const std::string& profile_path);
+    bool hasProfile() const;
 
-    // Set the metadata map (passed from the Driver's MetadataEngine)
-    void setMetadataMap(MetadataMap* map) { metadata_map_ = map; }
+    // LLVM metadata emission queries (delegated to L5, which runs during pipeline)
+    std::string llvmMetadataBlock() const;
+    std::string fnAttributes(FnDecl& fn) const;
+    std::string paramAttributes(FnParam& param) const;
+    std::string memoryMetadata(Expr& expr) const;
+    std::string branchWeightMetadata(IfStmt& is) const;
+    std::string loopMetadata(WhileStmt& ws) const;
+
+    // Dump all metadata for inspection
+    std::string dump() const { return metadata_.dump(); }
 
 private:
     PreLLVMOptLevel level_;
     TypeTable& type_table_;
+    MetadataMap metadata_;
+
+    // Metadata engine layers (used as sub-passes in the unified pipeline)
+    SemanticCollector l1_;
+    ControlFlowSimplifier l2_;
+    MemoryTopologyAnalyzer l3_;
+    LayoutTransformer l4_;       // Now only does packed bitfield
+    LLVMMetadataEmitter l5_;
+    ProfileGuidedOptimizer l6_;
+
+    // Pre-LLVM transform passes (the "Track 2" passes, now integrated)
     std::vector<std::unique_ptr<PreLLVMPass>> passes_;
-    ASTAnnotationMap annotations_;
-    MetadataMap* metadata_map_ = nullptr;
+
+    void addPass(std::unique_ptr<PreLLVMPass> pass);
 };
 
 } // namespace tether
