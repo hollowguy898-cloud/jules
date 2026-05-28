@@ -17,11 +17,9 @@ namespace tether {
 // ============================================================================
 IRGenerator::IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
                          TypeTable& type_table,
-                         ASTAnnotationMap* annotations,
                          MetadataMap* meta_map)
     : program_(program)
     , type_table_(type_table)
-    , annotations_(annotations)
     , meta_map_(meta_map)
 {}
 
@@ -1111,9 +1109,12 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     // If the function takes or returns opaque types, add the
     // inaccessiblememonly attribute to prevent LLVM from making
     // aliasing assumptions across this function's calls.
-    if (hasOpaqueBarrierAnnotation(fn)) {
-        if (!fn->isPure()) {  // Pure functions already have memory(none)
-            sig += " inaccessiblememonly";
+    if (meta_map_) {
+        auto* nm = meta_map_->get(fn);
+        if (nm && nm->opaque_barrier) {
+            if (!fn->isPure()) {  // Pure functions already have memory(none)
+                sig += " inaccessiblememonly";
+            }
         }
     }
 
@@ -2362,10 +2363,13 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         }
 
         // --- Pre-LLVM optimization: opaque barrier fence ---
-        // If this call has an OpaqueBarrier annotation, emit a fence
-        // before and after the call to prevent reordering.
-        bool call_has_opaque_barrier = annotations_ &&
-            annotations_->hasAnnotation(&call, ASTAnnotationKind::OpaqueBarrier);
+        // If this call has an opaque barrier in the metadata map,
+        // emit a fence before and after the call to prevent reordering.
+        bool call_has_opaque_barrier = false;
+        if (meta_map_) {
+            auto* nm = meta_map_->get(&call);
+            call_has_opaque_barrier = nm && nm->opaque_barrier;
+        }
 
         // Emit arguments
         std::vector<std::string> arg_vals;
@@ -3384,11 +3388,17 @@ std::string IRGenerator::emitBoxNew(Expr* value, TypeId pointee_type) {
     uint64_t size = typeSizeBytes(pointee_type);
 
     // --- Pre-LLVM optimization: StackAllocated ---
-    // If the EscapeAnalysis pass annotated this Box as non-escaping,
-    // use alloca instead of malloc. This eliminates heap allocation
-    // overhead entirely for short-lived Boxes. LLVM CANNOT do this
-    // because malloc/free are opaque external calls.
-    if (annotations_ && annotations_->hasAnnotation(value, ASTAnnotationKind::StackAllocated)) {
+    // If the EscapeAnalysis pass marked this Box as non-escaping
+    // in the MetadataMap, use alloca instead of malloc. This
+    // eliminates heap allocation overhead entirely for short-lived
+    // Boxes. LLVM CANNOT do this because malloc/free are opaque
+    // external calls.
+    bool is_stack_allocated = false;
+    if (meta_map_) {
+        auto* nm = meta_map_->get(value);
+        is_stack_allocated = nm && nm->stack_allocated;
+    }
+    if (is_stack_allocated) {
         // Stack-allocated Box: alloca + store (no malloc/free)
         std::string stack_ptr = makeAllocaName("__stack_box");
         alloca_ss_ << "  " << stack_ptr << " = alloca " << ll << "\n";
@@ -3792,354 +3802,235 @@ int IRGenerator::getBranchWeightMetadataId(uint32_t cold_weight, uint32_t hot_we
 // emitColdPathMetadata – emit !prof metadata for cold/hot branch hints
 //
 // When a node (typically a TryExpr, IfStmt, or ErrdeferStmt) has a
-// ColdPath annotation from the ErrorPathSeparator pass, this method
-// creates LLVM branch weight metadata that tells the optimizer the
-// likely execution direction.
-//
-// The annotation detail string format is:
-//   "try_error_branch:COLD:HOT"   (e.g., "try_error_branch:1:1000")
-//   "catch_block"
-//   "errdefer_cleanup"
-//   "coalesced_defer:N"
-//   "error_function:NAME"
+// cold_path flag in the MetadataMap from the ErrorPathSeparator pass,
+// this method creates LLVM branch weight metadata that tells the
+// optimizer the likely execution direction.
 //
 // Returns a string like ", !prof !5" to append to a branch instruction,
-// or empty string if no annotation exists.
+// or empty string if no cold path metadata exists.
 // ============================================================================
 std::string IRGenerator::emitColdPathMetadata(const ASTNode* node) {
-    if (!annotations_ || !node) return "";
+    if (!meta_map_ || !node) return "";
 
-    auto* anns = annotations_->getAnnotations(node);
-    if (!anns) return "";
+    auto* nm = meta_map_->get(node);
+    if (!nm || !nm->llvm_meta.cold_path) return "";
 
-    for (const auto& ann : *anns) {
-        if (ann.kind != ASTAnnotationKind::ColdPath) continue;
-
-        // Parse the detail to extract branch weights
-        uint32_t cold_w = 1;
-        uint32_t hot_w = 1000;
-
-        // Detail format: "try_error_branch:COLD:HOT"
-        if (ann.detail.find("try_error_branch:") == 0) {
-            // Parse "try_error_branch:1:1000"
-            size_t first_colon = ann.detail.find(':', 17); // after "try_error_branch:"
-            if (first_colon != std::string::npos) {
-                try {
-                    cold_w = static_cast<uint32_t>(std::stoul(ann.detail.substr(17, first_colon - 17)));
-                    hot_w = static_cast<uint32_t>(std::stoul(ann.detail.substr(first_colon + 1)));
-                } catch (...) {
-                    cold_w = 1; hot_w = 1000;
-                }
-            }
-        } else if (ann.detail == "catch_block" ||
-                   ann.detail == "errdefer_cleanup" ||
-                   ann.detail.find("coalesced_defer:") == 0) {
-            cold_w = 1;
-            hot_w = 2000;
-        } else if (ann.detail.find("error_function:") == 0) {
-            cold_w = 1;
-            hot_w = 500;
-        } else {
-            // Generic cold path annotation
-            cold_w = 1;
-            hot_w = 1000;
-        }
-
-        int prof_id = getBranchWeightMetadataId(cold_w, hot_w);
-        return ", !prof !" + std::to_string(prof_id);
-    }
-
-    return "";
+    // Use default cold path weights: 1 (cold) : 1000 (hot)
+    int prof_id = getBranchWeightMetadataId(1, 1000);
+    return ", !prof !" + std::to_string(prof_id);
 }
 
 // ============================================================================
 // emitPrefetchIfAnnotated – emit prefetch intrinsics for aligned loop access
 //
-// When a WhileStmt has a PrefetchSite annotation from the PrefetchInserter
-// pass, this method emits:
+// When a WhileStmt has a prefetch_distance > 0 in the MetadataMap
+// from the PrefetchInserter pass, this method emits:
 //   call void @llvm.prefetch(ptr %next_addr, i32 0, i32 3, i32 1)
-//
-// The annotation detail format is:
-//   "align:ALIGNMENT:distance:DISTANCE"
 //
 // This is called at the top of the loop body, before any other statements.
 // ============================================================================
 void IRGenerator::emitPrefetchIfAnnotated(WhileStmt* loop) {
-    if (!annotations_ || !loop) return;
+    if (!meta_map_ || !loop) return;
 
-    auto* anns = annotations_->getAnnotations(loop);
-    if (!anns) return;
+    auto* nm = meta_map_->get(loop);
+    if (!nm || nm->llvm_meta.prefetch_distance <= 0) return;
 
-    for (const auto& ann : *anns) {
-        if (ann.kind != ASTAnnotationKind::PrefetchSite) continue;
+    int distance = static_cast<int>(nm->llvm_meta.prefetch_distance);
 
-        // Parse detail: "align:64:distance:8"
-        uint32_t align = 64;
-        int distance = 8;
+    // Emit the prefetch intrinsic declaration
+    needed_runtime_.insert("prefetch");
 
-        if (ann.detail.find("align:") == 0) {
-            size_t pos = 6;
-            size_t colon = ann.detail.find(':', pos);
-            if (colon != std::string::npos) {
-                try {
-                    align = static_cast<uint32_t>(std::stoul(ann.detail.substr(pos, colon - pos)));
-                } catch (...) {}
-            }
-            // Look for ":distance:N"
-            size_t dist_pos = ann.detail.find(":distance:");
-            if (dist_pos != std::string::npos) {
-                try {
-                    distance = std::stoi(ann.detail.substr(dist_pos + 10));
-                } catch (...) {}
-            }
-        }
+    body_ss_ << "  ; [prefetch] distance=" << distance
+             << " (MetadataMap prefetch hint)\n";
 
-        // Emit the prefetch intrinsic declaration
-        needed_runtime_.insert("prefetch");
-
-        // Emit a prefetch for the next iteration's data.
-        // In practice, the IR generator would need to know the array base address
-        // and the loop index to compute the prefetch address. Since we don't have
-        // that information at the annotation level, we emit a placeholder comment
-        // and the prefetch call structure. The LLVM optimizer will handle the rest
-        // when combined with the alignment metadata on the data.
-        body_ss_ << "  ; [prefetch] align=" << align << " distance=" << distance
-                 << " (PrefetchSite annotation)\n";
-
-        // Emit the llvm.prefetch intrinsic - this tells LLVM to prefetch
-        // the cache line containing the address. The actual address computation
-        // is done by the loop's GEP instructions which LLVM can analyze.
-        // We emit a generic prefetch at the loop body entry point.
-        // The 4th arg: 1 = data prefetch (not instruction)
-        body_ss_ << "  call void @llvm.prefetch.p0(ptr null, i32 0, i32 3, i32 1)"
-                 << " ; prefetch hint (alignment-guided)\n";
-        break;  // Only process the first PrefetchSite annotation
-    }
+    // Emit the llvm.prefetch intrinsic
+    body_ss_ << "  call void @llvm.prefetch.p0(ptr null, i32 0, i32 3, i32 1)"
+             << " ; prefetch hint (alignment-guided)\n";
 }
 
 // ============================================================================
 // emitYieldCheckIfAnnotated – emit cooperative yield checks in loops
 //
-// When a WhileStmt has a YieldPoint annotation from the YieldPointInserter
-// pass, this method emits a counter-based yield check:
-//
-//   %counter = alloca i64
-//   store i64 0, ptr %counter
-//   ; ... at top of loop body:
-//   %val = load i64, ptr %counter
-//   %inc = add i64 %val, 1
-//   store i64 %inc, ptr %counter
-//   %mod = srem i64 %inc, INTERVAL
-//   %should = icmp eq i64 %mod, 0
-//   br i1 %should, label %yield.check, label %yield.skip
-// yield.check:
-//   call void @tether_yield(i64 0)
-//   br label %yield.skip
-// yield.skip:
-//
-// The annotation detail format is:
-//   "loop_yield:interval:N"
+// When a WhileStmt has yield_point = true in the MetadataMap
+// from the YieldPointInserter pass, this method emits a counter-based
+// yield check.
 // ============================================================================
 void IRGenerator::emitYieldCheckIfAnnotated(WhileStmt* loop) {
-    if (!annotations_ || !loop) return;
+    if (!meta_map_ || !loop) return;
 
-    auto* anns = annotations_->getAnnotations(loop);
-    if (!anns) return;
+    auto* nm = meta_map_->get(loop);
+    if (!nm || !nm->yield_point) return;
 
-    for (const auto& ann : *anns) {
-        if (ann.kind != ASTAnnotationKind::YieldPoint) continue;
+    // Use a default interval of 256 iterations
+    int interval = 256;
 
-        // Parse interval from detail: "loop_yield:interval:256"
-        int interval = 256;
-        if (ann.detail.find("loop_yield:interval:") == 0) {
-            try {
-                interval = std::stoi(ann.detail.substr(20));
-            } catch (...) {
-                interval = 256;
-            }
-        }
+    needed_runtime_.insert("tether_yield");
 
-        needed_runtime_.insert("tether_yield");
+    // Create a hidden counter alloca for this loop's yield check
+    std::string counter_alloca = makeAllocaName("__yield_counter_" + current_fn_name_);
+    alloca_ss_ << "  " << counter_alloca << " = alloca i64\n";
+    body_ss_ << "  store i64 0, ptr " << counter_alloca << "\n";
 
-        // Create a hidden counter alloca for this loop's yield check
-        std::string counter_alloca = makeAllocaName("__yield_counter_" + current_fn_name_);
-        alloca_ss_ << "  " << counter_alloca << " = alloca i64\n";
-        body_ss_ << "  store i64 0, ptr " << counter_alloca << "\n";
+    // At the top of the loop body: increment counter and check
+    std::string counter_val = nextReg();
+    body_ss_ << "  " << counter_val << " = load i64, ptr " << counter_alloca << "\n";
+    std::string incremented = nextReg();
+    body_ss_ << "  " << incremented << " = add i64 " << counter_val << ", 1\n";
+    body_ss_ << "  store i64 " << incremented << ", ptr " << counter_alloca << "\n";
+    std::string mod_val = nextReg();
+    body_ss_ << "  " << mod_val << " = srem i64 " << incremented << ", " << interval << "\n";
+    std::string should_yield = nextReg();
+    body_ss_ << "  " << should_yield << " = icmp eq i64 " << mod_val << ", 0\n";
 
-        // At the top of the loop body: increment counter and check
-        std::string counter_val = nextReg();
-        body_ss_ << "  " << counter_val << " = load i64, ptr " << counter_alloca << "\n";
-        std::string incremented = nextReg();
-        body_ss_ << "  " << incremented << " = add i64 " << counter_val << ", 1\n";
-        body_ss_ << "  store i64 " << incremented << ", ptr " << counter_alloca << "\n";
-        std::string mod_val = nextReg();
-        body_ss_ << "  " << mod_val << " = srem i64 " << incremented << ", " << interval << "\n";
-        std::string should_yield = nextReg();
-        body_ss_ << "  " << should_yield << " = icmp eq i64 " << mod_val << ", 0\n";
+    std::string yield_check_l = nextLabel("yield.check");
+    std::string yield_skip_l = nextLabel("yield.skip");
 
-        std::string yield_check_l = nextLabel("yield.check");
-        std::string yield_skip_l = nextLabel("yield.skip");
+    body_ss_ << "  br i1 " << should_yield << ", label %" << yield_check_l
+             << ", label %" << yield_skip_l << "\n";
+    setTerminated(false);
 
-        body_ss_ << "  br i1 " << should_yield << ", label %" << yield_check_l
-                 << ", label %" << yield_skip_l << "\n";
-        setTerminated(false);
+    body_ss_ << yield_check_l << ":\n";
+    body_ss_ << "  call void @tether_yield(i64 0)\n";
+    body_ss_ << "  br label %" << yield_skip_l << "\n";
+    setTerminated(false);
 
-        body_ss_ << yield_check_l << ":\n";
-        body_ss_ << "  call void @tether_yield(i64 0)\n";
-        body_ss_ << "  br label %" << yield_skip_l << "\n";
-        setTerminated(false);
-
-        body_ss_ << yield_skip_l << ":\n";
-        setTerminated(false);
-        break;  // Only process the first YieldPoint annotation
-    }
+    body_ss_ << yield_skip_l << ":\n";
+    setTerminated(false);
 }
 
 // ============================================================================
 // hasOpaqueBarrierAnnotation – check if a function has an opaque barrier
+//
+// Now checks the MetadataMap instead of the ASTAnnotationMap.
 // ============================================================================
 bool IRGenerator::hasOpaqueBarrierAnnotation(FnDecl* fn) const {
-    if (!annotations_ || !fn) return false;
-    return annotations_->hasAnnotation(fn, ASTAnnotationKind::OpaqueBarrier);
+    if (!meta_map_ || !fn) return false;
+    auto* nm = meta_map_->get(fn);
+    return nm && nm->opaque_barrier;
 }
 
 // ============================================================================
 // emitInlineAllocatorIfAnnotated – inline arena bump allocation
 //
-// When a CallExpr has an AllocatorInlined annotation from the
-// AllocatorLowerer pass, emit inline bump allocation code:
-//
-//   %old = load ptr, ptr %arena.offset
-//   %aligned = add ptr %old, ALIGN_UP(size, 8)
-//   store ptr %aligned, ptr %arena.offset
-//   ; result = %old (pointer to newly allocated memory)
-//
-// The annotation detail format is:
-//   "arena_inline:SIZE"
+// When a CallExpr has allocator_inlined = true in the MetadataMap
+// from the AllocatorLowerer pass, emit inline bump allocation code.
 // ============================================================================
 std::string IRGenerator::emitInlineAllocatorIfAnnotated(CallExpr* call, TypeId /*ret_type*/) {
-    if (!annotations_ || !call) return "";
+    if (!meta_map_ || !call) return "";
 
-    auto* anns = annotations_->getAnnotations(call);
-    if (!anns) return "";
+    auto* nm = meta_map_->get(call);
+    if (!nm || !nm->allocator_inlined) return "";
 
-    for (const auto& ann : *anns) {
-        if (ann.kind != ASTAnnotationKind::AllocatorInlined) continue;
+    // Use a default allocation size of 8 bytes
+    // (The exact size is not stored in the MetadataMap; the IR generator
+    // can compute it from the call's type information.)
+    uint64_t alloc_size = 8;
 
-        // Parse size from detail: "arena_inline:16"
-        uint64_t alloc_size = 8;
-        if (ann.detail.find("arena_inline:") == 0) {
-            try {
-                alloc_size = std::stoull(ann.detail.substr(13));
-            } catch (...) {
-                alloc_size = 8;
-            }
+    // Try to infer the allocation size from the call's return type
+    if (call->hasType()) {
+        TypeId ret_type = call->getType();
+        if (ret_type && !ret_type.isNull()) {
+            uint64_t computed_size = typeSizeBytes(ret_type);
+            if (computed_size > 0) alloc_size = computed_size;
         }
-
-        // Align up to 16 bytes (common arena alignment)
-        uint64_t aligned_size = ((alloc_size + 15) / 16) * 16;
-
-        // Get the callee (should be allocator.alloc or allocator.create)
-        // The object is the allocator variable
-        std::string callee_str;
-        if (auto* member = dyn_cast<MemberExpr>(call->callee())) {
-            callee_str = emitLValue(member->object());
-        } else {
-            callee_str = emitExpr(call->callee());
-        }
-
-        // Emit inline arena bump allocation:
-        //   %old = load ptr, ptr %allocator.offset
-        //   %aligned = add ptr %old, SIZE
-        //   store ptr %aligned, ptr %allocator.offset
-        //   result = %old
-        std::string old_ptr = nextReg();
-        body_ss_ << "  " << old_ptr << " = load ptr, ptr " << callee_str << "\n";
-
-        std::string new_ptr = nextReg();
-        body_ss_ << "  " << new_ptr << " = getelementptr i8, ptr " << old_ptr
-                 << ", i64 " << aligned_size << "\n";
-        body_ss_ << "  store ptr " << new_ptr << ", ptr " << callee_str << "\n";
-
-        // Zero-initialize the allocated memory
-        needed_runtime_.insert("memset");
-        body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << old_ptr
-                 << ", i8 0, i64 " << alloc_size << ", i1 false)\n";
-
-        return old_ptr;
     }
 
-    return "";
+    // Align up to 16 bytes (common arena alignment)
+    uint64_t aligned_size = ((alloc_size + 15) / 16) * 16;
+
+    // Get the callee (should be allocator.alloc or allocator.create)
+    // The object is the allocator variable
+    std::string callee_str;
+    if (auto* member = dyn_cast<MemberExpr>(call->callee())) {
+        callee_str = emitLValue(member->object());
+    } else {
+        callee_str = emitExpr(call->callee());
+    }
+
+    // Emit inline arena bump allocation:
+    //   %old = load ptr, ptr %allocator.offset
+    //   %aligned = add ptr %old, SIZE
+    //   store ptr %aligned, ptr %allocator.offset
+    //   result = %old
+    std::string old_ptr = nextReg();
+    body_ss_ << "  " << old_ptr << " = load ptr, ptr " << callee_str << "\n";
+
+    std::string new_ptr = nextReg();
+    body_ss_ << "  " << new_ptr << " = getelementptr i8, ptr " << old_ptr
+             << ", i64 " << aligned_size << "\n";
+    body_ss_ << "  store ptr " << new_ptr << ", ptr " << callee_str << "\n";
+
+    // Zero-initialize the allocated memory
+    needed_runtime_.insert("memset");
+    body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << old_ptr
+             << ", i8 0, i64 " << alloc_size << ", i1 false)\n";
+
+    return old_ptr;
 }
 
 // ============================================================================
 // hasSoAAnnotation – check if an expression has a SoA transform annotation
+//
+// Now checks the MetadataMap instead of the ASTAnnotationMap.
 // ============================================================================
 bool IRGenerator::hasSoAAnnotation(Expr* expr) const {
-    if (!annotations_ || !expr) return false;
-    return annotations_->hasAnnotation(expr, ASTAnnotationKind::SoATransformed);
+    if (!meta_map_ || !expr) return false;
+    auto* nm = meta_map_->get(expr);
+    return nm && nm->soa_transformed;
 }
 
 // ============================================================================
 // emitSoAAccessIfAnnotated – emit SoA-transformed array access
 //
-// When a MemberExpr has a SoATransformed annotation from the AoS→SoA pass,
-// rewrite the access pattern:
-//
-// Original: data[i].field  →  load %struct.Vec3, ptr %gep
-// SoA:      data_field[i]  →  load float, ptr %gep
-//
-// The annotation detail format is:
-//   "STRUCT_NAME:FIELD_ARRAY_NAME" (e.g., "Vec3:data_x")
+// When a MemberExpr has soa_transformed = true in the MetadataMap
+// from the AoS→SoA pass, rewrite the access pattern.
 // ============================================================================
 std::string IRGenerator::emitSoAAccessIfAnnotated(Expr* expr) {
-    if (!annotations_ || !expr) return "";
+    if (!meta_map_ || !expr) return "";
 
-    auto* anns = annotations_->getAnnotations(expr);
-    if (!anns) return "";
+    auto* nm = meta_map_->get(expr);
+    if (!nm || !nm->soa_transformed) return "";
 
-    for (const auto& ann : *anns) {
-        if (ann.kind != ASTAnnotationKind::SoATransformed) continue;
+    // For a MemberExpr on an IndexExpr, we need to:
+    // 1. Get the index value from the IndexExpr
+    // 2. Access the SoA field array at that index
+    if (auto* member = dyn_cast<MemberExpr>(expr)) {
+        if (auto* index = dyn_cast<IndexExpr>(member->object())) {
+            // Emit the index value
+            std::string idx_val = emitExpr(index->index());
 
-        // Parse detail: "Vec3:data_x"
-        std::string field_array_name;
-        size_t colon_pos = ann.detail.find(':');
-        if (colon_pos != std::string::npos) {
-            field_array_name = ann.detail.substr(colon_pos + 1);
-        }
-
-        if (field_array_name.empty()) continue;
-
-        // For a MemberExpr on an IndexExpr, we need to:
-        // 1. Get the index value from the IndexExpr
-        // 2. Access the SoA field array at that index
-        if (auto* member = dyn_cast<MemberExpr>(expr)) {
-            if (auto* index = dyn_cast<IndexExpr>(member->object())) {
-                // Emit the index value
-                std::string idx_val = emitExpr(index->index());
-
-                // Emit the SoA array access: @structname_fieldname[idx]
-                std::string soa_array = "@" + sanitizeName(field_array_name);
-                std::string gep = nextReg();
-
-                // Get the element type from the expression's type
-                std::string ll = llvmType(expr->getType());
-
-                body_ss_ << "  " << gep << " = getelementptr " << ll
-                         << ", ptr " << soa_array << ", i64 " << idx_val << "\n";
-
-                if (isAggregateType(expr->getType())) return gep;
-
-                std::string loaded = nextReg();
-                body_ss_ << "  " << loaded << " = load " << ll << ", ptr " << gep << "\n";
-                return loaded;
+            // Look up the field array name from the struct metadata
+            std::string field_array_name;
+            if (index->object()->hasType()) {
+                TypeId obj_type = index->object()->getType();
+                if (obj_type && isa<StructType>(obj_type)) {
+                    auto& st = cast<StructType>(obj_type);
+                    field_array_name = sanitizeName(st.name()) + "_" + member->field();
+                }
             }
-        }
+            if (field_array_name.empty()) {
+                field_array_name = sanitizeName(member->field());
+            }
 
-        // Fallback: if we can't rewrite, return empty and let normal emission happen
-        break;
+            // Emit the SoA array access: @structname_fieldname[idx]
+            std::string soa_array = "@" + field_array_name;
+            std::string gep = nextReg();
+
+            // Get the element type from the expression's type
+            std::string ll = llvmType(expr->getType());
+
+            body_ss_ << "  " << gep << " = getelementptr " << ll
+                     << ", ptr " << soa_array << ", i64 " << idx_val << "\n";
+
+            if (isAggregateType(expr->getType())) return gep;
+
+            std::string loaded = nextReg();
+            body_ss_ << "  " << loaded << " = load " << ll << ", ptr " << gep << "\n";
+            return loaded;
+        }
     }
 
+    // Fallback: if we can't rewrite, return empty and let normal emission happen
     return "";
 }
 

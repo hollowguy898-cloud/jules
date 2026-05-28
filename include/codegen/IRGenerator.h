@@ -2,7 +2,6 @@
 
 #include "ast/AST.h"
 #include "sema/Type.h"
-#include "opt/PreLLVMPipeline.h"
 #include "metadata/MetaTypes.h"
 
 #include <string>
@@ -50,15 +49,14 @@ public:
     // -----------------------------------------------------------------------
     // Construction
     //
-    // annotations: optional annotation map from the PreLLVM optimization
-    // pipeline. When provided, the IR generator consumes optimization
-    // metadata (cold paths, prefetch sites, yield points, SoA transforms,
-    // allocator lowering, opaque barriers) and emits the corresponding
-    // LLVM IR constructs.
+    // meta_map: optional MetadataMap from the unified metadata pipeline
+    // (MetadataEngine + PreLLVMPipeline). When provided, the IR generator
+    // consumes typed optimization metadata (cold paths, prefetch sites,
+    // yield points, SoA transforms, allocator lowering, opaque barriers)
+    // and emits the corresponding LLVM IR constructs.
     // -----------------------------------------------------------------------
     IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
                 TypeTable& type_table,
-                ASTAnnotationMap* annotations = nullptr,
                 MetadataMap* meta_map = nullptr);
 
     // -----------------------------------------------------------------------
@@ -170,7 +168,6 @@ private:
     // =======================================================================
     const std::vector<std::unique_ptr<TopLevel>>& program_;
     TypeTable& type_table_;
-    ASTAnnotationMap* annotations_;  // May be nullptr if no pre-LLVM opts ran
     MetadataMap* meta_map_;          // May be nullptr if metadata engine not run
 
     // =======================================================================
@@ -593,13 +590,14 @@ public:
     int emitSimdLoopMetadata();
 
     // =======================================================================
-    // Annotation-driven emission helpers
+    // Metadata-driven emission helpers
     //
-    // These methods check the ASTAnnotationMap for optimization metadata
-    // computed by the pre-LLVM pipeline and emit the appropriate LLVM IR.
+    // These methods check the MetadataMap for optimization metadata
+    // computed by the unified metadata pipeline and emit the appropriate
+    // LLVM IR.
     // =======================================================================
 
-    // Check if a node has a ColdPath annotation; if so, emit branch weight
+    // Check if a node has a cold_path flag; if so, emit branch weight
     // metadata on the enclosing branch instruction.
     // Returns the profile metadata string (e.g., "!prof !5") or empty string.
     std::string emitColdPathMetadata(const ASTNode* node);

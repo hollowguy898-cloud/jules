@@ -144,10 +144,8 @@ private:
     std::string ir_file_path_;                                   // Phase 8
     std::string obj_file_path_;                                  // Phase 9
 
-    // Annotation map from pre-LLVM optimization passes (consumed by IR gen)
-    ASTAnnotationMap prellvm_annotations_;                        // Phase 5
-
     // Metadata engine (6-layer post-Moore optimization pipeline)
+    // Also serves as the unified metadata store for Pre-LLVM passes
     MetadataEngine metadata_engine_;                              // Phase 4.5
 
     // -----------------------------------------------------------------------

@@ -185,6 +185,10 @@ bool PrefetchInserterPass::processWhileLoop(WhileStmt& loop, TypeTable& /*type_t
             annotations_->annotate(&loop,
                 ASTAnnotationKind::PrefetchSite, prefetch_detail);
         }
+        if (meta_map_) {
+            auto& nm = meta_map_->getOrCreate(&loop);
+            nm.llvm_meta.prefetch_distance = DEFAULT_PREFETCH_DISTANCE;
+        }
         prefetches_inserted_++;
         return true;
     }

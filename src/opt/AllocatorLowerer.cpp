@@ -280,6 +280,10 @@ bool AllocatorLowererPass::lowerCallExpr(CallExpr& call, TypeTable& /*type_table
             annotations_->annotate(&call,
                 ASTAnnotationKind::AllocatorInlined, detail);
         }
+        if (meta_map_) {
+            auto& nm = meta_map_->getOrCreate(&call);
+            nm.allocator_inlined = true;
+        }
         arenas_lowered_++;
         return true;
     }

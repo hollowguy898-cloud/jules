@@ -163,6 +163,9 @@ bool EscapeAnalysisPass::analyzeFn(FnDecl& fn, TypeTable& /*type_table*/) {
                 ASTAnnotationKind::StackAllocated,
                 detail);
         }
+        if (meta_map_) {
+            meta_map_->getOrCreate(alloc_call).stack_allocated = true;
+        }
 
         // Update stats
         switch (sp_kind) {

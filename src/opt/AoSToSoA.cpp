@@ -76,6 +76,25 @@ bool AoSToSoAPass::transformStruct(StructDecl& decl, TypeTable& type_table) {
         }
     }
 
+    // Write SoA transform to MetadataMap
+    if (meta_map_) {
+        auto& nm = meta_map_->getOrCreate(&decl);
+        nm.soa_transformed = true;
+        nm.layout = LayoutKind::SoA;
+
+        // Also register/update the struct metadata
+        MetadataMap::StructMeta smeta;
+        smeta.name = decl.name();
+        smeta.layout = LayoutKind::SoA;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            smeta.field_names.push_back(fields[i].name);
+        }
+        smeta.transform.kind = TransformKind::SoATransform;
+        smeta.transform.struct_name = decl.name();
+        smeta.transform.detail = "soa_transform";
+        meta_map_->registerStruct(decl.name(), std::move(smeta));
+    }
+
     transform.was_transformed = true;
     transforms_.push_back(std::move(transform));
     return true;
@@ -122,6 +141,10 @@ bool AoSToSoAPass::transformAccesses(Program& program, const SoATransform& trans
                                                              transform.field_array_names[i];
                                         annotations_->annotate(member,
                                             ASTAnnotationKind::SoATransformed, detail);
+                                    }
+                                    if (meta_map_) {
+                                        auto& nm = meta_map_->getOrCreate(member);
+                                        nm.soa_transformed = true;
                                     }
                                     access_count++;
                                     break;

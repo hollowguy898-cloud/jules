@@ -314,10 +314,8 @@ bool Driver::runPreLLVMOptimizations() {
     }
 
     PreLLVMPipeline pipeline(pre_level, type_table_);
+    pipeline.setMetadataMap(&metadata_engine_.metadata());
     auto result = pipeline.run(program_);
-
-    // Save the annotation map so the IR generator can consume it
-    prellvm_annotations_ = std::move(pipeline.annotations());
 
     if (verbose_) {
         std::cerr << "[tether]   Ran " << result.passes_run
@@ -399,7 +397,7 @@ bool Driver::runIRGeneration() {
         std::cerr << "[tether] Phase 7: IR generation..." << std::endl;
     }
 
-    IRGenerator generator(program_, type_table_, &prellvm_annotations_,
+    IRGenerator generator(program_, type_table_,
                            &metadata_engine_.metadata());
     ir_text_ = generator.generate();
 

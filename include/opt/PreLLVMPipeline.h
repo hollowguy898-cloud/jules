@@ -6,6 +6,8 @@
 
 #include <vector>
 #include <memory>
+#include "metadata/MetaTypes.h"
+
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -99,8 +101,12 @@ public:
     // Set the annotation map for this pass to write metadata into
     void setAnnotationMap(ASTAnnotationMap* annotations) { annotations_ = annotations; }
 
+    // Set the metadata map for this pass to write typed metadata into
+    void setMetadataMap(MetadataMap* meta_map) { meta_map_ = meta_map; }
+
 protected:
     ASTAnnotationMap* annotations_ = nullptr;
+    MetadataMap* meta_map_ = nullptr;
 };
 
 // ============================================================================
@@ -138,11 +144,15 @@ public:
     ASTAnnotationMap& annotations() { return annotations_; }
     const ASTAnnotationMap& annotations() const { return annotations_; }
 
+    // Set the metadata map (passed from the Driver's MetadataEngine)
+    void setMetadataMap(MetadataMap* map) { metadata_map_ = map; }
+
 private:
     PreLLVMOptLevel level_;
     TypeTable& type_table_;
     std::vector<std::unique_ptr<PreLLVMPass>> passes_;
     ASTAnnotationMap annotations_;
+    MetadataMap* metadata_map_ = nullptr;
 };
 
 } // namespace tether

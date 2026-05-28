@@ -48,6 +48,9 @@ void ErrorPathSeparatorPass::walkFn(FnDecl& fn) {
                 ASTAnnotationKind::ColdPath,
                 "error_function:" + fn.name());
         }
+        if (meta_map_) {
+            meta_map_->getOrCreate(fn.body()).llvm_meta.cold_path = true;
+        }
     }
 
     walkBlock(fn.body());
@@ -290,6 +293,9 @@ void ErrorPathSeparatorPass::annotateTryExpr(TryExpr& expr) {
             ASTAnnotationKind::ColdPath,
             "try_error_branch:1:1000");
     }
+    if (meta_map_) {
+        meta_map_->getOrCreate(&expr).llvm_meta.cold_path = true;
+    }
     annotated_tries_++;
 }
 
@@ -328,6 +334,9 @@ void ErrorPathSeparatorPass::annotateBlock(BlockStmt* block) {
                 ASTAnnotationKind::ColdPath,
                 "catch_block");
         }
+        if (meta_map_) {
+            meta_map_->getOrCreate(block).llvm_meta.cold_path = true;
+        }
         annotated_catches_++;
     }
 }
@@ -341,6 +350,9 @@ void ErrorPathSeparatorPass::annotateErrdefer(ErrdeferStmt& stmt) {
         annotations_->annotate(&stmt,
             ASTAnnotationKind::ColdPath,
             "errdefer_cleanup");
+    }
+    if (meta_map_) {
+        meta_map_->getOrCreate(&stmt).llvm_meta.cold_path = true;
     }
     annotated_errdefers_++;
 }

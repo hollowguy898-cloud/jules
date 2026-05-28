@@ -59,6 +59,9 @@ bool OpaqueBarrierPass::processFnDecl(FnDecl& fn, TypeTable& type_table) {
                 ASTAnnotationKind::OpaqueBarrier,
                 "opaque_function:" + fn.name());
         }
+        if (meta_map_) {
+            meta_map_->getOrCreate(&fn).opaque_barrier = true;
+        }
         barriers_inserted_++;
     }
 
@@ -100,6 +103,9 @@ bool OpaqueBarrierPass::walkStmt(Stmt* stmt, TypeTable& type_table) {
                         ASTAnnotationKind::OpaqueBarrier,
                         "opaque_var:" + var.name());
                 }
+                if (meta_map_) {
+                    meta_map_->getOrCreate(&var).opaque_barrier = true;
+                }
                 barriers_inserted_++;
                 found = true;
             }
@@ -116,6 +122,9 @@ bool OpaqueBarrierPass::walkStmt(Stmt* stmt, TypeTable& type_table) {
                     annotations_->annotate(&val,
                         ASTAnnotationKind::OpaqueBarrier,
                         "opaque_val:" + val.name());
+                }
+                if (meta_map_) {
+                    meta_map_->getOrCreate(&val).opaque_barrier = true;
                 }
                 barriers_inserted_++;
                 found = true;
@@ -206,6 +215,9 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
                 ASTAnnotationKind::OpaqueBarrier,
                 "opaque_expr");
         }
+        if (meta_map_) {
+            meta_map_->getOrCreate(expr).opaque_barrier = true;
+        }
         barriers_inserted_++;
         found = true;
     }
@@ -231,6 +243,9 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
                         annotations_->annotate(call,
                             ASTAnnotationKind::OpaqueBarrier,
                             "ffi_call");
+                    }
+                    if (meta_map_) {
+                        meta_map_->getOrCreate(call).opaque_barrier = true;
                     }
                     barriers_inserted_++;
                     found = true;
@@ -270,6 +285,9 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
                 annotations_->annotate(cast_expr,
                     ASTAnnotationKind::OpaqueBarrier,
                     "opaque_cast");
+            }
+            if (meta_map_) {
+                meta_map_->getOrCreate(cast_expr).opaque_barrier = true;
             }
             barriers_inserted_++;
             found = true;

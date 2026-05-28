@@ -180,6 +180,13 @@ struct NodeMeta {
 
     // L6: Profile
     ProfileData profile;
+
+    // Pre-LLVM pass annotations (migrated from ASTAnnotationMap)
+    bool yield_point = false;          // cooperative yield check needed
+    bool opaque_barrier = false;       // FFI boundary, needs aliasing fence
+    bool allocator_inlined = false;    // arena bump was inlined
+    bool stack_allocated = false;      // smart pointer can use stack instead of heap
+    bool soa_transformed = false;      // this struct was SoA-transformed
 };
 
 // ============================================================================

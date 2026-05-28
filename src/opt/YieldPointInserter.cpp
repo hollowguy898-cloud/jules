@@ -112,9 +112,12 @@ bool YieldPointInserterPass::walkStmt(Stmt* stmt, TypeTable& type_table) {
                     annotations_->annotate(call,
                         ASTAnnotationKind::YieldPoint,
                         "pre_call_yield");
-                    yield_points_inserted_++;
-                    changed = true;
                 }
+                if (meta_map_) {
+                    meta_map_->getOrCreate(call).yield_point = true;
+                }
+                yield_points_inserted_++;
+                changed = true;
             }
             break;
         }
@@ -163,6 +166,9 @@ bool YieldPointInserterPass::processWhileLoop(WhileStmt& loop, TypeTable& /*type
         std::string detail = "loop_yield:interval:" + std::to_string(YIELD_INTERVAL);
         annotations_->annotate(&loop,
             ASTAnnotationKind::YieldPoint, detail);
+    }
+    if (meta_map_) {
+        meta_map_->getOrCreate(&loop).yield_point = true;
     }
     yield_points_inserted_++;
     return true;
