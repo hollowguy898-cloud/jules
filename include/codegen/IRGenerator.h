@@ -74,10 +74,12 @@ private:
     std::string llvmReturnType(TypeId type, bool can_error) const;
     std::string llvmParamType(TypeId type) const;
     std::string sanitizeName(const std::string& name) const;
+    std::string zeroConstant(const std::string& llvm_type) const;
     bool        isAggregateType(TypeId type) const;
     uint64_t    typeSizeBytes(TypeId type) const;
     uint64_t    typeAlignmentBytes(TypeId type) const;
     void        collectNeededTypes(TypeId type);
+    std::string emitTypeCast(const std::string& val, TypeId from_type, TypeId to_type);
 
     // =======================================================================
     // Register / label generation

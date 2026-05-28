@@ -26,6 +26,16 @@ IRGenerator::IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
 {}
 
 // ============================================================================
+// zeroConstant – return the LLVM IR zero constant for a given LLVM type
+// ============================================================================
+std::string IRGenerator::zeroConstant(const std::string& llvm_type) const {
+    if (llvm_type == "double") return "0.0";
+    if (llvm_type == "float")  return "0.0";
+    if (llvm_type == "void")   return "";  // caller should use "ret void"
+    return "0";
+}
+
+// ============================================================================
 // sanitizeName – replace characters illegal in LLVM identifiers with '_'
 // ============================================================================
 std::string IRGenerator::sanitizeName(const std::string& name) const {
@@ -319,6 +329,74 @@ std::string IRGenerator::llvmParamType(TypeId type) const {
 }
 
 // ============================================================================
+// emitTypeCast – emit a type conversion instruction and return the new register.
+// Returns the original value if no conversion is needed, or a new register
+// containing the converted value.
+// ============================================================================
+std::string IRGenerator::emitTypeCast(const std::string& val,
+                                       TypeId from_type, TypeId to_type) {
+    if (!from_type || !to_type) return val;
+    std::string from_ll = llvmType(from_type);
+    std::string to_ll = llvmType(to_type);
+    if (from_ll == to_ll) return val;
+    if (from_ll.empty() || to_ll.empty()) return val;
+
+    std::string conv = nextReg();
+
+    // bool → integer/float
+    if (from_ll == "i1") {
+        if (to_ll == "double" || to_ll == "float") {
+            body_ss_ << "  " << conv << " = uitofp i1 " << val << " to " << to_ll << "\n";
+        } else {
+            body_ss_ << "  " << conv << " = zext i1 " << val << " to " << to_ll << "\n";
+        }
+        return conv;
+    }
+
+    // integer → float/double
+    if ((to_ll == "double" || to_ll == "float") &&
+        !(from_ll == "double" || from_ll == "float")) {
+        bool is_signed = from_type->isSigned();
+        body_ss_ << "  " << conv << " = " << (is_signed ? "sitofp" : "uitofp")
+                 << " " << from_ll << " " << val << " to " << to_ll << "\n";
+        return conv;
+    }
+
+    // float/double → integer
+    if ((from_ll == "double" || from_ll == "float") &&
+        !(to_ll == "double" || to_ll == "float")) {
+        bool is_signed = to_type->isSigned();
+        body_ss_ << "  " << conv << " = " << (is_signed ? "fptosi" : "fptoui")
+                 << " " << from_ll << " " << val << " to " << to_ll << "\n";
+        return conv;
+    }
+
+    // float → float
+    if ((from_ll == "double" || from_ll == "float") &&
+        (to_ll == "double" || to_ll == "float")) {
+        body_ss_ << "  " << conv << " = fptrunc " << from_ll << " " << val
+                 << " to " << to_ll << "\n";
+        return conv;
+    }
+
+    // integer → integer
+    uint64_t from_bits = from_type->bitWidth();
+    uint64_t to_bits = to_type->bitWidth();
+    if (to_bits < from_bits) {
+        // Shrinking: use trunc
+        body_ss_ << "  " << conv << " = trunc " << from_ll << " " << val
+                 << " to " << to_ll << "\n";
+    } else if (to_bits > from_bits) {
+        // Extending: use sext for signed, zext for unsigned
+        bool is_signed = from_type->isSigned();
+        body_ss_ << "  " << conv << " = " << (is_signed ? "sext" : "zext")
+                 << " " << from_ll << " " << val << " to " << to_ll << "\n";
+    }
+    // Same size: no-op (shouldn't happen since from_ll == to_ll was checked)
+    return conv;
+}
+
+// ============================================================================
 // nextReg / nextLabel / makeAllocaName
 // ============================================================================
 std::string IRGenerator::nextReg() {
@@ -562,6 +640,15 @@ void IRGenerator::emitStringConstants() {
 // ============================================================================
 std::string IRGenerator::emitTBAAMetadataForField(const std::string& struct_name,
                                                     const std::string& field_name) {
+    // BUG FIX: Disable TBAA metadata for now — the format emitted by
+    // emitMetaMapTBAA() doesn't match LLVM 17's expected struct tag format,
+    // causing "Immutability part of the struct tag metadata must be either 0 or 1"
+    // verification errors. The type descriptors have offsets encoded in them
+    // which LLVM misinterprets as the constant/immutability flag.
+    // TODO: Implement proper LLVM 17 TBAA with separate type descriptors
+    // and access tags.
+    return "";
+#if 0
     if (!meta_map_) return "";
 
     // Look up the struct in the metadata map
@@ -582,7 +669,7 @@ std::string IRGenerator::emitTBAAMetadataForField(const std::string& struct_name
     if (it != metadata_map_.end()) {
         return ", !tbaa !" + std::to_string(it->second);
     }
-
+#endif
     return "";
 }
 
@@ -690,7 +777,7 @@ void IRGenerator::emitMetaMapTBAA() {
 
         int struct_id = struct_it->second;
         module_out_ << "!" << struct_id << " = !{!\"struct." << name
-                     << "\", !" << root_id << ", 0}\n";
+                     << "\", !" << root_id << ", i64 0}\n";
 
         uint64_t offset = 0;
         for (size_t i = 0; i < sm.field_names.size(); ++i) {
@@ -699,7 +786,7 @@ void IRGenerator::emitMetaMapTBAA() {
 
             module_out_ << "!" << field_it->second << " = !{!\"field."
                          << sm.field_names[i] << "\", !" << struct_id
-                         << ", " << offset << "}\n";
+                         << ", i64 " << offset << "}\n";
             offset += 8;
         }
     }
@@ -749,13 +836,17 @@ std::string IRGenerator::generate() {
     // 4. Emit string constants
     emitStringConstants();
 
-    // 5. Emit runtime declarations
-    emitRuntimeDecls();
-
-    // 6. Emit each top-level declaration
+    // 5. Emit each top-level declaration (before runtime declarations,
+    //    so that needed_runtime_ is fully populated by the time we emit them)
     for (const auto& tl : program_) {
         emitTopLevel(tl.get());
     }
+
+    // 6. Emit runtime declarations — must come AFTER top-level emission
+    //    because function bodies may insert entries into needed_runtime_
+    //    (e.g. tether_yield, memcpy, memset). LLVM IR allows forward
+    //    references, so declaring these after their use is valid.
+    emitRuntimeDecls();
 
     // 7. Emit metadata (IRGenerator's own + metadata engine's L5 block)
     emitMetadata();
@@ -800,36 +891,13 @@ void IRGenerator::emitTopLevel(TopLevel* tl) {
 // emitStructDecl – type definitions already emitted by emitTypeDefinitions
 // ============================================================================
 void IRGenerator::emitStructDecl(StructDecl* sd) {
-    // Type defs are handled in emitTypeDefinitions(), but if the struct has
-    // a non-default alignment, we need to re-emit with the alignment info.
+    // Type defs are handled in emitTypeDefinitions(). We do NOT re-emit here
+    // even for aligned structs, because emitTypeDefinitions() already wrote
+    // the type definition to module_out_ and we can't undo that.
+    // Alignment info is preserved as a comment for readability only.
     if (sd && sd->alignment() > 0) {
-        // BUG FIX: Build the correct key matching needed_types_ format.
-        // The key is type->toString() (e.g. "struct:Name{...}"), not sd->name().
-        // Since we need the type from the type table, build the body directly.
-        std::string body_str;
-        std::string ll_name = "%struct." + sanitizeName(sd->name());
-        for (size_t i = 0; i < sd->fieldCount(); ++i) {
-            if (i > 0) body_str += ", ";
-            body_str += llvmType(sd->fields()[i].type);
-        }
-        // Remove old entry with the non-aligned key if it exists, to avoid
-        // duplicate type definitions. Search by ll_name prefix.
-        for (auto it = needed_types_.begin(); it != needed_types_.end(); ++it) {
-            if (it->second.llvm_name == ll_name) {
-                needed_types_.erase(it);
-                break;
-            }
-        }
-        // Also remove from emit order
-        type_emit_order_.erase(
-            std::remove_if(type_emit_order_.begin(), type_emit_order_.end(),
-                [&](const std::string& k) {
-                    auto it = needed_types_.find(k);
-                    return it != needed_types_.end() && it->second.llvm_name == ll_name;
-                }),
-            type_emit_order_.end());
-
-        module_out_ << ll_name << " = type <{ " << body_str << " }> ; align " << sd->alignment() << "\n";
+        module_out_ << "; %struct." << sanitizeName(sd->name())
+                    << " has alignment " << sd->alignment() << "\n";
     }
 }
 
@@ -922,8 +990,8 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         bool is_ptr_type = p.type && (isa<PointerType>(p.type) ||
                                        isa<ReferenceType>(p.type) ||
                                        isa<MutReferenceType>(p.type) ||
-                                       isa<SliceType>(p.type) ||
                                        isa<AllocatorType>(p.type));
+        bool is_slice_type = p.type && isa<SliceType>(p.type);
 
         // noalias: &mut T and &T params don't alias other pointers
         // (borrow checker guarantees this for &mut; &T is also safe because
@@ -956,6 +1024,8 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
         }
 
         // dereferenceable(N): pointer points to at least N bytes
+        // NOTE: dereferenceable is only valid on pointer-typed params, not
+        // struct-typed params like slices. For slices, we use byval instead.
         if (is_ptr_type) {
             uint64_t deref_bytes = 0;
             if (isa<ReferenceType>(p.type)) {
@@ -964,8 +1034,6 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
                 deref_bytes = typeSizeBytes(cast<MutReferenceType>(p.type).referent());
             } else if (isa<PointerType>(p.type)) {
                 deref_bytes = typeSizeBytes(cast<PointerType>(p.type).pointee());
-            } else if (isa<SliceType>(p.type)) {
-                deref_bytes = 16;  // { ptr, i64 } = 16 bytes
             } else if (isa<AllocatorType>(p.type)) {
                 deref_bytes = 40;  // TetherAllocator = 5 pointers = 40 bytes
             }
@@ -1012,13 +1080,10 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
 
     // noalloc function attribute: guarantees no heap allocation.
     // This is a stronger version of "nounwind" for allocation-free code.
-    // We express this as a custom attribute + no memory allocation metadata.
-    if (fn->isNoalloc()) {
-        // noalloc implies no calls to malloc/free/new — annotate with
-        // "alloc-family" metadata so LLVM's allocator-related optimizations
-        // can reason about this function.
-        sig += " alloc-family(\"none\")";
-    }
+    // Note: LLVM 17 does not support "alloc-family" as a function attribute,
+    // so we simply skip emitting it. The noalloc guarantee is enforced by
+    // the Tether compiler, not by LLVM.
+    // (Do NOT emit a comment here — it would break the function signature.)
 
     // Inlining attribute (alwaysinline / inlinehint)
     sig += inlining_attr;
@@ -1043,7 +1108,12 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     }
 
     // Metadata for directives
-    std::string metadata_suffix;
+    // NOTE: LLVM function definitions only support !prof and !dbg metadata
+    // attachments. Arbitrary !N attachments are invalid LLVM IR and will
+    // cause llvm-as to reject the module. Instead, we emit directive info
+    // as comments and register the metadata node for the module-level
+    // metadata section (where it IS valid).
+    std::string metadata_comment;
     for (const auto& d : fn->directives()) {
         std::string key;
         switch (d) {
@@ -1052,7 +1122,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             case CompilerDirective::Simd:          key = "jules.simd"; break;
         }
         int id = getMetadataId(key);
-        metadata_suffix += " !" + std::to_string(id);
+        metadata_comment += " ; directive:" + key + " (!" + std::to_string(id) + ")";
     }
 
     // No body → declaration only (use dso_local for all declarations)
@@ -1066,7 +1136,6 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             bool is_ptr_type = p.type && (isa<PointerType>(p.type) ||
                                            isa<ReferenceType>(p.type) ||
                                            isa<MutReferenceType>(p.type) ||
-                                           isa<SliceType>(p.type) ||
                                            isa<AllocatorType>(p.type));
             if (p.type) {
                 if (isa<MutReferenceType>(p.type)) module_out_ << " noalias";
@@ -1143,7 +1212,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
                 body_ss_ << "  ret void\n";
             } else if (isAggregateType(current_return_type_)) {
                 // Aggregate: zero-initialize via memset, then load and return
-                std::string zero = nextReg();
+                std::string zero = makeAllocaName("__zero_ret");
                 alloca_ss_ << "  " << zero << " = alloca " << ll_val << "\n";
                 needed_runtime_.insert("memset");
                 body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << zero
@@ -1153,18 +1222,19 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
                 body_ss_ << "  " << loaded << " = load " << ll_val << ", ptr " << zero << "\n";
                 body_ss_ << "  ret " << ll_val << " " << loaded << "\n";
             } else {
-                body_ss_ << "  ret " << ll_val << " 0\n";
+                body_ss_ << "  ret " << ll_val << " " << zeroConstant(ll_val) << "\n";
             }
         } else if (current_return_type_ && current_return_type_->isVoid()) {
             body_ss_ << "  ret void\n";
         } else {
-            body_ss_ << "  ret " << llvmType(current_return_type_) << " 0\n";
+            std::string rt = llvmType(current_return_type_);
+            body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
         }
         setTerminated(true);
     }
 
     // Write the complete function
-    module_out_ << sig << metadata_suffix << " {\n";
+    module_out_ << sig << " {" << metadata_comment << "\n";
     module_out_ << "entry:\n";
     module_out_ << alloca_ss_.str();
     module_out_ << body_ss_.str();
@@ -1354,6 +1424,14 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             auto& as = cast<AssignStmt>(*stmt);
             TypeId target_type = as.target()->getType();
             std::string val = emitExpr(as.value());
+            TypeId val_type = as.value()->getType();
+
+            // BUG FIX: Convert the value to the target type if they differ.
+            if (val_type && target_type &&
+                !isAggregateType(target_type) &&
+                llvmType(val_type) != llvmType(target_type)) {
+                val = emitTypeCast(val, val_type, target_type);
+            }
 
             // Check if the target is a simple scalar variable (SSA-eligible)
             if (auto* ident = dyn_cast<IdentExpr>(as.target())) {
@@ -1441,12 +1519,14 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             // Snapshot SSA values at end of then-block
             SSASnapshot then_snap = takeSnapshot();
             // Remember which block branches to merge (for phi predecessor)
+            bool then_terminated = isTerminated();
             std::string then_exit_block = current_block_label_;
             if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
             setTerminated(false);
 
             SSASnapshot else_snap;
             std::string else_exit_block;
+            bool else_terminated = false;
             if (is.hasElse()) {
                 emitBlockLabel(else_l);
                 // Restore SSA values to pre-branch state before emitting else
@@ -1455,6 +1535,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 }
                 emitBlockStmt(is.elseBlock());
                 else_snap = takeSnapshot();
+                else_terminated = isTerminated();
                 else_exit_block = current_block_label_;
                 if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
                 setTerminated(false);
@@ -1464,10 +1545,36 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 else_exit_block = branch_block;
             }
 
-            emitBlockLabel(merge_l);
-            // Emit phi nodes for variables that differ between then and else paths
-            emitPhiNodes(then_snap, then_exit_block, else_snap, else_exit_block);
-            setTerminated(false);
+            // BUG FIX: Only emit the merge block and phi nodes if at least
+            // one path actually branches to merge (is not terminated with
+            // return/break). If both paths are terminated, the merge block
+            // is unreachable.
+            bool then_reaches_merge = !then_terminated;
+            bool else_reaches_merge = !else_terminated;
+
+            if (then_reaches_merge || else_reaches_merge) {
+                emitBlockLabel(merge_l);
+                // Emit phi nodes only for predecessors that actually branch to merge
+                if (then_reaches_merge && else_reaches_merge) {
+                    // Both paths reach merge — normal phi
+                    emitPhiNodes(then_snap, then_exit_block, else_snap, else_exit_block);
+                } else if (then_reaches_merge) {
+                    // Only then path reaches merge — no phi needed, just use then values
+                    for (auto& [name, val] : then_snap.values) {
+                        updateVarValue(name, val);
+                    }
+                } else {
+                    // Only else path reaches merge — no phi needed, just use else values
+                    for (auto& [name, val] : else_snap.values) {
+                        updateVarValue(name, val);
+                    }
+                }
+                setTerminated(false);
+            } else {
+                // Both paths are terminated — merge block is unreachable.
+                // Still need to set terminated state.
+                setTerminated(true);
+            }
             break;
         }
 
@@ -1644,12 +1751,16 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             emitDeferBlocks();
 
             if (current_can_error_) {
-                // Zig-style: return just the success value directly.
-                // No struct wrapping needed — the err_slot stays at 0 (no error),
-                // as initialized by the caller.  Success value returns in a register!
                 std::string vt = llvmType(current_return_type_);
                 if (rs.hasValue()) {
                     std::string val = emitExpr(rs.value());
+                    // BUG FIX: If the expression type doesn't match the return type,
+                    // insert a conversion (e.g. int→float).
+                    TypeId val_type = rs.value()->getType();
+                    if (val_type && current_return_type_ &&
+                        !isAggregateType(current_return_type_) && vt != "void") {
+                        val = emitTypeCast(val, val_type, current_return_type_);
+                    }
                     if (isAggregateType(current_return_type_)) {
                         std::string loaded = nextReg();
                         body_ss_ << "  " << loaded << " = load " << vt << ", ptr " << val << "\n";
@@ -1663,13 +1774,19 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                     if (vt == "void") {
                         body_ss_ << "  ret void\n";
                     } else {
-                        body_ss_ << "  ret " << vt << " 0\n";
+                        body_ss_ << "  ret " << vt << " " << zeroConstant(vt) << "\n";
                     }
                 }
             } else {
                 if (rs.hasValue()) {
                     std::string val = emitExpr(rs.value());
                     std::string ll = llvmType(current_return_type_);
+                    // BUG FIX: Same type conversion for non-error returns
+                    TypeId val_type = rs.value()->getType();
+                    if (val_type && current_return_type_ &&
+                        !isAggregateType(current_return_type_) && ll != "void") {
+                        val = emitTypeCast(val, val_type, current_return_type_);
+                    }
                     if (isAggregateType(current_return_type_)) {
                         std::string loaded = nextReg();
                         body_ss_ << "  " << loaded << " = load " << ll << ", ptr " << val << "\n";
@@ -1796,14 +1913,18 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             std::string merge_label = nextLabel("switch_merge");
             std::vector<std::string> arm_labels;
             for (size_t i = 0; i < sw.armCount(); ++i) {
-                arm_labels.push_back(nextLabel("switch_arm"));
+                arm_labels.push_back(nextLabel("sw_case"));
+            }
+
+            // Branch from current block to the first arm
+            if (!isTerminated()) {
+                body_ss_ << "  br label %" << arm_labels[0] << "\n";
             }
 
             for (size_t i = 0; i < sw.armCount(); ++i) {
                 const auto& arm = sw.arms()[i];
-                if (!isTerminated()) {
-                    emitBlockLabel(arm_labels[i]);
-                }
+                emitBlockLabel(arm_labels[i]);
+                setTerminated(false);
 
                 // Emit comparison: subject == pattern
                 std::string pattern_val = emitExpr(arm.pattern.get());
@@ -1885,6 +2006,18 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     // ========================================================================
     case NodeKind::IntLiteral: {
         auto& lit = cast<IntLiteral>(*expr);
+        // BUG FIX: If the target type is a float/double, emit as a float constant.
+        // LLVM IR requires float-typed constants (e.g. `ret double 2.0`),
+        // not bare integers in float contexts.
+        TypeId ty = expr->getType();
+        if (ty && ty->isFloat()) {
+            double d = static_cast<double>(lit.value());
+            uint64_t bits;
+            std::memcpy(&bits, &d, sizeof(d));
+            std::ostringstream oss;
+            oss << "0x" << std::hex << std::setfill('0') << std::setw(16) << bits;
+            return oss.str();
+        }
         return std::to_string(lit.value());
     }
 
@@ -1956,6 +2089,16 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         if (op == BinaryOp::Assign) {
             TypeId target_type = bin.left()->getType();
             std::string val = emitExpr(bin.right());
+            TypeId val_type = bin.right()->getType();
+
+            // BUG FIX: Convert the value to the target type if they differ.
+            // This handles cases like `counter: i32 = sum - 5` where the
+            // expression type (i64) differs from the variable type (i32).
+            if (val_type && target_type &&
+                !isAggregateType(target_type) &&
+                llvmType(val_type) != llvmType(target_type)) {
+                val = emitTypeCast(val, val_type, target_type);
+            }
 
             // Check if the target is a simple scalar variable (SSA-eligible)
             if (auto* ident = dyn_cast<IdentExpr>(bin.left())) {
@@ -2020,7 +2163,17 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 default: base_op = BinaryOp::Add; break;
             }
 
-            // Compute the new value
+            // Compute the new value — use target_type as the operand type,
+            // converting operands as needed to avoid type mismatches.
+            TypeId rhs_type = bin.right()->getType();
+            if (rhs_type && target_type && llvmType(rhs_type) != ll) {
+                rhs = emitTypeCast(rhs, rhs_type, target_type);
+            }
+            TypeId lhs_type = bin.left()->getType();
+            if (lhs_type && target_type && llvmType(lhs_type) != ll) {
+                lhs = emitTypeCast(lhs, lhs_type, target_type);
+            }
+
             std::string new_val;
             {
                 std::string reg = nextReg();
@@ -2046,10 +2199,48 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         // ---- Regular binary operators ----
         std::string lhs = emitExpr(bin.left());
         std::string rhs = emitExpr(bin.right());
-        // For comparison operators, the operand type differs from the result type (i1).
-        // icmp/fcmp operate on the operand type, not the result bool type.
-        TypeId operand_type = bin.left()->getType();
+        // BUG FIX: Use the expression's type (common type) rather than just the
+        // left operand's type. When operands have different types (e.g. i32 + i64),
+        // the semantic analyzer promotes both to the common type (i64). We need
+        // to emit conversions so both operands match the common type.
+        TypeId result_type = expr->getType();
+        TypeId lhs_type = bin.left()->getType();
+        TypeId rhs_type = bin.right()->getType();
+
+        // For comparison operators, the result type is i1 (bool), so we use
+        // the common operand type instead. For arithmetic, the result type IS
+        // the operand type.
+        TypeId operand_type;
+        bool is_cmp = (op >= BinaryOp::Eq && op <= BinaryOp::Ge);
+        if (is_cmp) {
+            // For comparisons, determine the operand type from the common type
+            // of the two operands. If they differ, use the larger type
+            // (which is the common type from the semantic analyzer).
+            if (lhs_type && rhs_type && lhs_type != rhs_type) {
+                if (lhs_type->bitWidth() >= rhs_type->bitWidth()) {
+                    operand_type = lhs_type;
+                } else {
+                    operand_type = rhs_type;
+                }
+            } else {
+                operand_type = lhs_type;
+            }
+        } else {
+            operand_type = result_type;
+        }
+
         std::string ll = llvmType(operand_type);
+
+        // Convert lhs to operand_type if needed
+        if (lhs_type && operand_type && llvmType(lhs_type) != ll) {
+            lhs = emitTypeCast(lhs, lhs_type, operand_type);
+        }
+
+        // Convert rhs to operand_type if needed
+        if (rhs_type && operand_type && llvmType(rhs_type) != ll) {
+            rhs = emitTypeCast(rhs, rhs_type, operand_type);
+        }
+
         std::string reg = nextReg();
         emitBinaryOp(reg, ll, lhs, op, rhs, operand_type);
         return reg;
@@ -2192,7 +2383,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         if (callee_can_error) {
             actual_ret = cast<ErrorType>(ret_type).successType();
             // Zig-style: allocate an i32 err_slot on the caller's stack
-            caller_err_slot_alloc = nextReg();
+            caller_err_slot_alloc = makeAllocaName("__err_slot");
             alloca_ss_ << "  " << caller_err_slot_alloc << " = alloca i32\n";
             body_ss_ << "  store i32 0, ptr " << caller_err_slot_alloc << "\n";
         }
@@ -2238,14 +2429,14 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 return "";  // void result — err_slot is tracked in caller_err_slot_
             } else if (isAggregateType(err.successType())) {
                 // Aggregate: store result in alloca, return pointer
-                std::string ea = nextReg();
+                std::string ea = makeAllocaName("__err_ret");
                 alloca_ss_ << "  " << ea << " = alloca " << vt << "\n";
                 body_ss_ << "  store " << vt << " " << result << ", ptr " << ea << "\n";
                 return ea;
             } else {
                 // Scalar: store result in alloca, return pointer
                 // (try-expression will load from this alloca)
-                std::string ea = nextReg();
+                std::string ea = makeAllocaName("__err_ret");
                 alloca_ss_ << "  " << ea << " = alloca " << vt << "\n";
                 body_ss_ << "  store " << vt << " " << result << ", ptr " << ea << "\n";
                 return ea;
@@ -2254,7 +2445,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         // Aggregate return: store in alloca
         if (isAggregateType(actual_ret)) {
-            std::string ea = nextReg();
+            std::string ea = makeAllocaName("__agg_ret");
             alloca_ss_ << "  " << ea << " = alloca " << ret_ll << "\n";
             body_ss_ << "  store " << ret_ll << " " << result << ", ptr " << ea << "\n";
             return ea;
@@ -2565,13 +2756,13 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         // from error-resilient compilation). Emit a zero-initialized alloca.
         if (!ty || !isa<StructType>(ty)) {
             std::string ll = llvmType(ty);
-            std::string aname = nextReg();
+            std::string aname = makeAllocaName("__sinit_fb");
             alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
             return aname;
         }
 
         std::string ll = llvmType(ty);
-        std::string aname = nextReg();
+        std::string aname = makeAllocaName("__sinit");
         alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
 
         // Zero-initialize
@@ -2722,11 +2913,12 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 if (crt == "void") {
                     body_ss_ << "  ret void\n";
                 } else {
-                    body_ss_ << "  ret " << crt << " 0\n";
+                    body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
                 }
             } else {
                 // Non-error function returning early from try — return zero
-                body_ss_ << "  ret " << llvmType(current_return_type_) << " 0\n";
+                std::string rt = llvmType(current_return_type_);
+                body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
             }
         }
         setTerminated(true);
@@ -3031,7 +3223,7 @@ void IRGenerator::emitBinaryOp(const std::string& result_reg,
 std::string IRGenerator::emitLValue(Expr* expr) {
     if (!expr) {
         // BUG FIX: Return a valid alloca instead of "null" string
-        std::string fallback = nextReg();
+        std::string fallback = makeAllocaName("__fallback");
         alloca_ss_ << "  " << fallback << " = alloca i8\n";
         return fallback;
     }
@@ -3074,7 +3266,7 @@ std::string IRGenerator::emitLValue(Expr* expr) {
                     int idx = st.fieldIndex(mem.field());
                     if (idx < 0) {
                         // BUG FIX: field not found — return fallback alloca
-                        std::string fallback = nextReg();
+                        std::string fallback = makeAllocaName("__fb_field");
                         alloca_ss_ << "  " << fallback << " = alloca i8\n";
                         return fallback;
                     }
@@ -3093,7 +3285,7 @@ std::string IRGenerator::emitLValue(Expr* expr) {
                 int idx = st.fieldIndex(mem.field());
                 if (idx < 0) {
                     // BUG FIX: field not found — return fallback alloca
-                    std::string fallback = nextReg();
+                    std::string fallback = makeAllocaName("__fb_field2");
                     alloca_ss_ << "  " << fallback << " = alloca i8\n";
                     return fallback;
                 }
@@ -3107,7 +3299,7 @@ std::string IRGenerator::emitLValue(Expr* expr) {
 
             // BUG FIX: Unknown member target — return fallback alloca
             {
-                std::string fallback = nextReg();
+                std::string fallback = makeAllocaName("__fb_mem");
                 alloca_ss_ << "  " << fallback << " = alloca i8\n";
                 return fallback;
             }
@@ -3188,7 +3380,7 @@ std::string IRGenerator::emitBoxNew(Expr* value, TypeId pointee_type) {
     // because malloc/free are opaque external calls.
     if (annotations_ && annotations_->hasAnnotation(value, ASTAnnotationKind::StackAllocated)) {
         // Stack-allocated Box: alloca + store (no malloc/free)
-        std::string stack_ptr = nextReg();
+        std::string stack_ptr = makeAllocaName("__stack_box");
         alloca_ss_ << "  " << stack_ptr << " = alloca " << ll << "\n";
         std::string val = emitExpr(value);
         if (isAggregateType(pointee_type)) {
@@ -3261,7 +3453,7 @@ std::string IRGenerator::emitRcNew(Expr* value, TypeId pointee_type) {
     // Build Rc struct { ptr, i64 }
     TypeId rc_type = type_table_.getSmartPointer(pointee_type, SmartPointerKind::Rc);
     std::string rct = llvmType(rc_type);
-    std::string ea = nextReg();
+    std::string ea = makeAllocaName("__rc");
     alloca_ss_ << "  " << ea << " = alloca " << rct << "\n";
 
     std::string pg = nextReg();
@@ -3295,7 +3487,7 @@ std::string IRGenerator::emitRcClone(const std::string& rc_ptr, TypeId pointee_t
     body_ss_ << "  store i64 " << nw << ", ptr " << rcg << "\n";
 
     // Copy struct
-    std::string na = nextReg();
+    std::string na = makeAllocaName("__rc_clone");
     alloca_ss_ << "  " << na << " = alloca " << rct << "\n";
     body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << na << ", ptr " << rc_ptr
              << ", i64 " << typeSizeBytes(rc_type) << ", i1 false)\n";
@@ -3362,7 +3554,7 @@ std::string IRGenerator::emitArcNew(Expr* value, TypeId pointee_type) {
     // Build Arc struct { ptr, i64 }
     TypeId arc_type = type_table_.getSmartPointer(pointee_type, SmartPointerKind::Arc);
     std::string at = llvmType(arc_type);
-    std::string ea = nextReg();
+    std::string ea = makeAllocaName("__arc");
     alloca_ss_ << "  " << ea << " = alloca " << at << "\n";
 
     std::string pg = nextReg();
@@ -3394,7 +3586,7 @@ std::string IRGenerator::emitArcClone(const std::string& arc_ptr, TypeId pointee
     body_ss_ << "  " << old << " = atomicrmw add i64 ptr " << rcg << ", i64 1 acquire\n";
 
     // Copy struct
-    std::string na = nextReg();
+    std::string na = makeAllocaName("__arc_clone");
     alloca_ss_ << "  " << na << " = alloca " << at << "\n";
     body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << na << ", ptr " << arc_ptr
              << ", i64 " << typeSizeBytes(arc_type) << ", i1 false)\n";
@@ -3467,12 +3659,13 @@ std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId er
         if (crt == "void") {
             body_ss_ << "  ret void\n";
         } else {
-            body_ss_ << "  ret " << crt << " 0\n";
+            body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
         }
     } else {
         // Non-error-returning function — return zero of the actual return type
         if (current_return_type_ && !current_return_type_->isVoid()) {
-            body_ss_ << "  ret " << llvmType(current_return_type_) << " 0\n";
+            std::string rt = llvmType(current_return_type_);
+            body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
         } else {
             body_ss_ << "  ret void\n";
         }
