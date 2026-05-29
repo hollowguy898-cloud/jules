@@ -8,6 +8,16 @@ CC        = gcc
 CXXFLAGS  = -std=c++17 -Wall -Wextra -O3 -march=native -flto -I include
 CFLAGS    = -std=c11 -Wall -Wextra -O2
 
+# mimalloc — fast allocator (2-3x faster than glibc malloc)
+# Automatically detected: if libmimalloc is installed, use it.
+# To disable: make CFLAGS="-DTETHER_NO_MIMALLOC" ...
+MIMALLOC_CFLAGS  := $(shell pkg-config --cflags mimalloc 2>/dev/null)
+MIMALLOC_LDFLAGS := $(shell pkg-config --libs mimalloc 2>/dev/null)
+ifneq ($(MIMALLOC_LDFLAGS),)
+CFLAGS   += $(MIMALLOC_CFLAGS) -DTETHER_USE_MIMALLOC
+LDFLAGS  += $(MIMALLOC_LDFLAGS)
+endif
+
 # Directories
 SRCDIR    = src
 INCDIR    = include

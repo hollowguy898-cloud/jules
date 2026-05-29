@@ -537,19 +537,50 @@ void BorrowChecker::invalidateReborrows(const PathExpr& parent_path,
 
 // ============================================================================
 // Phase 5: Check moves (strict enforcement)
+//
+// Swap/temp pattern fix: When a variable is reassigned (e.g., a = b),
+// the old value of `a` is discarded but `a` itself becomes valid again
+// with a new value. So we "un-move" `a` when it appears as the LHS of
+// an assignment. This allows patterns like:
+//   temp = a; a = b; b = temp;  (swap)
+//   a = a + 1;                  (self-update, not a move)
+//   val x = compute(); y = x;   (move into y, x is now moved)
+//   x = compute2();             (x is valid again — reinitialized)
 // ============================================================================
 void BorrowChecker::checkMoves(CFG& cfg) {
     for (const auto& node_ptr : cfg.nodes()) {
         CFGNode& node = *node_ptr;
 
-        // Check for moves: assignments where the RHS is a simple identifier
-        // that is not Copy
+        // Process statements in order so that reassignment "un-moves" take
+        // effect before subsequent use-after-move checks.
         for (auto* stmt : node.stmts()) {
             if (stmt->getKind() == NodeKind::AssignStmt) {
                 auto& as = static_cast<AssignStmt&>(*stmt);
+
+                // --- LHS handling: reassignment un-moves the target ---
+                // When `a = expr`, the old value of `a` is replaced with a new
+                // value, so `a` is now valid again (not moved-out anymore).
+                // This is critical for swap patterns: temp = a; a = b; b = temp;
+                if (as.target()->getKind() == NodeKind::IdentExpr) {
+                    auto& lhs = static_cast<IdentExpr&>(*as.target());
+                    const std::string& lhs_name = lhs.name();
+                    // Un-move: the variable is being reinitialized
+                    moved_out_vars_.erase(lhs_name);
+                }
+
+                // --- RHS handling: moving a value out ---
                 // If the RHS is a simple identifier, it might be a move
                 if (as.value()->getKind() == NodeKind::IdentExpr) {
                     auto& ie = static_cast<IdentExpr&>(*as.value());
+
+                    // Self-assignment check: a = a is a no-op, not a move
+                    if (as.target()->getKind() == NodeKind::IdentExpr) {
+                        auto& lhs = static_cast<IdentExpr&>(*as.target());
+                        if (lhs.name() == ie.name()) {
+                            // Self-assignment (a = a) — not a move, skip
+                            continue;
+                        }
+                    }
 
                     // Check if the variable is borrowed
                     const auto& live = live_in_[node.id()];
@@ -579,7 +610,28 @@ void BorrowChecker::checkMoves(CFG& cfg) {
                         }
                     }
 
-                    // Mark the variable as moved
+                    // Mark the RHS variable as moved
+                    markMoved(ie.name());
+                }
+            } else if (stmt->getKind() == NodeKind::VarDeclStmt) {
+                // var x = expr; — x is being initialized (not a move of x)
+                // If the RHS is a simple identifier, it's a move of that identifier
+                auto& vd = static_cast<VarDeclStmt&>(*stmt);
+                if (vd.hasInit() && vd.init()->getKind() == NodeKind::IdentExpr) {
+                    auto& ie = static_cast<IdentExpr&>(*vd.init());
+                    // The newly declared variable is valid (it's being initialized)
+                    // So we make sure it's not in moved_out_vars_
+                    moved_out_vars_.erase(vd.name());
+
+                    // Mark the RHS as moved
+                    markMoved(ie.name());
+                }
+            } else if (stmt->getKind() == NodeKind::ValDeclStmt) {
+                // val x = expr; — x is being initialized as immutable
+                auto& vd = static_cast<ValDeclStmt&>(*stmt);
+                if (vd.hasInit() && vd.init()->getKind() == NodeKind::IdentExpr) {
+                    auto& ie = static_cast<IdentExpr&>(*vd.init());
+                    moved_out_vars_.erase(vd.name());
                     markMoved(ie.name());
                 }
             }

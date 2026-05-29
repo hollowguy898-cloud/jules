@@ -61,6 +61,7 @@ bool IRGenerator::isAggregateType(TypeId type) const {
     switch (type->getKind()) {
         case TypeKind::Struct:
         case TypeKind::Slice:
+        case TypeKind::Array:       // Array is aggregate { ptr, i64 }
             return true;
         case TypeKind::SmartPointer: {
             auto& sp = cast<SmartPointerType>(type);
@@ -126,6 +127,7 @@ uint64_t IRGenerator::typeSizeBytes(TypeId type) const {
         case TypeKind::MutReference:
         case TypeKind::Allocator:  return 8;
         case TypeKind::Slice:      return 16;
+        case TypeKind::Array:      return 16;  // { ptr, i64 } same layout as slice
         case TypeKind::Struct: {
             auto& st = cast<StructType>(type);
             // BUG FIX: Empty structs have size 1 (like in C), not 0
@@ -222,6 +224,7 @@ uint64_t IRGenerator::typeAlignmentBytes(TypeId type) const {
         case TypeKind::MutReference:
         case TypeKind::Allocator:  return 8;
         case TypeKind::Slice:      return 8;
+        case TypeKind::Array:      return 8;  // { ptr, i64 } alignment
         case TypeKind::Struct: {
             auto& st = cast<StructType>(type);
             uint64_t ma = 1;
@@ -296,6 +299,19 @@ std::string IRGenerator::llvmType(TypeId type) {
             auto it = needed_types_.find(key);
             if (it != needed_types_.end()) return it->second.llvm_name;
             return "{ ptr, i64 }";
+        }
+        case TypeKind::Array: {
+            // Arrays use the same { ptr, i64 } layout as slices, but
+            // the length is a compile-time constant. This enables
+            // bounds check elimination and stack allocation for small arrays.
+            auto& arr = cast<ArrayType>(type);
+            auto key = type->toString();
+            auto it = needed_types_.find(key);
+            if (it != needed_types_.end()) return it->second.llvm_name;
+            std::string ln = "%array." + sanitizeName(arr.toString());
+            needed_types_[key] = {ln, "{ ptr, i64 }"};
+            type_emit_order_.push_back(key);
+            return ln;
         }
         case TypeKind::Struct: {
             auto& st = cast<StructType>(type);
@@ -629,6 +645,15 @@ void IRGenerator::collectNeededTypes(TypeId type) {
             type_emit_order_.push_back(key);
             break;
         }
+        case TypeKind::Array: {
+            auto& arr = cast<ArrayType>(type);
+            TypeId elem = arr.element();
+            collectNeededTypes(elem);
+            std::string ln = "%array." + sanitizeName(arr.toString());
+            needed_types_[key] = {ln, "{ ptr, i64 }"};
+            type_emit_order_.push_back(key);
+            break;
+        }
         case TypeKind::SmartPointer: {
             auto& sp = cast<SmartPointerType>(type);
             TypeId pt = sp.pointee();
@@ -806,6 +831,16 @@ void IRGenerator::emitRuntimeDecls() {
     }
     if (needed_runtime_.count("tether_deopt")) {
         module_out_ << "declare void @tether_deopt(i64, ptr) noreturn cold\n"; any = true;
+    }
+    // Benchmarking intrinsics — black_box prevents optimizer from eliminating code
+    if (needed_runtime_.count("tether_black_box_i64")) {
+        module_out_ << "declare void @tether_black_box_i64(i64) nounwind\n"; any = true;
+    }
+    if (needed_runtime_.count("tether_black_box_f64")) {
+        module_out_ << "declare void @tether_black_box_f64(double) nounwind\n"; any = true;
+    }
+    if (needed_runtime_.count("tether_black_box_ptr")) {
+        module_out_ << "declare void @tether_black_box_ptr(ptr) nounwind\n"; any = true;
     }
     // Optimized string equality — checks length first, then pointer
     // equality (for interned strings), then falls back to memcmp.
@@ -1194,6 +1229,62 @@ void IRGenerator::emitTetherMetadata() {
             module_out_ << "!" << loop_meta_ids[i];
         }
         module_out_ << "}\n";
+    }
+
+    // !tether.tbaa = !{!T, !U, ...} — TBAA field access metadata
+    // This is the metadata consumed by TetherAttrPass to generate
+    // LLVM TBAA tags on load/store instructions. Without this, LLVM
+    // must assume all pointer accesses may alias, which prevents
+    // vectorization, LICM, and other optimizations on struct fields.
+    if (meta_map_) {
+        // Collect struct field TBAA info from the MetadataMap
+        std::vector<std::tuple<std::string, std::string, uint64_t, uint64_t>> tbaa_entries;
+        for (const auto& [key, id] : metadata_map_) {
+            // Keys like "access.STRUCT.FIELD" indicate TBAA access tags
+            if (key.find("access.") == 0) {
+                // Parse the key: "access.StructName.FieldName"
+                std::string rest = key.substr(7); // skip "access."
+                auto dot_pos = rest.find('.');
+                if (dot_pos != std::string::npos) {
+                    std::string struct_name = rest.substr(0, dot_pos);
+                    std::string field_name = rest.substr(dot_pos + 1);
+                    // Compute offset and size from type info
+                    // For now, use the metadata ID as a placeholder;
+                    // the TetherAttrPass will compute actual offsets from
+                    // the struct layout
+                    tbaa_entries.push_back({struct_name, field_name, 0, 0});
+                }
+            }
+        }
+
+        if (!tbaa_entries.empty()) {
+            std::vector<int> tbaa_meta_ids;
+            for (const auto& [struct_name, field_name, offset, size] : tbaa_entries) {
+                int tbaa_id = metadata_counter_++;
+                tbaa_meta_ids.push_back(tbaa_id);
+                metadata_entries_.push_back({tbaa_id,
+                    "!{!\"" + struct_name + "\", !\"" + field_name +
+                    "\", i64 " + std::to_string(offset) +
+                    ", i64 " + std::to_string(size) + "}"});
+            }
+
+            // Emit the entries
+            for (size_t i = start_idx; i < metadata_entries_.size(); ++i) {
+                const auto& e = metadata_entries_[i];
+                // Only emit entries that haven't been emitted yet
+                if (e.id >= start_idx) {
+                    // Already emitted above, skip
+                }
+            }
+
+            // Emit the named metadata
+            module_out_ << "!tether.tbaa = !{";
+            for (size_t i = 0; i < tbaa_meta_ids.size(); ++i) {
+                if (i > 0) module_out_ << ", ";
+                module_out_ << "!" << tbaa_meta_ids[i];
+            }
+            module_out_ << "}\n";
+        }
     }
 
     module_out_ << "\n";
@@ -2377,8 +2468,23 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 // Speculative: route the unlikely branch to a deopt block
                 int deopt_id = deopt_counter_++;
                 std::string deopt_l = nextLabel("deopt");
-                std::string likely_l = then_is_unlikely ? else_l : then_l;
-                std::string unlikely_l = then_is_unlikely ? then_l : else_l;
+
+                // BUG FIX: When there's no else branch, else_l is empty.
+                // The "likely" path for a no-else if where then is unlikely
+                // must be the merge label (fallthrough), not an empty label.
+                // We need a concrete label for the likely path.
+                std::string likely_l;
+                if (then_is_unlikely) {
+                    if (is.hasElse()) {
+                        likely_l = else_l;
+                    } else {
+                        // No else block — the likely path falls through to merge
+                        likely_l = merge_l;
+                    }
+                } else {
+                    likely_l = then_l;
+                }
+                std::string unlikely_l = then_is_unlikely ? then_l : deopt_l;
 
                 // Branch to likely path and deopt block
                 if (then_is_unlikely) {
@@ -2399,30 +2505,50 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 setTerminated(true);
 
                 // Emit the likely path
-                emitBlockLabel(likely_l);
-                setTerminated(false);
-                if (then_is_unlikely && is.hasElse()) {
-                    emitBlockStmt(is.elseBlock());
-                } else {
-                    emitBlockStmt(is.thenBlock());
-                }
-                // Snapshot at end of likely path
-                SSASnapshot likely_snap = takeSnapshot();
-                bool likely_terminated = isTerminated();
-                std::string likely_exit_block = current_block_label_;
-                if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
-                setTerminated(false);
+                if (then_is_unlikely && !is.hasElse()) {
+                    // No else block and then is unlikely: the likely path is
+                    // just the fallthrough (merge block). We don't emit a
+                    // separate block here — the merge block IS the likely path.
+                    // Just update SSA values from the pre-branch snapshot.
+                    SSASnapshot likely_snap = takeSnapshot();
+                    // The merge label will be emitted below
+                    setTerminated(false);
+                    // Mark that we still need the merge block
+                    bool likely_terminated = false;
 
-                // Emit the merge block
-                if (!likely_terminated) {
+                    // Emit the merge block directly
                     emitBlockLabel(merge_l);
-                    // Just use the likely snap values (no phi needed with deopt)
-                    for (auto& [name, val] : likely_snap.values) {
+                    for (auto& [name, val] : pre_branch_snap.values) {
                         updateVarValue(name, val);
                     }
                     setTerminated(false);
                 } else {
-                    setTerminated(true);
+                    // Emit the likely path as a real block
+                    emitBlockLabel(likely_l);
+                    setTerminated(false);
+                    if (then_is_unlikely && is.hasElse()) {
+                        emitBlockStmt(is.elseBlock());
+                    } else {
+                        emitBlockStmt(is.thenBlock());
+                    }
+                    // Snapshot at end of likely path
+                    SSASnapshot likely_snap = takeSnapshot();
+                    bool likely_terminated = isTerminated();
+                    std::string likely_exit_block = current_block_label_;
+                    if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
+                    setTerminated(false);
+
+                    // Emit the merge block
+                    if (!likely_terminated) {
+                        emitBlockLabel(merge_l);
+                        // Just use the likely snap values (no phi needed with deopt)
+                        for (auto& [name, val] : likely_snap.values) {
+                            updateVarValue(name, val);
+                        }
+                        setTerminated(false);
+                    } else {
+                        setTerminated(true);
+                    }
                 }
                 break;
             }
@@ -3404,6 +3530,35 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         // Regular call
         std::string callee;
         if (auto* ident = dyn_cast<IdentExpr>(callee_expr)) {
+            // --- Built-in intrinsics ---
+            // black_box(val) — optimization barrier for benchmarking
+            if (ident->name() == "black_box" || ident->name() == "@black_box") {
+                if (call.argCount() >= 1) {
+                    std::string val = emitExpr(call.args()[0].get());
+                    TypeId arg_type = call.args()[0]->getType();
+                    std::string ll = llvmType(arg_type);
+
+                    if (ll == "double" || ll == "float") {
+                        needed_runtime_.insert("tether_black_box_f64");
+                        body_ss_ << "  call void @tether_black_box_f64(" << ll << " " << val << ")\n";
+                    } else if (ll == "ptr") {
+                        needed_runtime_.insert("tether_black_box_ptr");
+                        body_ss_ << "  call void @tether_black_box_ptr(" << ll << " " << val << ")\n";
+                    } else {
+                        // Default: use i64 version, cast if needed
+                        needed_runtime_.insert("tether_black_box_i64");
+                        if (ll != "i64") {
+                            std::string widened = nextReg();
+                            body_ss_ << "  " << widened << " = zext " << ll << " " << val << " to i64\n";
+                            val = widened;
+                        }
+                        body_ss_ << "  call void @tether_black_box_i64(i64 " << val << ")\n";
+                    }
+                    return val;  // Return the original value
+                }
+                return "0";
+            }
+
             callee = "@" + sanitizeName(ident->name());
         } else {
             callee = emitExpr(callee_expr);

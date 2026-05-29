@@ -848,3 +848,55 @@ void tether_deopt(uint64_t deopt_id, void* frame) {
 void tether_register_deopt_handler(TetherDeoptCallback callback) {
     g_deopt_callback = callback;
 }
+
+/* ============================================================================
+ * Benchmarking intrinsics — black_box and volatile read/write
+ *
+ * These functions act as optimization barriers, preventing the compiler from
+ * eliminating benchmark code. They are essential for accurate microbenchmarks.
+ * ============================================================================ */
+
+/* tether_black_box_i64 — consume an i64 value without allowing the optimizer
+ * to eliminate it. Uses inline asm with a memory clobber as an optimization
+ * fence. The value is stored to a stack slot via the "r" constraint, forcing
+ * the compiler to keep it in a register (and thus compute it). */
+void tether_black_box_i64(int64_t value) {
+    __asm__ __volatile__("" : "+r"(value) :: "memory");
+    (void)value;
+}
+
+/* tether_black_box_f64 — consume a double value without allowing the
+ * optimizer to eliminate it. */
+void tether_black_box_f64(double value) {
+    __asm__ __volatile__("" : "+x"(value) :: "memory");
+    (void)value;
+}
+
+/* tether_black_box_ptr — consume a pointer value without allowing the
+ * optimizer to eliminate it. */
+void tether_black_box_ptr(const void* ptr) {
+    __asm__ __volatile__("" : "+r"(ptr) :: "memory");
+    (void)ptr;
+}
+
+/* tether_volatile_read_i64 — read an i64 from memory with volatile semantics.
+ * Forces an actual load (no CSE, no hoisting). */
+int64_t tether_volatile_read_i64(const volatile int64_t* ptr) {
+    return *ptr;
+}
+
+/* tether_volatile_read_f64 — read a double from memory with volatile semantics. */
+double tether_volatile_read_f64(const volatile double* ptr) {
+    return *ptr;
+}
+
+/* tether_volatile_write_i64 — write an i64 to memory with volatile semantics.
+ * Forces an actual store (no DSE, no sinking). */
+void tether_volatile_write_i64(volatile int64_t* ptr, int64_t value) {
+    *ptr = value;
+}
+
+/* tether_volatile_write_f64 — write a double to memory with volatile semantics. */
+void tether_volatile_write_f64(volatile double* ptr, double value) {
+    *ptr = value;
+}

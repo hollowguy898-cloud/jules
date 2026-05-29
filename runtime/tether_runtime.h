@@ -27,12 +27,31 @@
 /* ============================================================================
  * Allocator abstraction — mimalloc / malloc dispatch
  *
- * When TETHER_USE_MIMALLOC is defined, Box/Rc/Arc allocations use
- * mimalloc for 2-3x faster allocation on hot paths.
- * If mimalloc is not available, falls back to malloc.
+ * By default, Tether uses mimalloc for 2-3x faster allocation on hot paths.
+ * If mimalloc is not available (TETHER_NO_MIMALLOC defined), falls back to
+ * system malloc. The mimalloc library is preferred because:
+ *   - 2-3x faster than glibc malloc for small allocations (Box, Rc, Arc)
+ *   - Better multithreaded scalability (thread-local segments)
+ *   - Lower memory fragmentation
+ *   - Consistent low-latency allocation (important for HFT workloads)
+ *
+ * To force system malloc: compile with -DTETHER_NO_MIMALLOC
  * ============================================================================ */
 
-#ifdef TETHER_USE_MIMALLOC
+#ifdef TETHER_NO_MIMALLOC
+/* Explicitly disabled — use system malloc */
+#define tether_malloc(size)        malloc(size)
+#define tether_free(ptr)           free(ptr)
+#define tether_realloc(ptr, size)  realloc(ptr, size)
+#elif defined(TETHER_USE_MIMALLOC)
+/* Explicitly enabled via flag */
+#include <mimalloc.h>
+#define tether_malloc(size)        mi_malloc(size)
+#define tether_free(ptr)           mi_free(ptr)
+#define tether_realloc(ptr, size)  mi_realloc(ptr, size)
+#else
+/* Default: try mimalloc, fall back to malloc if not linked */
+#if __has_include(<mimalloc.h>)
 #include <mimalloc.h>
 #define tether_malloc(size)        mi_malloc(size)
 #define tether_free(ptr)           mi_free(ptr)
@@ -41,6 +60,7 @@
 #define tether_malloc(size)        malloc(size)
 #define tether_free(ptr)           free(ptr)
 #define tether_realloc(ptr, size)  realloc(ptr, size)
+#endif
 #endif
 
 #ifdef __cplusplus
@@ -491,6 +511,49 @@ void tether_register_deopt_handler(TetherDeoptCallback callback);
 /* simd<T, M> simd_shuffle<M, N, T>(simd<T, N> a, simd<T, N> b, int32_t mask[M]) */
 /* simd<T, N> simd_gather<T, N>(simd<T*, N> ptrs) */
 /* void simd_scatter<T, N>(simd<T, N> vals, simd<T*, N> ptrs) */
+
+/* ============================================================================
+ * Benchmarking intrinsics
+ *
+ * black_box / volatile_barrier — prevent the optimizer from eliminating
+ * benchmark code. These are essential for accurate microbenchmarks.
+ *
+ * Usage in Tether code:
+ *   val result = heavy_computation();
+ *   @black_box(result);  // Prevents result from being eliminated
+ *   // Or simply:
+ *   black_box(result);
+ * ============================================================================ */
+
+/* black_box — consume a value and return it, but prevent the optimizer from
+ * eliminating or simplifying any computation that produced it.
+ *
+ * This is implemented as a volatile asm block with no outputs, which acts
+ * as an optimization barrier. The value is "used" (stored to memory via
+ * the asm constraint) but never actually read back, so there's no runtime
+ * cost beyond the barrier itself.
+ *
+ * In LLVM IR, the codegen emits:
+ *   call void @llvm.blackbox.i64(i64 %val)  [for integers]
+ *   call void @llvm.blackbox.f64(double %val) [for floats]
+ *   call void @llvm.blackbox.ptr(ptr %val)    [for pointers]
+ */
+void tether_black_box_i64(int64_t value);
+void tether_black_box_f64(double value);
+void tether_black_box_ptr(const void* ptr);
+
+/* volatile_read — read a value from memory with volatile semantics.
+ * Forces the compiler to actually load from memory (no CSE, no hoisting).
+ * Useful for benchmarking code that reads from shared state.
+ */
+int64_t tether_volatile_read_i64(const volatile int64_t* ptr);
+double tether_volatile_read_f64(const volatile double* ptr);
+
+/* volatile_write — write a value to memory with volatile semantics.
+ * Forces the compiler to actually store to memory (no DSE, no sinking).
+ */
+void tether_volatile_write_i64(volatile int64_t* ptr, int64_t value);
+void tether_volatile_write_f64(volatile double* ptr, double value);
 
 #ifdef __cplusplus
 } /* extern "C" */

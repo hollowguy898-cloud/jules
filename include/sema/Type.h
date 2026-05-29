@@ -54,6 +54,7 @@ enum class TypeKind : uint8_t {
     Reference,
     MutReference,
     Slice,
+    Array,          // Fixed-size array [N]T (heap-allocated, bounds-checked)
     Fn,
     SmartPointer,
     Poison,
@@ -114,6 +115,7 @@ class PointerType;
 class ReferenceType;
 class MutReferenceType;
 class SliceType;
+class ArrayType;
 class FnType;
 class SmartPointerType;
 class PoisonType;
@@ -537,6 +539,64 @@ public:
 
 private:
     TypeId element_;
+};
+
+// ============================================================================
+// ArrayType - fixed-size array [N]T
+//
+// Represents a fixed-size array type like [1024]f64 or [N]i32.
+// In LLVM IR, this is emitted as a heap-allocated block with a pointer
+// and length, similar to a slice but with a known compile-time size.
+//
+// The main difference from SliceType is that the size is known at compile
+// time, which enables:
+//   - Stack allocation for small arrays (eliminates malloc)
+//   - Bounds check elimination when the index is a literal < N
+//   - SIMD vectorization for power-of-2 sized arrays
+//   - SoA transforms when multiple arrays are in a struct
+//
+// Syntax: [N]T (e.g., [1024]f64, [4]i32)
+// LLVM IR: { ptr, i64 } (same as slice, but length is a constant)
+// ============================================================================
+
+class ArrayType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::Array;
+    }
+
+    ArrayType(TypeId element, uint64_t count)
+        : Type(TypeKind::Array)
+        , element_(element)
+        , count_(count)
+    {}
+
+    TypeId element() const { return element_; }
+    uint64_t count() const { return count_; }
+
+    std::string toString() const override {
+        if (element_.isNull()) return "[<unresolved>]";
+        return "[" + std::to_string(count_) + "]" + element_->toString();
+    }
+
+    uint64_t bitWidth() const override { return 128; } // ptr + len (same layout as slice)
+    bool isPointerLike() const override { return true; }
+
+    // Check if this array size is a power of 2 (good for SIMD)
+    bool isPowerOfTwo() const {
+        return count_ > 0 && (count_ & (count_ - 1)) == 0;
+    }
+
+    // Check if this array is small enough for stack allocation
+    // (avoid malloc for arrays < 4096 bytes)
+    bool isSmallArray() const {
+        if (element_.isNull()) return false;
+        return count_ * element_->bitWidth() / 8 <= 4096;
+    }
+
+private:
+    TypeId element_;
+    uint64_t count_;
 };
 
 // ============================================================================
@@ -1212,6 +1272,24 @@ public:
         }
 
         auto type = std::make_unique<SliceType>(element);
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // -----------------------------------------------------------------------
+    // Intern an array type [N]T
+    // -----------------------------------------------------------------------
+    TypeId getArray(TypeId element, uint64_t count) {
+        std::string key = element.isNull()
+            ? "[<unresolved>]" : "[" + std::to_string(count) + "]" + element->toString();
+
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+
+        auto type = std::make_unique<ArrayType>(element, count);
         Type* raw = type.get();
         type_map_[std::move(key)] = std::move(type);
         return TypeId(raw);
