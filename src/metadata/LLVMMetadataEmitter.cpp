@@ -58,9 +58,9 @@ void walkAllStmts(BlockStmt& block, std::function<void(Stmt&)> callback) {
                 if (es.stmt()) callback(*es.stmt());
                 break;
             }
-            case NodeKind::SwitchStmt: {
-                auto& ss = cast<SwitchStmt>(*stmt);
-                for (auto& arm : ss.arms()) {
+            case NodeKind::MatchStmt: {
+                auto& ms = cast<MatchStmt>(*stmt);
+                for (auto& arm : ms.arms()) {
                     if (arm.body) walkAllStmts(*arm.body, callback);
                 }
                 break;

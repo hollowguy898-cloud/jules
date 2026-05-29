@@ -94,14 +94,6 @@ static void collectIndexExprsInExpr(
         return;
     }
 
-    // SelectExpr
-    if (auto* sel = dyn_cast<SelectExpr>(expr)) {
-        collectIndexExprsInExpr(sel->condition(), false, result);
-        collectIndexExprsInExpr(sel->trueExpr(), false, result);
-        collectIndexExprsInExpr(sel->falseExpr(), false, result);
-        return;
-    }
-
     // CastExpr
     if (auto* cast_e = dyn_cast<CastExpr>(expr)) {
         collectIndexExprsInExpr(cast_e->expr(), false, result);
@@ -274,10 +266,10 @@ static void collectIndexExprsInStmt(
         return;
     }
 
-    // SwitchStmt
-    if (auto* sw = dyn_cast<SwitchStmt>(stmt)) {
-        collectIndexExprsInExpr(sw->subject(), false, result);
-        for (const auto& arm : sw->arms()) {
+    // MatchStmt
+    if (auto* ms = dyn_cast<MatchStmt>(stmt)) {
+        collectIndexExprsInExpr(ms->subject(), false, result);
+        for (const auto& arm : ms->arms()) {
             if (arm.pattern) {
                 collectIndexExprsInExpr(arm.pattern.get(), false, result);
             }
@@ -505,8 +497,8 @@ void MemoryTopologyAnalyzer::walkStmts(
                     analyzeWhileLoop(*ws, type_table, meta);
                 }
             }
-        } else if (auto* sw = dyn_cast<SwitchStmt>(stmt.get())) {
-            for (const auto& arm : sw->arms()) {
+        } else if (auto* ms = dyn_cast<MatchStmt>(stmt.get())) {
+            for (const auto& arm : ms->arms()) {
                 if (arm.body) {
                     walkStmts(*arm.body, type_table, meta);
                 }

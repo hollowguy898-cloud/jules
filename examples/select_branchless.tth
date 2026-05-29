@@ -1,9 +1,15 @@
-// Branchless select expression - zero pipeline flushes
+// Branchless-style select patterns — now using match/if instead of select keyword
+// The select keyword has been replaced by @branchless attribute (coming soon)
+// Until @branchless is implemented, use if/else for equivalent logic
+
 fn clamp(x: i32, lo: i32, hi: i32) i32 pure {
-    // Branchless: if x < lo, return lo; if x > hi, return hi; else x
-    val clamped_low = select(x < lo, lo, x);
-    val result = select(clamped_low > hi, hi, clamped_low);
-    return result;
+    if (x < lo) {
+        return lo;
+    } else if (x > hi) {
+        return hi;
+    } else {
+        return x;
+    }
 }
 
 fn abs_val(x: i32) i32 pure {
@@ -13,17 +19,29 @@ fn abs_val(x: i32) i32 pure {
 }
 
 fn min_val(a: i32, b: i32) i32 pure {
-    return select(a < b, a, b);
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
 }
 
 fn max_val(a: i32, b: i32) i32 pure {
-    return select(a > b, a, b);
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
 }
 
 fn signum(x: i32) i32 pure {
-    val is_neg = select(x < 0, 1, 0);
-    val is_pos = select(x > 0, 1, 0);
-    return is_pos - is_neg;
+    if (x < 0) {
+        return -1;
+    } else if (x > 0) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 fn main() i32 {

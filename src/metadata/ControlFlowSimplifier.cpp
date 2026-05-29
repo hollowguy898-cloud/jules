@@ -82,9 +82,9 @@ void ControlFlowSimplifier::walkStmts(BlockStmt& block, MetadataMap& meta) {
             case NodeKind::ExprStmt: {
                 break;
             }
-            case NodeKind::SwitchStmt: {
-                auto& switch_stmt = static_cast<SwitchStmt&>(*stmt);
-                for (auto& arm : switch_stmt.arms()) {
+            case NodeKind::MatchStmt: {
+                auto& match_stmt = static_cast<MatchStmt&>(*stmt);
+                for (auto& arm : match_stmt.arms()) {
                     if (arm.body) {
                         walkStmts(*arm.body, meta);
                     }
@@ -372,10 +372,6 @@ bool ControlFlowSimplifier::isCheapExpr(Expr& expr) const {
         case NodeKind::AddrOfExpr:
             return false;
 
-        // SelectExpr — already a select, could be cheap but conservative
-        case NodeKind::SelectExpr:
-            return false;
-
         // SizeofExpr — compile-time constant, cheap
         case NodeKind::SizeofExpr:
             return true;
@@ -480,15 +476,6 @@ int ControlFlowSimplifier::countOps(Expr& expr) const {
         case NodeKind::AddrOfExpr:
             return 0;
 
-        // SelectExpr — 1 op + condition + true_expr + false_expr
-        case NodeKind::SelectExpr: {
-            auto& sel = static_cast<SelectExpr&>(expr);
-            int cond_ops = sel.condition() ? countOps(*sel.condition()) : 0;
-            int true_ops = sel.trueExpr() ? countOps(*sel.trueExpr()) : 0;
-            int false_ops = sel.falseExpr() ? countOps(*sel.falseExpr()) : 0;
-            return 1 + cond_ops + true_ops + false_ops;
-        }
-
         // SizeofExpr — 0 ops (compile-time constant)
         case NodeKind::SizeofExpr:
             return 0;
@@ -587,15 +574,6 @@ bool ControlFlowSimplifier::hasSideEffects(Expr& expr) const {
         case NodeKind::CastExpr: {
             auto& cast = static_cast<CastExpr&>(expr);
             return cast.expr() ? hasSideEffects(*cast.expr()) : false;
-        }
-
-        // SelectExpr — check all three sub-expressions
-        case NodeKind::SelectExpr: {
-            auto& sel = static_cast<SelectExpr&>(expr);
-            bool cond_se = sel.condition() ? hasSideEffects(*sel.condition()) : false;
-            bool true_se = sel.trueExpr() ? hasSideEffects(*sel.trueExpr()) : false;
-            bool false_se = sel.falseExpr() ? hasSideEffects(*sel.falseExpr()) : false;
-            return cond_se || true_se || false_se;
         }
 
         // ArrayInitExpr — check elements

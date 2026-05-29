@@ -1928,7 +1928,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             }
 
             // Branch from current block to the first arm
-            if (!isTerminated()) {
+            if (!isTerminated() && !arm_labels.empty()) {
                 body_ss_ << "  br label %" << arm_labels[0] << "\n";
             }
 

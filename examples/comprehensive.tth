@@ -160,9 +160,13 @@ fn fibonacci(n: u64) u64 {
     return b;
 }
 
-// --- select (branchless) ---
+// --- branchless conditional (select keyword removed, use if/else) ---
 fn select_example(cond: bool, a: i32, b: i32) i32 {
-    return select(cond, a, b);
+    if (cond) {
+        return a;
+    } else {
+        return b;
+    }
 }
 
 // --- main: exercise all features ---

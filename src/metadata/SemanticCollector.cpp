@@ -252,10 +252,10 @@ void SemanticCollector::collectStmt(Stmt& stmt, MetadataMap& meta) {
             if (es.expr()) collectExpr(*es.expr(), meta);
             break;
         }
-        case NodeKind::SwitchStmt: {
-            auto& ss = static_cast<SwitchStmt&>(stmt);
-            if (ss.subject()) collectExpr(*ss.subject(), meta);
-            for (const auto& arm : ss.arms()) {
+        case NodeKind::MatchStmt: {
+            auto& ms = static_cast<MatchStmt&>(stmt);
+            if (ms.subject()) collectExpr(*ms.subject(), meta);
+            for (const auto& arm : ms.arms()) {
                 if (arm.body) collectBlockStmt(*arm.body, meta);
             }
             break;
@@ -497,13 +497,6 @@ void SemanticCollector::collectExpr(Expr& expr, MetadataMap& meta) {
         case NodeKind::CastExpr: {
             auto& cast_e = static_cast<CastExpr&>(expr);
             if (cast_e.expr()) collectExpr(*cast_e.expr(), meta);
-            break;
-        }
-        case NodeKind::SelectExpr: {
-            auto& sel = static_cast<SelectExpr&>(expr);
-            if (sel.condition()) collectExpr(*sel.condition(), meta);
-            if (sel.trueExpr()) collectExpr(*sel.trueExpr(), meta);
-            if (sel.falseExpr()) collectExpr(*sel.falseExpr(), meta);
             break;
         }
         case NodeKind::StructInitExpr: {
