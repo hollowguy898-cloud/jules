@@ -26,11 +26,6 @@ MetadataEngine::MetadataEngine() = default;
 // ============================================================================
 
 void MetadataEngine::run(Program& program, TypeTable& type_table) {
-    // DEPRECATED: This method runs ONLY the 6 analysis layers.
-    // It does NOT run escape analysis, allocator lowering, SoA transforms,
-    // hot/cold splitting, or any other PreLLVMPass.
-    // Use PreLLVMPipeline::run() for the full production pipeline.
-
     // L1: Semantic Collector — "understand the program"
     // Collects ownership, aliasing, layout, purity, inline, restrict info
     l1_.collect(program, type_table, meta_);

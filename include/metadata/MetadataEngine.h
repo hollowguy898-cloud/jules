@@ -16,38 +16,41 @@
 namespace tether {
 
 // ============================================================================
-// MetadataEngine — DEPRECATED: superseded by PreLLVMPipeline
+// MetadataEngine — standalone analysis pipeline (6 layers)
 //
-// This standalone engine is NO LONGER USED by the compiler driver.
-// The unified PreLLVMPipeline now orchestrates both the MetadataEngine
-// analysis layers (L1-L6) AND the pre-LLVM transform passes in a
-// single correct ordering. See opt/PreLLVMPipeline.h for details.
+// Runs the metadata analysis layers in order, with each layer building
+// on the metadata collected by previous layers:
 //
-// This class is retained ONLY for unit testing individual analysis layers
-// in isolation. Do NOT call MetadataEngine::run() in production code —
-// it omits escape analysis, allocator lowering, SoA transforms, and
-// hot/cold splitting, producing incomplete optimization.
-//
-// The layers still run in the documented order:
 //   L1: Semantic Collector    — "understand the program"
 //   L6: Profile-Guided Opt   — "learn from reality" (if profile available)
 //   L3: Memory Topology       — "detect access patterns"
 //   L2: Control-Flow Simplify — "simplify branches"
-//   L4: Layout Transform      — "packed bitfield only" (SoA/hot-cold moved to passes)
+//   L4: Layout Transform      — "packed bitfield only" (SoA/hot-cold in PreLLVMPass)
 //   L5: LLVM Metadata Emit    — "translate to LLVM hints"
+//
+// The Driver uses the unified PreLLVMPipeline (which incorporates these
+// layers plus transform passes like EscapeAnalysis, AllocatorLowerer,
+// AoSToSoA, etc.). This standalone engine is useful for:
+//   - Unit testing individual analysis layers in isolation
+//   - Debugging metadata issues without triggering transform passes
+//   - Quick iteration when developing a new analysis layer
+//
+// Note: MetadataEngine runs ONLY the analysis layers — it does NOT run
+// escape analysis, allocator lowering, SoA transforms, or hot/cold
+// splitting. Use PreLLVMPipeline for the full production pipeline.
 //
 // The key design principle: memory movement > raw arithmetic.
 // Every optimization decision is evaluated against whether it reduces
 // stalls, cache misses, and bandwidth waste.
 // ============================================================================
-class [[deprecated("Use PreLLVMPipeline instead — MetadataEngine omits escape analysis, "
-                        "allocator lowering, SoA, and hot/cold splitting")]] MetadataEngine {
+class MetadataEngine {
 public:
     MetadataEngine();
 
-    // Run the metadata analysis layers ONLY (no transform passes).
-    // DEPRECATED: Use PreLLVMPipeline::run() for the full pipeline.
-    // This method is retained for isolated layer testing only.
+    // Run the 6-layer metadata analysis pipeline.
+    // Note: This runs ONLY the analysis layers — no transform passes.
+    // Use PreLLVMPipeline::run() for the full production pipeline that
+    // includes escape analysis, allocator lowering, SoA, etc.
     void run(Program& program, TypeTable& type_table);
 
     // Load profile data (call before run() for PGO)
