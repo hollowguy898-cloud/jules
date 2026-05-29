@@ -31,6 +31,7 @@ public:
     std::string name() const override { return "HotColdFieldSplitting"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::LayoutTransform; }
 
     int structsSplit() const { return structs_split_; }
 

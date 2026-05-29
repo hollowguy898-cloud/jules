@@ -19,6 +19,10 @@ public:
     std::string name() const override { return "EscapeAnalysis"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::TetherSpecific; }
+    // NOTE: EscapeAnalysis runs in Phase 1c (before all transform passes)
+    // despite being categorized as TetherSpecific. This is because
+    // AllocatorLowerer (Phase 4) depends on its stack_allocated annotations.
 
     int boxesStackAllocated() const { return boxes_stack_allocated_; }
     int rcsStackAllocated() const { return rcs_stack_allocated_; }

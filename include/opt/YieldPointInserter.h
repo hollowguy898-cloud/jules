@@ -27,6 +27,7 @@ public:
     std::string name() const override { return "YieldPointInsertion"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::IRHint; }
 
     int yieldPointsInserted() const { return yield_points_inserted_; }
 

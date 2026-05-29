@@ -28,6 +28,7 @@ namespace tether {
 class AllocatorLowererPass : public PreLLVMPass {
 public:
     std::string name() const override { return "AllocatorLowering"; }
+    PassCategory category() const override { return PassCategory::TetherSpecific; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
 

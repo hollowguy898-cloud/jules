@@ -11,6 +11,7 @@
 #include "opt/EscapeAnalysis.h"
 
 #include <sstream>
+#include <iostream>
 
 namespace tether {
 
@@ -21,6 +22,7 @@ class FieldReordererAdapterPass : public PreLLVMPass {
 public:
     std::string name() const override { return "FieldReordering"; }
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::LayoutTransform; }
 
     bool run(Program& program, TypeTable& type_table) override {
         FieldReorderer reorderer(type_table);
@@ -126,9 +128,34 @@ PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table)
 }
 
 // ============================================================================
-// addPass
+// addPass — register a pass with category ordering validation
+//
+// Validates that passes are registered in non-decreasing category order:
+//   LayoutTransform (Phase 3) → TetherSpecific (Phase 4) → IRHint (Phase 5)
+//
+// This prevents subtle ordering bugs where a Phase 4 pass is accidentally
+// registered before a Phase 3 pass, which would break dependencies.
 // ============================================================================
 void PreLLVMPipeline::addPass(std::unique_ptr<PreLLVMPass> pass) {
+    // Validate category ordering: each new pass's category must be >= the
+    // previous pass's category. This ensures passes are registered in a
+    // valid phase order.
+    if (!passes_.empty()) {
+        auto prev_cat = static_cast<uint8_t>(passes_.back()->category());
+        auto new_cat = static_cast<uint8_t>(pass->category());
+        if (new_cat < prev_cat) {
+            // Log a warning but don't crash — the phase-based execution
+            // in run() will route the pass to the correct phase anyway.
+            // This just means the registration order is misleading.
+            std::cerr << "[tether] WARNING: Pass '" << pass->name()
+                      << "' (category " << static_cast<int>(new_cat)
+                      << ") registered after '" << passes_.back()->name()
+                      << "' (category " << static_cast<int>(prev_cat)
+                      << ") — passes should be registered in phase order"
+                      << std::endl;
+        }
+    }
+
     pass->setMetadataMap(&metadata_);
     passes_.push_back(std::move(pass));
 }
@@ -235,14 +262,15 @@ PreLLVMPipelineResult PreLLVMPipeline::run(Program& program) {
 
     // ========================================================================
     // Phase 3: LAYOUT TRANSFORMS — use analysis to optimize data layout
+    //
+    // Only LayoutTransform-category passes run here. These change the
+    // physical memory layout of data structures.
     // ========================================================================
 
     result.pass_log.push_back("[PreLLVM] Phase 3: Layout transforms");
-
-    // Run the PreLLVMPass-based layout transforms (HotColdSplitter,
-    // FieldReorderer, AoSToSoA) — these are registered in the constructor
     for (auto& pass : passes_) {
-        // Check if this is a layout pass (first few passes are layout)
+        if (pass->category() != PassCategory::LayoutTransform) continue;
+
         std::string note;
         bool changed = pass->run(program, type_table_);
         result.passes_run++;
@@ -263,6 +291,59 @@ PreLLVMPipelineResult PreLLVMPipeline::run(Program& program) {
         result.pass_log.push_back("[PreLLVM]   L4 LayoutTransformer (packed bitfield only)");
         l4_.transform(program, type_table_, metadata_);
         result.passes_run++;
+    }
+
+    // ========================================================================
+    // Phase 4: TETHER-SPECIFIC TRANSFORMS — semantic optimizations
+    //
+    // Only TetherSpecific-category passes run here. These rely on the
+    // analysis from Phase 1-2 and the layout decisions from Phase 3.
+    //
+    // CRITICAL ORDERING: AllocatorLowerer runs AFTER EscapeAnalysis
+    // (which ran in Phase 1c) because it may consume stack_allocated
+    // annotations when deciding allocation strategy.
+    // ========================================================================
+
+    result.pass_log.push_back("[PreLLVM] Phase 4: Tether-specific transforms");
+    for (auto& pass : passes_) {
+        if (pass->category() != PassCategory::TetherSpecific) continue;
+
+        std::string note;
+        bool changed = pass->run(program, type_table_);
+        result.passes_run++;
+
+        if (changed) {
+            result.transformations_made++;
+            note = " -> made transformations";
+        } else {
+            note = " -> no changes";
+        }
+        result.pass_log.push_back("[PreLLVM]   " + pass->name() + note);
+    }
+
+    // ========================================================================
+    // Phase 5: IR HINTS — annotate for LLVM optimization
+    //
+    // Only IRHint-category passes run here. These add metadata that
+    // helps LLVM generate better code but don't change semantics.
+    // They must run AFTER all transforms so the hints are accurate.
+    // ========================================================================
+
+    result.pass_log.push_back("[PreLLVM] Phase 5: IR hints");
+    for (auto& pass : passes_) {
+        if (pass->category() != PassCategory::IRHint) continue;
+
+        std::string note;
+        bool changed = pass->run(program, type_table_);
+        result.passes_run++;
+
+        if (changed) {
+            result.transformations_made++;
+            note = " -> made transformations";
+        } else {
+            note = " -> no changes";
+        }
+        result.pass_log.push_back("[PreLLVM]   " + pass->name() + note);
     }
 
     // ========================================================================

@@ -31,6 +31,22 @@ enum class PreLLVMOptLevel : uint8_t {
 };
 
 // ============================================================================
+// PassCategory — classifies passes into pipeline phases
+//
+// The unified pipeline runs passes in strict phase order:
+//   LayoutTransform  (Phase 3): Change data layout — hot/cold split, reorder, SoA
+//   TetherSpecific   (Phase 4): Tether semantics — error paths, barriers, defer, allocator
+//   IRHint           (Phase 5): LLVM IR hints — prefetch, yield points
+//
+// Within each phase, passes run in registration order.
+// ============================================================================
+enum class PassCategory : uint8_t {
+    LayoutTransform,   // Phase 3: Data layout changes
+    TetherSpecific,    // Phase 4: Tether-specific semantic transforms
+    IRHint,            // Phase 5: LLVM IR annotation hints
+};
+
+// ============================================================================
 // PreLLVMPass - base class for all pre-LLVM optimization passes
 //
 // These passes run on the AST BEFORE LLVM IR emission. They perform
@@ -39,6 +55,10 @@ enum class PreLLVMOptLevel : uint8_t {
 //
 // UNIFIED PIPELINE: All passes write to MetadataMap only.
 // The old ASTAnnotationMap dual-channel has been eliminated.
+//
+// Each pass declares its category so the pipeline can route it to the
+// correct phase. This prevents ordering bugs like running allocator
+// lowering before escape analysis.
 // ============================================================================
 class PreLLVMPass {
 public:
@@ -54,6 +74,9 @@ public:
     // redundant with LLVM's own optimizations. Override and return true
     // only if a pass does something LLVM already handles.
     virtual bool isRedundantWithLLVM() const { return false; }
+
+    // Which phase this pass belongs to — determines execution order
+    virtual PassCategory category() const = 0;
 
     // Set the metadata map for this pass to write typed metadata into
     void setMetadataMap(MetadataMap* meta_map) { meta_map_ = meta_map; }

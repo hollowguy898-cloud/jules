@@ -22,6 +22,7 @@ public:
     std::string name() const override { return "OpaqueBarrier"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::TetherSpecific; }
 
     int barriersInserted() const { return barriers_inserted_; }
 

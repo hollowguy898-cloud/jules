@@ -27,6 +27,7 @@ public:
     std::string name() const override { return "AoS->SoA"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::LayoutTransform; }
 
     struct SoATransform {
         std::string struct_name;

@@ -242,6 +242,18 @@ bool AllocatorLowererPass::lowerCallExpr(CallExpr& call, TypeTable& /*type_table
     TypeId obj_type = object->getType();
     if (!obj_type || !isa<AllocatorType>(obj_type)) return false;
 
+    // Check if EscapeAnalysis has already determined this allocation
+    // can be stack-allocated. If so, skip arena lowering — the IR
+    // generator will emit alloca instead.
+    if (meta_map_) {
+        const NodeMeta* existing = meta_map_->get(&call);
+        if (existing && existing->stack_allocated) {
+            // EscapeAnalysis already marked this as stack-allocatable.
+            // No need for arena lowering — the IR generator handles it.
+            return false;
+        }
+    }
+
     // This is a call to allocator.alloc() or allocator.create()
     // We need to determine the allocator kind from context.
 

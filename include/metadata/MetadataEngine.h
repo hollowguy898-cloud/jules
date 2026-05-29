@@ -16,27 +16,38 @@
 namespace tether {
 
 // ============================================================================
-// MetadataEngine — orchestrates all 6 layers of the metadata pipeline
+// MetadataEngine — DEPRECATED: superseded by PreLLVMPipeline
 //
-// The engine runs layers in order, with each layer building on the
-// metadata collected by previous layers:
+// This standalone engine is NO LONGER USED by the compiler driver.
+// The unified PreLLVMPipeline now orchestrates both the MetadataEngine
+// analysis layers (L1-L6) AND the pre-LLVM transform passes in a
+// single correct ordering. See opt/PreLLVMPipeline.h for details.
 //
+// This class is retained ONLY for unit testing individual analysis layers
+// in isolation. Do NOT call MetadataEngine::run() in production code —
+// it omits escape analysis, allocator lowering, SoA transforms, and
+// hot/cold splitting, producing incomplete optimization.
+//
+// The layers still run in the documented order:
 //   L1: Semantic Collector    — "understand the program"
 //   L6: Profile-Guided Opt   — "learn from reality" (if profile available)
 //   L3: Memory Topology       — "detect access patterns"
 //   L2: Control-Flow Simplify — "simplify branches"
-//   L4: Layout Transform      — "optimize layouts"
+//   L4: Layout Transform      — "packed bitfield only" (SoA/hot-cold moved to passes)
 //   L5: LLVM Metadata Emit    — "translate to LLVM hints"
 //
 // The key design principle: memory movement > raw arithmetic.
 // Every optimization decision is evaluated against whether it reduces
 // stalls, cache misses, and bandwidth waste.
 // ============================================================================
-class MetadataEngine {
+class [[deprecated("Use PreLLVMPipeline instead — MetadataEngine omits escape analysis, "
+                        "allocator lowering, SoA, and hot/cold splitting")]] MetadataEngine {
 public:
     MetadataEngine();
 
-    // Run the full metadata pipeline
+    // Run the metadata analysis layers ONLY (no transform passes).
+    // DEPRECATED: Use PreLLVMPipeline::run() for the full pipeline.
+    // This method is retained for isolated layer testing only.
     void run(Program& program, TypeTable& type_table);
 
     // Load profile data (call before run() for PGO)

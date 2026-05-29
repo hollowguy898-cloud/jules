@@ -26,6 +26,11 @@ MetadataEngine::MetadataEngine() = default;
 // ============================================================================
 
 void MetadataEngine::run(Program& program, TypeTable& type_table) {
+    // DEPRECATED: This method runs ONLY the 6 analysis layers.
+    // It does NOT run escape analysis, allocator lowering, SoA transforms,
+    // hot/cold splitting, or any other PreLLVMPass.
+    // Use PreLLVMPipeline::run() for the full production pipeline.
+
     // L1: Semantic Collector — "understand the program"
     // Collects ownership, aliasing, layout, purity, inline, restrict info
     l1_.collect(program, type_table, meta_);
@@ -46,9 +51,11 @@ void MetadataEngine::run(Program& program, TypeTable& type_table) {
     // L3's memory dependency info to make sound decisions
     l2_.simplify(program, type_table, meta_);
 
-    // L4: Layout Transformer — "optimize layouts"
-    // Transforms AoS→SoA, splits hot/cold fields, packs bitfields
-    // using the full picture from L1+L6+L3+L2
+    // L4: Layout Transformer — "packed bitfield only"
+    // NOTE: SoA and hot/cold splitting have been moved to dedicated
+    // PreLLVMPass implementations (AoSToSoAPass, HotColdSplitterPass)
+    // in the unified PreLLVMPipeline. L4 here only handles packed
+    // bitfield detection as a complementary lower-priority transform.
     l4_.transform(program, type_table, meta_);
 
     // L5: LLVM Metadata Emitter — "translate to LLVM hints"

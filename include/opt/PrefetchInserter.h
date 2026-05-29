@@ -25,6 +25,7 @@ public:
     std::string name() const override { return "AlignPrefetch"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::IRHint; }
 
     int prefetchesInserted() const { return prefetches_inserted_; }
 

@@ -24,6 +24,7 @@ public:
     std::string name() const override { return "DeferCoalescing"; }
     bool run(Program& program, TypeTable& type_table) override;
     bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::TetherSpecific; }
 
     int coalescedGroups() const { return coalesced_groups_; }
 
