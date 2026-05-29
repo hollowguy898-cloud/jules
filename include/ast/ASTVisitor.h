@@ -122,6 +122,8 @@ public:
                 return derived().visitStaticAssertStmt(static_cast<StaticAssertStmt&>(node));
             case NodeKind::SpawnStmt:
                 return derived().visitSpawnStmt(static_cast<SpawnStmt&>(node));
+            case NodeKind::UnsafeBlockStmt:
+                return derived().visitUnsafeBlockStmt(static_cast<UnsafeBlockStmt&>(node));
 
             // Top-level declarations
             case NodeKind::FnDecl:
@@ -140,6 +142,9 @@ public:
                 return derived().visitModuleDecl(static_cast<ModuleDecl&>(node));
             case NodeKind::UseDecl:
                 return derived().visitUseDecl(static_cast<UseDecl&>(node));
+            case NodeKind::UnsafeBlockStmt_:
+                // Sentinel value, not a real node
+                break;
         }
         return retDefault();
     }
@@ -235,6 +240,8 @@ public:
                 return derived().visitStaticAssertStmt(static_cast<const StaticAssertStmt&>(node));
             case NodeKind::SpawnStmt:
                 return derived().visitSpawnStmt(static_cast<const SpawnStmt&>(node));
+            case NodeKind::UnsafeBlockStmt:
+                return derived().visitUnsafeBlockStmt(static_cast<const UnsafeBlockStmt&>(node));
             case NodeKind::FnDecl:
                 return derived().visitFnDecl(static_cast<const FnDecl&>(node));
             case NodeKind::StructDecl:
@@ -251,6 +258,9 @@ public:
                 return derived().visitModuleDecl(static_cast<const ModuleDecl&>(node));
             case NodeKind::UseDecl:
                 return derived().visitUseDecl(static_cast<const UseDecl&>(node));
+            case NodeKind::UnsafeBlockStmt_:
+                // Sentinel value, not a real node
+                break;
         }
         return retDefault();
     }
@@ -493,6 +503,11 @@ public:
         return retDefault();
     }
 
+    Ret visitUnsafeBlockStmt(UnsafeBlockStmt& node) {
+        traverseStmt(node.bodyPtr());
+        return retDefault();
+    }
+
     // --- Top-level declarations ---
 
     Ret visitFnDecl(FnDecl& node) {
@@ -570,6 +585,7 @@ public:
     Ret visitParallelForStmt(const ParallelForStmt&) { return retDefault(); }
     Ret visitStaticAssertStmt(const StaticAssertStmt&) { return retDefault(); }
     Ret visitSpawnStmt(const SpawnStmt&) { return retDefault(); }
+    Ret visitUnsafeBlockStmt(const UnsafeBlockStmt&) { return retDefault(); }
 
     Ret visitFnDecl(const FnDecl&) { return retDefault(); }
     Ret visitStructDecl(const StructDecl&) { return retDefault(); }

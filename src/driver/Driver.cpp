@@ -339,7 +339,7 @@ bool Driver::runCFGBuilding() {
 // ============================================================================
 bool Driver::runBorrowChecking() {
     if (verbose_) {
-        std::cerr << "[tether] Phase 6: Borrow checking..." << std::endl;
+        std::cerr << "[tether] Phase 6: Borrow checking (strict mode)..." << std::endl;
     }
 
     BorrowChecker checker;
@@ -349,8 +349,12 @@ bool Driver::runBorrowChecking() {
     borrowck_had_errors_ = checker.hasErrors();
     borrowck_errors_ = checker.errors();
 
-    if (borrowck_had_errors_) {
-        // Don't abort - continue with IR generation
+    // Collect strict errors for enhanced reporting
+    const auto& strict_errs = checker.strictErrors();
+
+    // In strict mode, strict errors also count as compilation errors
+    if (checker.hasStrictErrors()) {
+        borrowck_had_errors_ = true;
     }
 
     // Plumb borrow checker's noalias results into the MetadataMap
@@ -371,6 +375,58 @@ bool Driver::runBorrowChecking() {
                     }
                 }
             }
+        }
+    }
+
+    // Propagate strict borrow checker results into the MetadataMap
+    // - bounds_proven_safe: bounds checks can be eliminated
+    // - borrow_proven_safe: borrow checker proved this access is safe
+    // - moved_out: variable has been moved out
+    // - lifetime_id: assigned lifetime for this reference
+    // - in_unsafe_block: this node is inside an unsafe block
+    if (pipeline_) {
+        MetadataMap& meta = pipeline_->metadata();
+
+        // Mark nodes with proven-safe bounds
+        for (const void* node_ptr : checker.boundsProvenSafe()) {
+            auto& nm = meta.getOrCreate(node_ptr);
+            nm.bounds_proven_safe = true;
+        }
+
+        // Mark nodes with proven-safe borrows
+        for (const void* node_ptr : checker.borrowProvenSafe()) {
+            auto& nm = meta.getOrCreate(node_ptr);
+            nm.borrow_proven_safe = true;
+        }
+
+        // Mark nodes in unsafe blocks
+        for (const void* node_ptr : checker.unsafeBlockNodes()) {
+            auto& nm = meta.getOrCreate(node_ptr);
+            nm.in_unsafe_block = true;
+        }
+
+        // Mark moved-out variables in the AST
+        for (const auto& var_name : checker.movedOutVars()) {
+            // Find the corresponding variable in the AST and mark it
+            for (const auto& tl : program_) {
+                if (auto* fn = dyn_cast<FnDecl>(tl.get())) {
+                    for (auto& param : fn->params()) {
+                        if (param.name == var_name) {
+                            auto& nm = meta.getOrCreate(&param);
+                            nm.moved_out = true;
+                            nm.ownership = OwnershipKind::Moved;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Print enhanced error messages with path expressions and help text
+    if (verbose_ && !strict_errs.empty()) {
+        for (const auto& err : strict_errs) {
+            std::cerr << err.toString() << std::endl;
         }
     }
 
@@ -471,6 +527,23 @@ bool Driver::runBackend() {
         }
     }
 
+    // Build the TetherAttrPass LLVM pass plugin (if possible).
+    // When using clang, we add -fpass-plugin to inject the Tether metadata
+    // attributes into LLVM's optimization pipeline.
+    std::string pass_plugin;
+    if (using_clang && opt_level_ > 0) {
+        pass_plugin = buildPassPlugin();
+        // If the plugin couldn't be built (e.g., LLVM headers not available),
+        // we still compile — just without the TetherAttrPass optimizations.
+        if (!pass_plugin.empty() && verbose_) {
+            std::cerr << "[tether]   Using pass plugin: " << pass_plugin << std::endl;
+        } else if (pass_plugin.empty() && verbose_) {
+            std::cerr << "[tether]   Warning: TetherAttrPass plugin not available "
+                      << "(LLVM headers may not be installed). "
+                      << "Compiling without Tether metadata attributes." << std::endl;
+        }
+    }
+
     // Build the command
     std::ostringstream cmd;
 
@@ -491,6 +564,11 @@ bool Driver::runBackend() {
 
         if (emit_type_ == EmitType::Assembly) {
             cmd << " -S";
+        }
+
+        // Add the TetherAttrPass plugin if available
+        if (!pass_plugin.empty()) {
+            cmd << " -fpass-plugin=" << pass_plugin;
         }
 
         cmd << " -c " << ir_file_path_;
@@ -789,6 +867,201 @@ bool Driver::removeFile(const std::string& path) {
     std::error_code ec;
     fs::remove(path, ec);
     return !ec;
+}
+
+// ============================================================================
+// Utility: find llvm-config on PATH
+// ============================================================================
+std::string Driver::findLlvmConfig() {
+    // Try versioned names first (common on Linux)
+    static const char* llvm_config_names[] = {
+        "llvm-config-18", "llvm-config-17", "llvm-config-16", "llvm-config-15",
+        "llvm-config-14", "llvm-config-13", "llvm-config-12",
+        "llvm-config"
+    };
+
+    for (const char* name : llvm_config_names) {
+        std::string result = findExecutable(name);
+        if (!result.empty()) return result;
+    }
+
+    return "";
+}
+
+// ============================================================================
+// Build the TetherAttrPass LLVM pass plugin shared library
+//
+// Compiles src/pass/TetherAttrPass.cpp and src/pass/PassPluginMain.cpp
+// into a shared library (build/TetherAttrPass.so) using clang and
+// llvm-config. If the plugin is already built and the source files haven't
+// changed, returns the cached path without rebuilding.
+//
+// Returns the path to the built .so file, or empty string on failure
+// (e.g., LLVM headers not available, clang not found, etc.).
+// ============================================================================
+std::string Driver::buildPassPlugin() {
+    // Return cached path if already built this session
+    if (!pass_plugin_path_.empty()) {
+        namespace fs = std::filesystem;
+        if (fs::exists(pass_plugin_path_)) {
+            return pass_plugin_path_;
+        }
+        // Cached file was removed — rebuild
+        pass_plugin_path_.clear();
+    }
+
+    // Find clang (must use clang for LLVM plugin compilation — g++ won't work
+    // because the plugin must be compiled with the same C++ ABI as LLVM)
+    std::string clang = findClang();
+    if (clang.empty()) {
+        if (verbose_) {
+            std::cerr << "[tether]   Cannot build pass plugin: clang not found" << std::endl;
+        }
+        return "";
+    }
+
+    // Find llvm-config
+    std::string llvm_config = findLlvmConfig();
+    if (llvm_config.empty()) {
+        if (verbose_) {
+            std::cerr << "[tether]   Cannot build pass plugin: llvm-config not found" << std::endl;
+        }
+        return "";
+    }
+
+    // Determine the output path for the plugin
+    // Place it in the build/ directory next to the Tether source
+    namespace fs = std::filesystem;
+
+    // Find the Tether source root (look for src/pass/ relative to cwd)
+    std::string source_root;
+    if (fs::exists("src/pass/TetherAttrPass.cpp")) {
+        source_root = ".";
+    } else if (fs::exists("jules/src/pass/TetherAttrPass.cpp")) {
+        source_root = "jules";
+    } else {
+        // Try relative to the compiler executable
+        const char* exe_path = std::getenv("JULES_COMPILER_PATH");
+        if (exe_path) {
+            fs::path exe_dir = fs::path(exe_path).parent_path();
+            if (fs::exists(exe_dir / "src" / "pass" / "TetherAttrPass.cpp")) {
+                source_root = exe_dir.string();
+            } else if (fs::exists(exe_dir / ".." / "src" / "pass" / "TetherAttrPass.cpp")) {
+                source_root = (exe_dir / "..").string();
+            }
+        }
+    }
+
+    if (source_root.empty()) {
+        if (verbose_) {
+            std::cerr << "[tether]   Cannot build pass plugin: source root not found" << std::endl;
+        }
+        return "";
+    }
+
+    std::string plugin_path = (fs::path(source_root) / "build" / "TetherAttrPass.so").string();
+
+    // Check if the plugin is already built and up-to-date
+    if (fs::exists(plugin_path)) {
+        // Check if source files are newer than the plugin
+        auto plugin_time = fs::last_write_time(plugin_path);
+        auto src_time1 = fs::last_write_time(
+            fs::path(source_root) / "src" / "pass" / "TetherAttrPass.cpp");
+        auto src_time2 = fs::last_write_time(
+            fs::path(source_root) / "src" / "pass" / "PassPluginMain.cpp");
+
+        if (src_time1 <= plugin_time && src_time2 <= plugin_time) {
+            // Plugin is up-to-date
+            pass_plugin_path_ = plugin_path;
+            return plugin_path;
+        }
+    }
+
+    // Build the plugin
+    // Create the build directory if needed
+    fs::path build_dir = fs::path(source_root) / "build";
+    fs::create_directories(build_dir);
+
+    // Get LLVM compile/link flags
+    std::string cxxflags_cmd = llvm_config + " --cxxflags 2>/dev/null";
+    std::string ldflags_cmd = llvm_config + " --ldflags 2>/dev/null";
+    std::string libs_cmd = llvm_config + " --libs core 2>/dev/null";
+
+    // Execute the commands to get the flags
+    std::string cxxflags, ldflags, libs;
+
+    // Helper: capture stdout from a command
+    auto captureOutput = [](const std::string& cmd) -> std::string {
+        std::string result;
+#ifdef _WIN32
+        FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+        FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+        if (pipe) {
+            char buffer[256];
+            while (fgets(buffer, sizeof(buffer), pipe)) {
+                result += buffer;
+            }
+#ifdef _WIN32
+            _pclose(pipe);
+#else
+            pclose(pipe);
+#endif
+        }
+        // Trim trailing whitespace/newlines
+        while (!result.empty() && (result.back() == '\n' || result.back() == ' ' || result.back() == '\r')) {
+            result.pop_back();
+        }
+        return result;
+    };
+
+    cxxflags = captureOutput(cxxflags_cmd);
+    ldflags = captureOutput(ldflags_cmd);
+    libs = captureOutput(libs_cmd);
+
+    if (cxxflags.empty()) {
+        if (verbose_) {
+            std::cerr << "[tether]   Cannot build pass plugin: llvm-config --cxxflags failed" << std::endl;
+        }
+        return "";
+    }
+
+    // Build the compile command
+    std::ostringstream cmd;
+    cmd << clang << " -std=c++17 -shared -fPIC -O2 "
+        << cxxflags << " "
+        << "-I " << source_root << "/include "
+        << "-o " << plugin_path << " "
+        << source_root << "/src/pass/TetherAttrPass.cpp "
+        << source_root << "/src/pass/PassPluginMain.cpp "
+        << ldflags << " " << libs << " 2>&1";
+
+    if (verbose_) {
+        std::cerr << "[tether]   Building pass plugin: " << cmd.str() << std::endl;
+    }
+
+    // Execute the build command
+    int ret = std::system(cmd.str().c_str());
+    if (ret != 0) {
+        if (verbose_) {
+            std::cerr << "[tether]   Pass plugin build failed (exit code "
+                      << ret << "). "
+                      << "Compiling without TetherAttrPass optimizations." << std::endl;
+        }
+        return "";
+    }
+
+    // Verify the plugin was built
+    if (!fs::exists(plugin_path)) {
+        if (verbose_) {
+            std::cerr << "[tether]   Pass plugin build produced no output file" << std::endl;
+        }
+        return "";
+    }
+
+    pass_plugin_path_ = plugin_path;
+    return plugin_path;
 }
 
 } // namespace tether

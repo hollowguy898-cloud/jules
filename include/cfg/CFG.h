@@ -320,6 +320,10 @@ private:
     // Extract borrow information from an expression
     void collectBorrows(Expr& expr, std::vector<BorrowInfo>& borrows);
 
+    // Extract a path string from an expression (e.g., "point.x" from a MemberExpr chain)
+    // Returns empty string if the expression is not a simple path
+    std::string extractPathString(Expr& expr);
+
     // Track variable uses/defs and borrows for a statement in a node
     void trackStatement(Stmt& stmt, CFGNode* node);
 };

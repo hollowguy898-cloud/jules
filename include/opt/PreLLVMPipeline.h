@@ -13,6 +13,7 @@
 #include "metadata/LayoutTransformer.h"
 #include "metadata/LLVMMetadataEmitter.h"
 #include "metadata/ProfileGuidedOptimizer.h"
+#include "opt/SpeculativeOptimizer.h"
 
 #include <string>
 #include <unordered_map>
@@ -152,6 +153,9 @@ private:
     LayoutTransformer l4_;       // Now only does packed bitfield
     LLVMMetadataEmitter l5_;
     ProfileGuidedOptimizer l6_;
+
+    // Speculative optimizer (nuclear option #8)
+    SpeculativeOptimizerPass speculative_;
 
     // Pre-LLVM transform passes (the "Track 2" passes, now integrated)
     std::vector<std::unique_ptr<PreLLVMPass>> passes_;

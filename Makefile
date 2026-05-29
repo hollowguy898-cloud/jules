@@ -22,8 +22,8 @@ TARGET    = tetherc
 # Discover source files
 # ============================================================================
 
-# C++ sources (compiler itself)
-CXX_SRCS  = $(shell find $(SRCDIR) -name '*.cpp')
+# C++ sources (compiler itself - excludes pass/ which requires LLVM headers)
+CXX_SRCS  = $(shell find $(SRCDIR) -name '*.cpp' -not -path '$(SRCDIR)/pass/*')
 CXX_OBJS  = $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(CXX_SRCS))
 
 # Library objects (everything EXCEPT main.cpp — for linking into benchmarks)
@@ -74,6 +74,39 @@ $(RUNTIME_LIB): $(C_OBJ)
 	ar rcs $@ $<
 
 # ============================================================================
+# LLVM Pass Plugin — TetherAttrPass
+#
+# Custom LLVM pass plugin that reads Tether-specific metadata from the
+# LLVM IR module and injects corresponding LLVM optimization attributes.
+# This is loaded by clang via -fpass-plugin.
+#
+# Prerequisites: LLVM development headers (llvm-config must be on PATH)
+# If LLVM is not available, the plugin build is skipped gracefully —
+# the Tether compiler still works, just without the pass plugin.
+# ============================================================================
+
+PASS_PLUGIN = build/TetherAttrPass.so
+LLVM_CONFIG ?= $(shell which llvm-config-18 2>/dev/null || which llvm-config-17 2>/dev/null || which llvm-config-16 2>/dev/null || which llvm-config-15 2>/dev/null || which llvm-config 2>/dev/null)
+
+# Only build the pass plugin if llvm-config is available
+ifneq ($(LLVM_CONFIG),)
+PASS_PLUGIN_DEPS = src/pass/TetherAttrPass.cpp src/pass/PassPluginMain.cpp include/pass/TetherAttrPass.h
+
+$(PASS_PLUGIN): $(PASS_PLUGIN_DEPS)
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -shared -fPIC -O2 $(shell $(LLVM_CONFIG) --cxxflags) -I include -o $@ src/pass/TetherAttrPass.cpp src/pass/PassPluginMain.cpp $(shell $(LLVM_CONFIG) --ldflags --libs core)
+else
+# llvm-config not found - create a stub target that warns
+$(PASS_PLUGIN):
+	@echo "Warning: llvm-config not found. Skipping TetherAttrPass plugin build."
+	@echo "         The compiler will work without the pass plugin (metadata will"
+	@echo "         be emitted but not consumed by LLVM optimization passes)."
+endif
+
+.PHONY: pass-plugin
+pass-plugin: $(PASS_PLUGIN)
+
+# ============================================================================
 # Dependency tracking (auto-generated .d files from -MMD -MP)
 # ============================================================================
 
@@ -85,7 +118,7 @@ $(RUNTIME_LIB): $(C_OBJ)
 
 .PHONY: clean
 clean:
-	rm -rf $(BUILDDIR) $(TARGET)
+	rm -rf $(BUILDDIR) $(TARGET) $(PASS_PLUGIN)
 
 # ============================================================================
 # Test target
@@ -257,6 +290,7 @@ help:
 	@echo "  bench-speed - Run compiler phase throughput benchmark"
 	@echo "  bench-real  - Run real-workload compilation benchmark"
 	@echo "  bench-ecs   - Run ECS SoA vs AoS runtime benchmark"
+	@echo "  pass-plugin - Build the TetherAttrPass LLVM plugin (requires LLVM dev headers)"
 	@echo "  install     - Install to PREFIX (default: /usr/local)"
 	@echo "  uninstall   - Remove installed files"
 	@echo "  setup       - Configure git hooks (run after clone)"

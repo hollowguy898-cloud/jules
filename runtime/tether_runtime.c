@@ -648,3 +648,51 @@ int tether_task_is_done(TetherTaskHandle handle) {
 uint32_t tether_taskpool_thread_count(void) {
     return g_taskpool.num_threads;
 }
+
+/* ============================================================================
+ * Deoptimization support (Nuclear #8: Speculative Optimization)
+ * ============================================================================ */
+
+/* Global deopt handler callback (NULL = use default handler) */
+static TetherDeoptCallback g_deopt_callback = NULL;
+
+/* Deoptimization reason strings (indexed by deopt_id) */
+static const char* g_deopt_reasons[] = {
+    "unknown deoptimization",
+    "null pointer dereference (NeverNull assumption violated)",
+    "branch taken (BranchNeverTaken assumption violated)",
+    "array index out of bounds (BoundsInRange assumption violated)",
+    "arithmetic overflow (NoOverflow assumption violated)",
+    "type mismatch (TypeExact assumption violated)",
+    "aliasing conflict (NoAlias assumption violated)",
+    "side effect in pure call (PureCall assumption violated)",
+};
+
+void tether_deopt(uint64_t deopt_id, void* frame) {
+    if (g_deopt_callback) {
+        TetherDeoptInfo info;
+        info.deopt_id = deopt_id;
+        info.frame = frame;
+        info.reason = (deopt_id < sizeof(g_deopt_reasons) / sizeof(g_deopt_reasons[0]))
+                       ? g_deopt_reasons[deopt_id]
+                       : "unknown deoptimization reason";
+        g_deopt_callback(&info);
+        /* If the custom handler returns, we still abort because the
+         * deoptimization point's fast-path code is unreachable after this.
+         * In a JIT compiler, the handler would never return. */
+    }
+
+    /* Default handler: print error and abort */
+    const char* reason = (deopt_id < sizeof(g_deopt_reasons) / sizeof(g_deopt_reasons[0]))
+                          ? g_deopt_reasons[deopt_id]
+                          : "unknown deoptimization reason";
+    fprintf(stderr, "[tether] DEOPTIMIZATION: assumption violated at deopt point %lu: %s\n",
+            (unsigned long)deopt_id, reason);
+    fprintf(stderr, "[tether] This means a speculative optimization was incorrect.\n");
+    fprintf(stderr, "[tether] Recompile without speculative optimization or fix the code.\n");
+    abort();
+}
+
+void tether_register_deopt_handler(TetherDeoptCallback callback) {
+    g_deopt_callback = callback;
+}

@@ -87,7 +87,8 @@ std::string unaryOpToString(UnaryOp op);
 enum class CompilerDirective : uint8_t {
     Superoptimize,
     Polly,
-    Simd
+    Simd,
+    Unsafe  // @unsafe directive or unsafe block
 };
 
 std::string compilerDirectiveToString(CompilerDirective d);
@@ -146,6 +147,7 @@ enum class NodeKind : uint16_t {
     MatchStmt,        // Pattern matching: match expr { ... } (replaces SwitchStmt)
     ParallelForStmt,  // Parallel loop: parallel for item in iter { body }
     StaticAssertStmt, // Compile-time assertion: static_assert(cond, "msg")
+    UnsafeBlockStmt,  // unsafe { ... } block
     // Top-level declarations
     FnDecl,
     StructDecl,
@@ -157,6 +159,8 @@ enum class NodeKind : uint16_t {
     // v0.3 expansion top-level declarations
     ModuleDecl,       // Module declaration: module name;
     UseDecl,          // Selective import: use module::name as alias;
+    // v0.4 strict borrow checker additions
+    UnsafeBlockStmt_, // Sentinel: end of UnsafeBlockStmt range (for classof)
 };
 
 // ============================================================================
@@ -257,7 +261,7 @@ class Stmt : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::VarDeclStmt && k <= NodeKind::StaticAssertStmt;
+        return k >= NodeKind::VarDeclStmt && k <= NodeKind::UnsafeBlockStmt;
     }
 
 protected:
@@ -272,7 +276,7 @@ class TopLevel : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::FnDecl && k <= NodeKind::UseDecl;
+        return k >= NodeKind::FnDecl && k <= NodeKind::UnsafeBlockStmt_;
     }
 
 protected:
@@ -1204,6 +1208,33 @@ public:
 private:
     std::unique_ptr<Expr> condition_;
     std::string message_;
+};
+
+// ---- UnsafeBlockStmt ----
+// unsafe { ... } block — relaxes borrow checking within the block
+// The compiler still tracks everything, but enforcement is relaxed:
+// borrow errors become warnings, bounds check failures are suppressed,
+// and raw pointer operations are allowed.
+class UnsafeBlockStmt : public Stmt {
+public:
+    UnsafeBlockStmt(SourceLocation loc, std::unique_ptr<BlockStmt> body)
+        : Stmt(NodeKind::UnsafeBlockStmt, std::move(loc))
+        , body_(std::move(body)) {}
+
+    BlockStmt& body() { return *body_; }
+    const BlockStmt& body() const { return *body_; }
+    BlockStmt* bodyPtr() { return body_.get(); }
+    const BlockStmt* bodyPtr() const { return body_.get(); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::UnsafeBlockStmt;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<BlockStmt> body_;
 };
 
 // ---- TypeofExpr ----

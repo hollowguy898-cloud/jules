@@ -87,3 +87,70 @@ Stage Summary:
 - IR-level PGO working: 8 functions profiled, maximum function count 64,926, maximum block count 5,097,996
 - Propeller benefits scale with codebase size (I-cache effects require >1MB of code)
 - Files: scripts/propeller_build.sh, benchmarks/propeller_bench.tth, Makefile targets, IRGenerator.cpp linkage fix
+
+---
+Task ID: 1
+Agent: Main Agent
+Task: Implement Nuclear Option #1 - Custom LLVM Pass Plugin for Tether Compiler
+
+Work Log:
+- Read and analyzed existing codebase: IRGenerator.cpp, Driver.cpp, Makefile, MetaTypes.h
+- Created include/pass/TetherAttrPass.h — Header with flag constants and TetherAttrPass class declaration
+- Created src/pass/TetherAttrPass.cpp — Main LLVM pass plugin implementation (250+ lines)
+  - Reads !tether.fns named metadata for function-level attributes (hot, cold, pure, noalloc, etc.)
+  - Reads !tether.params named metadata for parameter-level attributes (noalias, readonly, nonnull, invariant_load)
+  - Reads !tether.loops named metadata for loop hints (vectorize, unroll) and creates !llvm.loop metadata
+  - Uses new LLVM pass manager (PassInfoMixin)
+  - Gracefully handles missing metadata (no-op if !tether.* not present)
+  - Checks existing attributes before adding (avoids duplicate attribute warnings)
+- Created src/pass/PassPluginMain.cpp — Plugin entry point exporting llvmGetPassPluginInfo()
+  - Registers pass by name ("tether-attr") for explicit invocation
+  - Auto-inserts at pipeline start for -O1+ via registerPipelineStartEPCallback
+- Modified include/codegen/IRGenerator.h — Added emitTetherFnMetadata() and emitTetherMetadata() methods
+  - Added TetherFnMeta struct for per-function metadata collection
+  - Added tether_fn_metas_ vector for accumulated metadata
+- Modified src/codegen/IRGenerator.cpp — Implemented Tether metadata emission
+  - emitTetherFnMetadata(FnDecl*): Computes flags bitmask from MetadataMap's NodeMeta
+    - Function flags: noalias, readonly, hot, cold, pure, noalloc, vectorize, unroll, invariant_load
+    - Parameter flags: noalias, readonly, nonnull, invariant_load
+    - Also checks AST properties (isPure, isNoalloc, is_restrict, reference types)
+  - emitTetherMetadata(): Emits module-level named metadata at end of generate()
+    - !tether.fns = !{!N, !M, ...} — function name + flags
+    - !tether.params = !{!P, !Q, ...} — function name + param index + param flags
+    - !tether.loops = !{!R, !S, ...} — function name + loop flags
+  - Called emitTetherFnMetadata(fn) at end of emitFnDecl()
+  - Called emitTetherMetadata() at end of generate()
+  - Reset tether_fn_metas_ at start of generate()
+- Modified include/driver/Driver.h — Added buildPassPlugin() and findLlvmConfig() declarations
+  - Added pass_plugin_path_ cache field
+- Modified src/driver/Driver.cpp — Implemented pass plugin build and integration
+  - buildPassPlugin(): Builds TetherAttrPass.so using clang + llvm-config
+    - Caches built plugin path for reuse within session
+    - Checks if plugin is up-to-date (skips rebuild if sources unchanged)
+    - Gracefully degrades if llvm-config or clang not available
+    - Uses popen() to capture llvm-config output for cxxflags/ldflags/libs
+  - findLlvmConfig(): Finds llvm-config on PATH (versioned names first)
+  - Modified runBackend(): Added -fpass-plugin=... flag when plugin available and -O1+
+    - Warning message if plugin not available
+- Modified Makefile — Added pass plugin build target
+  - PASS_PLUGIN = build/TetherAttrPass.so target
+  - Auto-detects llvm-config availability (skips build if not found)
+  - Excluded src/pass/ from regular CXX_SRCS (requires LLVM headers)
+  - Added pass-plugin phony target
+  - Updated clean target to remove plugin
+  - Updated help text
+- Built and tested: compiler compiles successfully with all changes
+- Verified Tether metadata emission in generated IR:
+  - !tether.fns with correct function flags (e.g., pure=16, noalloc=32)
+  - !tether.params with correct parameter flags (e.g., noalias+readonly+nonnull=7)
+  - !tether.loops for functions with vectorize/unroll directives
+
+Stage Summary:
+- Custom LLVM pass plugin (TetherAttrPass) implemented as shared library
+- IRGenerator now emits Tether-specific metadata in LLVM IR modules
+- Driver builds the plugin automatically when LLVM is available
+- Graceful degradation: metadata always emitted, plugin optional
+- Metadata format: !tether.fns, !tether.params, !tether.loops named metadata
+- Pass injects: noalias, readonly, hot, cold, memory(none), willreturn, nosync, !llvm.loop attributes
+- Files created: include/pass/TetherAttrPass.h, src/pass/TetherAttrPass.cpp, src/pass/PassPluginMain.cpp
+- Files modified: include/codegen/IRGenerator.h, src/codegen/IRGenerator.cpp, include/driver/Driver.h, src/driver/Driver.cpp, Makefile

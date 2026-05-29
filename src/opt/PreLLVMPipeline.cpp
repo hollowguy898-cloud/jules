@@ -261,6 +261,36 @@ PreLLVMPipelineResult PreLLVMPipeline::run(Program& program) {
     result.pass_log.push_back("[PreLLVM]   -> L2 ControlFlowSimplifier applied");
 
     // ========================================================================
+    // Phase 2c: Speculative optimization (Nuclear #8)
+    //
+    // Analyzes the program for speculative optimization opportunities:
+    //   - Branches that are almost never taken (deopt guard the cold path)
+    //   - Pointers that are never null (deopt guard the null check)
+    //   - Array indices that are always in bounds (skip bounds check)
+    //   - Arithmetic that never overflows (use unchecked math)
+    //
+    // Must run after L1-L3 (needs branch probabilities and access patterns)
+    // and before transforms (so deopt guards are in place before codegen).
+    // ========================================================================
+
+    if (level_ == PreLLVMOptLevel::Aggressive) {
+        result.pass_log.push_back("[PreLLVM] Phase 2c: Speculative optimization (Nuclear #8)");
+        speculative_.setMetadataMap(&metadata_);
+        bool spec_changed = speculative_.run(program, type_table_);
+        result.passes_run++;
+        if (spec_changed) {
+            result.transformations_made++;
+            result.pass_log.push_back("[PreLLVM]   -> SpeculativeOptimizer: " +
+                                      std::to_string(speculative_.totalAssumptions()) +
+                                      " assumptions, " +
+                                      std::to_string(speculative_.totalGuards()) +
+                                      " deopt guards");
+        } else {
+            result.pass_log.push_back("[PreLLVM]   -> SpeculativeOptimizer: no speculative opportunities found");
+        }
+    }
+
+    // ========================================================================
     // Phase 3: LAYOUT TRANSFORMS — use analysis to optimize data layout
     //
     // Only LayoutTransform-category passes run here. These change the

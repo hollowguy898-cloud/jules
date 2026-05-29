@@ -590,6 +590,33 @@ public:
     int emitSimdLoopMetadata();
 
     // =======================================================================
+    // Tether metadata emission for LLVM pass plugin
+    //
+    // These methods emit Tether-specific named metadata that the
+    // TetherAttrPass LLVM plugin reads to inject optimization attributes.
+    // The metadata is emitted as module-level named metadata nodes
+    // (!tether.fns, !tether.params, !tether.loops).
+    // =======================================================================
+
+    // Emit Tether metadata for a single function. Called after the function
+    // body is emitted. Computes flags from the MetadataMap's NodeMeta and
+    // records them for later emission by emitTetherMetadata().
+    void emitTetherFnMetadata(FnDecl* fn);
+
+    // Emit all accumulated Tether named metadata at the end of the module.
+    // Called after all top-level declarations have been emitted.
+    void emitTetherMetadata();
+
+    // Per-function Tether metadata collected during emission
+    struct TetherFnMeta {
+        std::string fn_name;         // sanitized function name
+        uint32_t fn_flags = 0;       // function-level flags bitmask
+        std::vector<uint32_t> param_flags;  // per-parameter flags bitmask
+        uint32_t loop_flags = 0;     // loop-level flags (vectorize/unroll)
+    };
+    std::vector<TetherFnMeta> tether_fn_metas_;
+
+    // =======================================================================
     // Metadata-driven emission helpers
     //
     // These methods check the MetadataMap for optimization metadata
@@ -641,6 +668,30 @@ public:
 
     // Metadata engine helpers: emit !range metadata on enum loads
     std::string emitRangeMetadataForEnum(TypeId type);
+
+    // =======================================================================
+    // Speculative optimization: deoptimization guard emission
+    //
+    // These methods check the MetadataMap for speculative assumptions
+    // (from the SpeculativeOptimizerPass) and emit deoptimization guards.
+    // If an assumption is violated at runtime, the deopt handler is called.
+    // =======================================================================
+
+    // Check if a node has a speculative assumption worth guarding
+    bool hasSpeculativeAssumption(const ASTNode* node) const;
+
+    // Emit a deoptimization guard for a branch (BranchNeverTaken assumption).
+    // The unlikely branch leads to a deopt block that calls tether_deopt().
+    // Returns the label of the fast-path block.
+    std::string emitDeoptGuardForBranch(const ASTNode* node, const std::string& cond,
+                                         const std::string& likely_label,
+                                         const std::string& unlikely_label);
+
+    // Emit a deoptimization block that calls the runtime deopt handler.
+    void emitDeoptBlock(int deopt_id);
+
+    // Counter for unique deopt IDs within a function
+    int deopt_counter_ = 0;
 };
 
 } // namespace tether

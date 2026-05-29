@@ -642,6 +642,9 @@ void IRGenerator::emitRuntimeDecls() {
     if (needed_runtime_.count("tether_taskpool_shutdown")) {
         module_out_ << "declare void @tether_taskpool_shutdown()\n"; any = true;
     }
+    if (needed_runtime_.count("tether_deopt")) {
+        module_out_ << "declare void @tether_deopt(i64, ptr) noreturn cold\n"; any = true;
+    }
     if (any) module_out_ << "\n";
 }
 
@@ -780,6 +783,246 @@ void IRGenerator::emitMetadata() {
     for (const auto& e : metadata_entries_) {
         module_out_ << "!" << e.id << " = " << e.content << "\n";
     }
+    module_out_ << "\n";
+}
+
+// ============================================================================
+// emitTetherFnMetadata — compute and record Tether metadata for a function
+//
+// This is called after emitting each function definition. It examines the
+// MetadataMap's NodeMeta for the function and its parameters, computes a
+// flags bitmask, and records it for later emission by emitTetherMetadata().
+//
+// The actual metadata nodes are emitted at the end of generate() so that
+// all metadata entries can be collected into module-level named metadata.
+// ============================================================================
+void IRGenerator::emitTetherFnMetadata(FnDecl* fn) {
+    if (!fn) return;
+
+    // Only emit metadata for function definitions (not declarations)
+    if (!fn->body()) return;
+
+    TetherFnMeta meta;
+    meta.fn_name = sanitizeName(fn->name());
+
+    // --- Compute function-level flags ---
+    uint32_t fn_flags = 0;
+    auto* nm = meta_map_ ? meta_map_->get(fn) : nullptr;
+
+    if (nm) {
+        // noalias — function's return/this is noalias
+        if (nm->aliasing == AliasingKind::NoAlias) {
+            fn_flags |= 1u;  // kFnNoAlias = bit0
+        }
+        // readonly — function is readonly
+        if (nm->llvm_meta.noalias && nm->ownership == OwnershipKind::Immutable) {
+            fn_flags |= 2u;  // kFnReadOnly = bit1
+        }
+        // hot — function is on a hot path
+        if (nm->llvm_meta.hot_path) {
+            fn_flags |= 4u;  // kFnHot = bit2
+        }
+        // cold — function is on a cold path
+        if (nm->llvm_meta.cold_path) {
+            fn_flags |= 8u;  // kFnCold = bit3
+        }
+        // pure — function is memory(none)
+        if (nm->purity == FunctionPurity::Pure || fn->isPure()) {
+            fn_flags |= 16u;  // kFnPure = bit4
+        }
+        // noalloc — function is willreturn + nosync
+        if (nm->purity == FunctionPurity::NoAlloc || fn->isNoalloc()) {
+            fn_flags |= 32u;  // kFnNoAlloc = bit5
+        }
+        // vectorize — loop is safe to vectorize
+        if (nm->llvm_meta.vectorization_safe) {
+            meta.loop_flags |= 64u;  // kFnVectorize = bit6
+        }
+        // unroll — loop should be unrolled
+        if (nm->has_loop_with_linear_access && nm->llvm_meta.hot_path) {
+            meta.loop_flags |= 128u;  // kFnUnroll = bit7
+        }
+        // invariant_load — function has invariant load patterns
+        if (nm->llvm_meta.nonnull) {
+            fn_flags |= 256u;  // kFnInvariantLoad = bit8
+        }
+    }
+
+    // Also check function-level properties from the AST
+    if (fn->isPure() && !(fn_flags & 16u)) {
+        fn_flags |= 16u;  // kFnPure
+    }
+    if (fn->isNoalloc() && !(fn_flags & 32u)) {
+        fn_flags |= 32u;  // kFnNoAlloc
+    }
+
+    // Check for @simd directive
+    if (fn->hasDirective(CompilerDirective::Simd)) {
+        meta.loop_flags |= 64u;  // kFnVectorize
+    }
+
+    meta.fn_flags = fn_flags;
+
+    // --- Compute parameter-level flags ---
+    for (size_t i = 0; i < fn->paramCount(); ++i) {
+        const auto& p = fn->params()[i];
+        uint32_t pflags = 0;
+
+        auto* pnm = meta_map_ ? meta_map_->get(&p) : nullptr;
+        if (pnm) {
+            // noalias — parameter is restrict/noalias
+            if (pnm->aliasing == AliasingKind::NoAlias || pnm->is_restrict) {
+                pflags |= 1u;  // kParamNoAlias = bit0
+            }
+            // readonly — parameter is only read
+            if (pnm->ownership == OwnershipKind::Immutable ||
+                pnm->llvm_meta.noalias) {
+                // Use a heuristic: if the parameter's ownership is Immutable
+                // (val declaration) or it's a shared reference, mark readonly
+                if (p.type && isa<ReferenceType>(p.type)) {
+                    pflags |= 2u;  // kParamReadOnly = bit1
+                }
+            }
+            // nonnull — parameter is never null (Tether references are nonnull)
+            if (p.type && (isa<PointerType>(p.type) ||
+                           isa<ReferenceType>(p.type) ||
+                           isa<MutReferenceType>(p.type))) {
+                pflags |= 4u;  // kParamNonNull = bit2
+            }
+            // invariant_load — loads from this parameter are invariant
+            if (pnm->llvm_meta.nonnull && pnm->aliasing == AliasingKind::NoAlias) {
+                pflags |= 8u;  // kParamInvariantLoad = bit3
+            }
+        }
+
+        // Also check parameter-level properties from the AST
+        // (the IRGenerator already emits some of these as attributes, but the
+        //  pass plugin may apply additional attributes or fix up ones that
+        //  were missed)
+        if (p.is_restrict) {
+            pflags |= 1u;  // kParamNoAlias
+        }
+
+        // For &T (shared reference) parameters, always add readonly
+        if (p.type && isa<ReferenceType>(p.type)) {
+            pflags |= 2u;  // kParamReadOnly
+        }
+
+        // For &mut T (exclusive reference) parameters, add noalias
+        if (p.type && isa<MutReferenceType>(p.type)) {
+            pflags |= 1u;  // kParamNoAlias
+        }
+
+        // For pointer/reference types, add nonnull
+        if (p.type && (isa<PointerType>(p.type) ||
+                       isa<ReferenceType>(p.type) ||
+                       isa<MutReferenceType>(p.type))) {
+            pflags |= 4u;  // kParamNonNull
+        }
+
+        meta.param_flags.push_back(pflags);
+    }
+
+    // Only record if there's something to emit
+    if (fn_flags != 0 || meta.loop_flags != 0 ||
+        !meta.param_flags.empty()) {
+        tether_fn_metas_.push_back(std::move(meta));
+    }
+}
+
+// ============================================================================
+// emitTetherMetadata — emit all accumulated Tether named metadata
+//
+// Called at the end of generate() after all top-level declarations have
+// been emitted. Writes the module-level named metadata nodes that the
+// TetherAttrPass LLVM plugin reads.
+//
+// Emits:
+//   !tether.fns = !{!N, !M, ...}     — function name + flags
+//   !tether.params = !{!P, !Q, ...}   — function name + param idx + param flags
+//   !tether.loops = !{!R, !S, ...}    — function name + loop flags
+// ============================================================================
+void IRGenerator::emitTetherMetadata() {
+    if (tether_fn_metas_.empty()) return;
+
+    // We need to emit individual metadata entries and then the named
+    // metadata that references them. We track the start position so we
+    // only emit the Tether-specific entries (not the ones already emitted
+    // by emitMetadata()).
+
+    size_t start_idx = metadata_entries_.size();  // entries before Tether metadata
+
+    std::vector<int> fn_meta_ids;       // IDs for function metadata entries
+    std::vector<int> param_meta_ids;    // IDs for parameter metadata entries
+    std::vector<int> loop_meta_ids;     // IDs for loop metadata entries
+
+    // Allocate metadata IDs for each function entry
+    for (const auto& meta : tether_fn_metas_) {
+        // Function metadata: !{!"name", i32 flags}
+        int fn_id = metadata_counter_++;
+        fn_meta_ids.push_back(fn_id);
+        metadata_entries_.push_back({fn_id,
+            "!{!\"" + meta.fn_name + "\", i32 " + std::to_string(meta.fn_flags) + "}"});
+
+        // Parameter metadata: !{!"name", i32 param_idx, i32 param_flags}
+        for (size_t pi = 0; pi < meta.param_flags.size(); ++pi) {
+            if (meta.param_flags[pi] != 0) {
+                int param_id = metadata_counter_++;
+                param_meta_ids.push_back(param_id);
+                metadata_entries_.push_back({param_id,
+                    "!{!\"" + meta.fn_name + "\", i32 " + std::to_string(pi) +
+                    ", i32 " + std::to_string(meta.param_flags[pi]) + "}"});
+            }
+        }
+
+        // Loop metadata: !{!"name", i32 loop_flags}
+        if (meta.loop_flags != 0) {
+            int loop_id = metadata_counter_++;
+            loop_meta_ids.push_back(loop_id);
+            metadata_entries_.push_back({loop_id,
+                "!{!\"" + meta.fn_name + "\", i32 " +
+                std::to_string(meta.loop_flags) + "}"});
+        }
+    }
+
+    // Emit only the Tether-specific metadata entries (starting from start_idx)
+    module_out_ << "; Tether optimization metadata (consumed by TetherAttrPass)\n";
+    for (size_t i = start_idx; i < metadata_entries_.size(); ++i) {
+        const auto& e = metadata_entries_[i];
+        module_out_ << "!" << e.id << " = " << e.content << "\n";
+    }
+
+    // Emit the named metadata that ties them together
+    // !tether.fns = !{!N, !M, ...}
+    if (!fn_meta_ids.empty()) {
+        module_out_ << "!tether.fns = !{";
+        for (size_t i = 0; i < fn_meta_ids.size(); ++i) {
+            if (i > 0) module_out_ << ", ";
+            module_out_ << "!" << fn_meta_ids[i];
+        }
+        module_out_ << "}\n";
+    }
+
+    // !tether.params = !{!P, !Q, ...}
+    if (!param_meta_ids.empty()) {
+        module_out_ << "!tether.params = !{";
+        for (size_t i = 0; i < param_meta_ids.size(); ++i) {
+            if (i > 0) module_out_ << ", ";
+            module_out_ << "!" << param_meta_ids[i];
+        }
+        module_out_ << "}\n";
+    }
+
+    // !tether.loops = !{!R, !S, ...}
+    if (!loop_meta_ids.empty()) {
+        module_out_ << "!tether.loops = !{";
+        for (size_t i = 0; i < loop_meta_ids.size(); ++i) {
+            if (i > 0) module_out_ << ", ";
+            module_out_ << "!" << loop_meta_ids[i];
+        }
+        module_out_ << "}\n";
+    }
+
     module_out_ << "\n";
 }
 
@@ -929,6 +1172,9 @@ void IRGenerator::emitMetaMapTBAA() {
 // generate – main entry point
 // ============================================================================
 std::string IRGenerator::generate() {
+    // 0. Reset per-generation state
+    tether_fn_metas_.clear();
+
     // 1. Collect composite types
     for (const auto& tl : program_) {
         if (isa<FnDecl>(*tl)) {
@@ -988,6 +1234,14 @@ std::string IRGenerator::generate() {
     if (meta_map_) {
         emitMetaMapTBAA();
     }
+
+    // 9. Emit Tether optimization metadata for the LLVM pass plugin.
+    // This emits named metadata (!tether.fns, !tether.params, !tether.loops)
+    // that the TetherAttrPass reads to inject LLVM optimization attributes.
+    // The metadata is always emitted (even without the pass plugin), because
+    // it's valid LLVM IR that just adds module-level named metadata nodes.
+    // If the TetherAttrPass plugin is not loaded, the metadata is harmless.
+    emitTetherMetadata();
 
     return module_out_.str();
 }
@@ -1088,6 +1342,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     current_err_slot_.clear();
     caller_err_slot_.clear();
     current_fn_has_simd_ = fn->hasDirective(CompilerDirective::Simd);
+    deopt_counter_ = 0;
     current_block_label_ = "entry";
 
     alloca_ss_.clear();
@@ -1399,6 +1654,10 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     module_out_ << alloca_ss_.str();
     module_out_ << body_ss_.str();
     module_out_ << "}\n\n";
+
+    // Emit Tether metadata for this function (records metadata for later
+    // emission by emitTetherMetadata() at the end of generate()).
+    emitTetherFnMetadata(fn);
 }
 
 // ============================================================================
@@ -1739,6 +1998,80 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             SSASnapshot pre_branch_snap = takeSnapshot();
             // Remember the label of the block that contains the branch instruction
             std::string branch_block = current_block_label_;
+
+            // --- Speculative optimization: deoptimization guard ---
+            // If the speculative optimizer determined that one branch is
+            // almost never taken, route the unlikely path to a deopt block
+            // instead of normal code. This eliminates the overhead of the
+            // cold path entirely in the fast path.
+            bool has_deopt_guard = false;
+            bool then_is_unlikely = false;
+            if (meta_map_) {
+                auto* nm = meta_map_->get(stmt);
+                if (nm && nm->has_speculative_assumption &&
+                    nm->speculative_kind == AssumptionKind::BranchNeverTaken) {
+                    has_deopt_guard = true;
+                    // Determine which branch is unlikely
+                    auto* if_nm = meta_map_->get(&is);
+                    if (if_nm) {
+                        then_is_unlikely = (if_nm->branch_prob == BranchProbability::Unlikely);
+                    }
+                }
+            }
+
+            if (has_deopt_guard) {
+                // Speculative: route the unlikely branch to a deopt block
+                int deopt_id = deopt_counter_++;
+                std::string deopt_l = nextLabel("deopt");
+                std::string likely_l = then_is_unlikely ? else_l : then_l;
+                std::string unlikely_l = then_is_unlikely ? then_l : else_l;
+
+                // Branch to likely path and deopt block
+                if (then_is_unlikely) {
+                    body_ss_ << "  br i1 " << cond << ", label %" << deopt_l
+                             << ", label %" << likely_l << cold_meta << "\n";
+                } else {
+                    body_ss_ << "  br i1 " << cond << ", label %" << likely_l
+                             << ", label %" << deopt_l << cold_meta << "\n";
+                }
+                setTerminated(false);
+
+                // Emit the deoptimization block
+                emitBlockLabel(deopt_l);
+                needed_runtime_.insert("tether_deopt");
+                body_ss_ << "  ; [speculative] deoptimization guard, deopt_id=" << deopt_id << "\n";
+                body_ss_ << "  call void @tether_deopt(i64 " << deopt_id << ", ptr null)\n";
+                body_ss_ << "  unreachable\n";
+                setTerminated(true);
+
+                // Emit the likely path
+                emitBlockLabel(likely_l);
+                setTerminated(false);
+                if (then_is_unlikely && is.hasElse()) {
+                    emitBlockStmt(is.elseBlock());
+                } else {
+                    emitBlockStmt(is.thenBlock());
+                }
+                // Snapshot at end of likely path
+                SSASnapshot likely_snap = takeSnapshot();
+                bool likely_terminated = isTerminated();
+                std::string likely_exit_block = current_block_label_;
+                if (!isTerminated()) body_ss_ << "  br label %" << merge_l << "\n";
+                setTerminated(false);
+
+                // Emit the merge block
+                if (!likely_terminated) {
+                    emitBlockLabel(merge_l);
+                    // Just use the likely snap values (no phi needed with deopt)
+                    for (auto& [name, val] : likely_snap.values) {
+                        updateVarValue(name, val);
+                    }
+                    setTerminated(false);
+                } else {
+                    setTerminated(true);
+                }
+                break;
+            }
 
             if (is.hasElse()) {
                 body_ss_ << "  br i1 " << cond << ", label %" << then_l
@@ -4309,6 +4642,77 @@ std::string IRGenerator::emitSoAAccessIfAnnotated(Expr* expr) {
 
     // Fallback: if we can't rewrite, return empty and let normal emission happen
     return "";
+}
+
+// ============================================================================
+// hasSpeculativeAssumption – check if a node has a speculative assumption
+// ============================================================================
+bool IRGenerator::hasSpeculativeAssumption(const ASTNode* node) const {
+    if (!meta_map_ || !node) return false;
+    auto* nm = meta_map_->get(node);
+    return nm && nm->has_speculative_assumption;
+}
+
+// ============================================================================
+// emitDeoptGuardForBranch – emit a deoptimization guard for a branch
+//
+// When the speculative optimizer has determined that one branch is almost
+// never taken (BranchNeverTaken assumption), we emit the likely path as
+// the fast path and route the unlikely path to a deoptimization block
+// that calls tether_deopt() and is marked unreachable.
+//
+// Pattern:
+//   br i1 %cond, label %likely, label %deopt.N
+// deopt.N:
+//   call void @tether_deopt(i64 N, ptr null)
+//   unreachable
+// likely:
+//   ; ... fast-path code ...
+// ============================================================================
+std::string IRGenerator::emitDeoptGuardForBranch(const ASTNode* node,
+                                                   const std::string& cond,
+                                                   const std::string& likely_label,
+                                                   const std::string& unlikely_label) {
+    if (!meta_map_ || !node) return unlikely_label;
+
+    auto* nm = meta_map_->get(node);
+    if (!nm || !nm->has_speculative_assumption) return unlikely_label;
+
+    // Only emit deopt guard for BranchNeverTaken assumptions
+    if (nm->speculative_kind != AssumptionKind::BranchNeverTaken) return unlikely_label;
+
+    int deopt_id = deopt_counter_++;
+    std::string deopt_label = nextLabel("deopt");
+
+    // Emit the branch: likely path is normal, unlikely path goes to deopt
+    body_ss_ << "  br i1 " << cond << ", label %" << likely_label
+             << ", label %" << deopt_label << "\n";
+    setTerminated(false);
+
+    // Emit the deoptimization block
+    emitDeoptBlock(deopt_id);
+
+    // Return the likely label (caller should emit fast-path code there)
+    return likely_label;
+}
+
+// ============================================================================
+// emitDeoptBlock – emit a deoptimization block
+//
+// Emits a basic block that calls the runtime deopt handler and is marked
+// unreachable. LLVM will place this block out-of-line (cold section).
+// ============================================================================
+void IRGenerator::emitDeoptBlock(int deopt_id) {
+    std::string deopt_label = nextLabel("deopt");
+    emitBlockLabel(deopt_label);
+
+    // Declare the deopt runtime function
+    needed_runtime_.insert("tether_deopt");
+
+    body_ss_ << "  ; [speculative] deoptimization guard, deopt_id=" << deopt_id << "\n";
+    body_ss_ << "  call void @tether_deopt(i64 " << deopt_id << ", ptr null)\n";
+    body_ss_ << "  unreachable\n";
+    setTerminated(true);
 }
 
 } // namespace tether

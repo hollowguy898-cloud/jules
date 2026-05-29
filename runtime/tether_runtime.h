@@ -330,6 +330,36 @@ int tether_task_is_done(TetherTaskHandle handle);
 // Get the number of worker threads in the task pool.
 uint32_t tether_taskpool_thread_count(void);
 
+/* ============================================================================
+ * Deoptimization support (Nuclear #8: Speculative Optimization)
+ *
+ * When the compiler speculatively optimizes code (e.g., assuming a branch is
+ * never taken, a pointer is never null, or an array index is in bounds),
+ * it inserts deoptimization guards. If a guard fails at runtime, the
+ * tether_deopt() function is called to handle the deoptimization event.
+ *
+ * The default handler prints an error message and aborts. Applications can
+ * register a custom handler for more graceful recovery (e.g., JIT compilers
+ * can use this for on-stack replacement).
+ * ============================================================================ */
+
+/* Deoptimization event information */
+typedef struct TetherDeoptInfo {
+    uint64_t deopt_id;     /* Which deopt point was hit (maps to source location) */
+    void*     frame;       /* Stack frame pointer at the deopt point */
+    const char* reason;    /* Human-readable reason for the deopt */
+} TetherDeoptInfo;
+
+/* Called when a speculative assumption is violated at runtime.
+ * The default implementation prints a message and calls abort().
+ * If a custom handler is registered, it is called instead. */
+void tether_deopt(uint64_t deopt_id, void* frame);
+
+/* Register a custom deoptimization handler callback.
+ * Pass NULL to restore the default handler. */
+typedef void (*TetherDeoptCallback)(TetherDeoptInfo* info);
+void tether_register_deopt_handler(TetherDeoptCallback callback);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

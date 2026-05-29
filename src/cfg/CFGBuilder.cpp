@@ -120,6 +120,13 @@ CFGNode* CFGBuilder::buildStmt(Stmt& stmt, CFGNode* current) {
             return buildExprStmt(static_cast<ExprStmt&>(stmt), current);
         case NodeKind::BlockStmt:
             return buildBlock(static_cast<BlockStmt&>(stmt), current);
+        case NodeKind::UnsafeBlockStmt: {
+            auto& us = static_cast<UnsafeBlockStmt&>(stmt);
+            current->addStmt(&us);
+            trackStatement(us, current);
+            // Build the body of the unsafe block
+            return buildBlock(us.body(), current);
+        }
         default:
             // Unknown statement type — just add it and continue
             current->addStmt(&stmt);
@@ -451,23 +458,26 @@ void CFGBuilder::collectBorrows(Expr& expr, std::vector<BorrowInfo>& borrows) {
         case NodeKind::AddrOfExpr: {
             auto& ae = static_cast<AddrOfExpr&>(expr);
             // &x or &mut x creates a borrow
-            if (ae.operand()->getKind() == NodeKind::IdentExpr) {
+            // Try to extract a path expression from the operand for precise tracking
+            std::string path_str = extractPathString(*ae.operand());
+            BorrowKind kind = ae.isMutable()
+                ? BorrowKind::MutExclusive
+                : BorrowKind::Shared;
+            TypeId borrow_type = ae.getType();
+
+            if (!path_str.empty()) {
+                // We have a precise path (e.g., "point.x")
+                borrows.emplace_back(
+                    path_str, kind, ae.sourceLoc(), "", borrow_type);
+            } else if (ae.operand()->getKind() == NodeKind::IdentExpr) {
                 auto& ie = static_cast<IdentExpr&>(*ae.operand());
-                BorrowKind kind = ae.isMutable()
-                    ? BorrowKind::MutExclusive
-                    : BorrowKind::Shared;
-                TypeId borrow_type = ae.getType();
                 borrows.emplace_back(
                     ie.name(), kind, ae.sourceLoc(), "", borrow_type);
             } else {
-                // Borrowing through a member access or index
-                // e.g., &s.field or &a[i]
+                // Borrowing through a complex expression (index, deref, etc.)
+                // Fall back to collecting used vars
                 std::unordered_set<std::string> used;
                 collectUsedVars(*ae.operand(), used);
-                BorrowKind kind = ae.isMutable()
-                    ? BorrowKind::MutExclusive
-                    : BorrowKind::Shared;
-                TypeId borrow_type = ae.getType();
                 for (const auto& var : used) {
                     borrows.emplace_back(
                         var, kind, ae.sourceLoc(), "", borrow_type);
@@ -497,6 +507,29 @@ void CFGBuilder::collectBorrows(Expr& expr, std::vector<BorrowInfo>& borrows) {
         default:
             // Most expressions don't create borrows
             break;
+    }
+}
+
+// ============================================================================
+// extractPathString - extract a dotted path string from an expression
+// e.g., point.x → "point.x", point.x.y → "point.x.y"
+// Returns empty string if the expression is not a simple path
+// ============================================================================
+std::string CFGBuilder::extractPathString(Expr& expr) {
+    switch (expr.getKind()) {
+        case NodeKind::IdentExpr: {
+            auto& ie = static_cast<IdentExpr&>(expr);
+            return ie.name();
+        }
+        case NodeKind::MemberExpr: {
+            auto& me = static_cast<MemberExpr&>(expr);
+            std::string prefix = extractPathString(*me.object());
+            if (prefix.empty()) return "";
+            return prefix + "." + me.field();
+        }
+        default:
+            // Not a simple path (index, deref, call, etc.)
+            return "";
     }
 }
 

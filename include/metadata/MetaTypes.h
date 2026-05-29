@@ -116,6 +116,23 @@ struct LayoutTransform {
 };
 
 // ============================================================================
+// Speculative optimization assumption kinds
+//
+// These are the types of assumptions the speculative optimizer can make
+// about program behavior. Each assumption carries a confidence level and
+// results in a deoptimization guard in the generated LLVM IR.
+// ============================================================================
+enum class AssumptionKind : uint8_t {
+    NeverNull,        // Pointer is never null
+    TypeExact,        // Type is exactly T (not a subtype)
+    BranchNeverTaken, // A branch is never taken (cold path)
+    NoOverflow,       // Arithmetic doesn't overflow
+    BoundsInRange,    // Array index is within bounds
+    NoAlias,          // Pointers don't alias
+    PureCall,         // Function call has no side effects
+};
+
+// ============================================================================
 // L5: LLVM emission metadata — what LLVM hints to emit
 // ============================================================================
 
@@ -143,6 +160,7 @@ struct ProfileData {
     uint64_t branch_taken = 0;      // True branch taken count
     uint64_t branch_not_taken = 0;  // False branch taken count
     uint64_t loop_iteration_count = 0; // Average loop iterations
+    uint64_t violation_count = 0;   // How many times a speculative assumption was violated
     bool has_profile = false;       // Whether real profile data is available
 };
 
@@ -187,6 +205,18 @@ struct NodeMeta {
     bool allocator_inlined = false;    // arena bump was inlined
     bool stack_allocated = false;      // smart pointer can use stack instead of heap
     bool soa_transformed = false;      // this struct was SoA-transformed
+
+    // Speculative optimization (from SpeculativeOptimizerPass)
+    bool has_speculative_assumption = false;
+    AssumptionKind speculative_kind;   // Only valid if has_speculative_assumption
+    float speculative_confidence = 0.0f;
+
+    // Strict borrow checker results
+    bool borrow_proven_safe = false;     // Borrow checker proved this access is safe
+    bool bounds_proven_safe = false;     // Bounds check can be eliminated
+    bool in_unsafe_block = false;        // This node is inside an unsafe block
+    bool moved_out = false;              // This variable has been moved out
+    uint32_t lifetime_id = static_cast<uint32_t>(-1);  // Assigned lifetime for this reference (INVALID_LIFETIME = -1)
 };
 
 // ============================================================================

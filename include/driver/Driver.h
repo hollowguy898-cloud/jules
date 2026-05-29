@@ -86,6 +86,15 @@ private:
     std::string deriveOutputPath() const;
     static bool removeFile(const std::string& path);
 
+    // Build the TetherAttrPass LLVM pass plugin shared library.
+    // Returns the path to the built .so file, or empty string on failure.
+    // If the plugin is already built and up-to-date, returns the existing path.
+    // Uses clang and llvm-config to compile the plugin.
+    std::string buildPassPlugin();
+
+    // Find llvm-config on PATH (for building the pass plugin)
+    static std::string findLlvmConfig();
+
     // Configuration
     std::string input_file_;
     std::string output_file_;
@@ -123,6 +132,9 @@ private:
     std::vector<ParseError> parse_errors_;
     ErrorReporter sema_reporter_;
     std::vector<BorrowError> borrowck_errors_;
+
+    // Cached path to the built TetherAttrPass plugin (.so)
+    std::string pass_plugin_path_;
 };
 
 } // namespace tether
