@@ -632,6 +632,13 @@ public:
     std::string emitTBAAMetadataForField(const std::string& struct_name,
                                           const std::string& field_name);
 
+    // Emit both a TBAA type descriptor and an access tag for a struct field.
+    // Returns the access tag metadata string (e.g. ", !tbaa !7") for use on
+    // load/store instructions. Also emits the type descriptor if needed.
+    std::string emitTBAATypeAndAccessTags(const std::string& struct_name,
+                                           const std::string& field_name,
+                                           uint64_t offset, uint64_t size);
+
     // Metadata engine helpers: emit !range metadata on enum loads
     std::string emitRangeMetadataForEnum(TypeId type);
 };

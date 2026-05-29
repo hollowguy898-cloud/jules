@@ -7,6 +7,7 @@
 #include "borrowck/BorrowChecker.h"
 #include "opt/PreLLVMPipeline.h"
 #include "codegen/IRGenerator.h"
+#include "metadata/MetaTypes.h"
 
 #include <iostream>
 #include <fstream>
@@ -350,6 +351,27 @@ bool Driver::runBorrowChecking() {
 
     if (borrowck_had_errors_) {
         // Don't abort - continue with IR generation
+    }
+
+    // Plumb borrow checker's noalias results into the MetadataMap
+    // so IRGenerator can emit noalias attributes on function parameters
+    if (pipeline_ && !checker.noAliasParams().empty()) {
+        MetadataMap& meta = pipeline_->metadata();
+        for (const auto& na : checker.noAliasParams()) {
+            // Find the corresponding FnParam in the program AST
+            for (const auto& tl : program_) {
+                if (auto* fn = dyn_cast<FnDecl>(tl.get())) {
+                    for (auto& param : fn->params()) {
+                        if (param.name == na.param_name) {
+                            auto& nm = meta.getOrCreate(&param);
+                            nm.aliasing = AliasingKind::NoAlias;
+                            nm.is_restrict = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (verbose_ && !borrowck_had_errors_) {

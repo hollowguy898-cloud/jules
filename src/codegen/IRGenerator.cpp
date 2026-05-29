@@ -435,10 +435,60 @@ void IRGenerator::collectNeededTypes(TypeId type) {
             if (st.fields().empty()) {
                 body = "{ i8 }";
             } else {
+                // Check if this struct has a PackedBitfield transform.
+                // If so, merge consecutive bool fields into a single integer type.
+                bool is_packed_bitfield = false;
+                if (meta_map_) {
+                    auto* smeta = meta_map_->getStructMeta(st.name());
+                    if (smeta && smeta->transform.kind == TransformKind::PackedBitfield) {
+                        is_packed_bitfield = true;
+                    }
+                }
+
                 body = "{ ";
-                for (size_t i = 0; i < st.fields().size(); ++i) {
-                    if (i > 0) body += ", ";
-                    body += llvmType(st.fields()[i].type);
+                if (is_packed_bitfield) {
+                    // Merge consecutive bool fields into a single integer type.
+                    // Walk fields, accumulating consecutive bools, then emit as iN.
+                    size_t i = 0;
+                    bool first = true;
+                    while (i < st.fields().size()) {
+                        // Check if this field is bool
+                        if (st.fields()[i].type && st.fields()[i].type->isBool()) {
+                            // Count consecutive bools
+                            size_t bool_count = 0;
+                            while (i < st.fields().size() &&
+                                   st.fields()[i].type && st.fields()[i].type->isBool()) {
+                                ++bool_count;
+                                ++i;
+                            }
+                            // Merge into the smallest integer type that fits
+                            if (!first) body += ", ";
+                            first = false;
+                            if (bool_count <= 1) {
+                                body += "i1";
+                            } else if (bool_count <= 8) {
+                                body += "i8";
+                            } else if (bool_count <= 16) {
+                                body += "i16";
+                            } else if (bool_count <= 32) {
+                                body += "i32";
+                            } else {
+                                body += "i64";
+                            }
+                        } else {
+                            // Non-bool field: emit normally
+                            if (!first) body += ", ";
+                            first = false;
+                            body += llvmType(st.fields()[i].type);
+                            ++i;
+                        }
+                    }
+                } else {
+                    // Normal struct: emit each field individually
+                    for (size_t i = 0; i < st.fields().size(); ++i) {
+                        if (i > 0) body += ", ";
+                        body += llvmType(st.fields()[i].type);
+                    }
                 }
                 body += " }";
             }
@@ -638,25 +688,22 @@ void IRGenerator::emitStringConstants() {
 // ============================================================================
 std::string IRGenerator::emitTBAAMetadataForField(const std::string& struct_name,
                                                     const std::string& field_name) {
-    // BUG FIX: Disable TBAA metadata for now — the format emitted by
-    // emitMetaMapTBAA() doesn't match LLVM 17's expected struct tag format,
-    // causing "Immutability part of the struct tag metadata must be either 0 or 1"
-    // verification errors. The type descriptors have offsets encoded in them
-    // which LLVM misinterprets as the constant/immutability flag.
-    // TODO: Implement proper LLVM 17 TBAA with separate type descriptors
-    // and access tags.
-    return "";
-#if 0
     if (!meta_map_) return "";
 
-    // Look up the struct in the metadata map
-    auto* smeta = meta_map_->getStructMeta(struct_name);
-    if (!smeta) return "";
+    // Look up the access tag for this struct+field.
+    // In LLVM 17+, TBAA access tags have the format:
+    //   !N = !{!base_type, !access_type, i64 offset, i64 size}
+    // We pre-register both type descriptors and access tags.
+    // The access tag key format is "access.STRUCT_NAME.FIELD_NAME".
+    std::string access_key = "access." + struct_name + "." + field_name;
+    auto it = metadata_map_.find(access_key);
+    if (it != metadata_map_.end()) {
+        return ", !tbaa !" + std::to_string(it->second);
+    }
 
-    // Find the TBAA metadata ID for this struct+field combination
-    // The key format is "field.STRUCT_NAME.FIELD_NAME" (as created by L5)
+    // Fall back to the type descriptor (field-level)
     std::string key = "field." + struct_name + "." + field_name;
-    auto it = metadata_map_.find(key);
+    it = metadata_map_.find(key);
     if (it != metadata_map_.end()) {
         return ", !tbaa !" + std::to_string(it->second);
     }
@@ -667,8 +714,36 @@ std::string IRGenerator::emitTBAAMetadataForField(const std::string& struct_name
     if (it != metadata_map_.end()) {
         return ", !tbaa !" + std::to_string(it->second);
     }
-#endif
     return "";
+}
+
+// ============================================================================
+// emitTBAATypeAndAccessTags — emit TBAA type descriptor + access tag pair
+//
+// For LLVM 17+, TBAA has two kinds of metadata nodes:
+//   1. Type descriptors: !N = !{!"name", !parent, i64 offset}
+//   2. Access tags:      !N = !{!base_type, !access_type, i64 offset, i64 size}
+//
+// Loads/stores must reference access tags, not type descriptors.
+// This function ensures both are pre-registered and returns the access tag ref.
+// ============================================================================
+std::string IRGenerator::emitTBAATypeAndAccessTags(const std::string& struct_name,
+                                                     const std::string& field_name,
+                                                     uint64_t offset, uint64_t size) {
+    if (!meta_map_) return "";
+
+    // Ensure the access tag is registered (it should have been pre-registered
+    // by preRegisterTBAAMetadata, but if not, register it now)
+    std::string access_key = "access." + struct_name + "." + field_name;
+    auto it = metadata_map_.find(access_key);
+    if (it != metadata_map_.end()) {
+        return ", !tbaa !" + std::to_string(it->second);
+    }
+
+    // Access tag not yet registered — allocate one on the fly
+    int access_id = metadata_counter_++;
+    metadata_map_[access_key] = access_id;
+    return ", !tbaa !" + std::to_string(access_id);
 }
 
 // ============================================================================
@@ -728,14 +803,22 @@ void IRGenerator::preRegisterTBAAMetadata() {
     int scope_id = metadata_counter_++;
     metadata_map_["__tbaa_scope"] = scope_id;
 
-    // For each struct, allocate struct-level and per-field TBAA IDs
+    // For each struct, allocate struct-level and per-field TBAA IDs.
+    // For LLVM 17+, we emit BOTH type descriptors and access tags:
+    //   Type descriptor: !N = !{!"field.x", !struct_id, i64 offset}
+    //   Access tag:      !M = !{!struct_id, !N, i64 offset, i64 size}
     for (const auto& [name, sm] : meta_map_->structs()) {
         int struct_id = metadata_counter_++;
         metadata_map_["struct." + name] = struct_id;
 
         for (size_t i = 0; i < sm.field_names.size(); ++i) {
+            // Type descriptor ID for this field
             int field_id = metadata_counter_++;
             metadata_map_["field." + name + "." + sm.field_names[i]] = field_id;
+
+            // Access tag ID for this field (LLVM 17+ format)
+            int access_id = metadata_counter_++;
+            metadata_map_["access." + name + "." + sm.field_names[i]] = access_id;
         }
     }
 }
@@ -768,24 +851,74 @@ void IRGenerator::emitMetaMapTBAA() {
                      << domain_it->second << "}\n";
     }
 
-    // For each struct, emit struct-level and per-field TBAA nodes
+    // Build a lookup from struct name → StructDecl* so we can compute real offsets
+    std::unordered_map<std::string, StructDecl*> struct_decls;
+    for (const auto& tl : program_) {
+        if (isa<StructDecl>(*tl)) {
+            auto& sd = cast<StructDecl>(*tl);
+            struct_decls[sd.name()] = &sd;
+        }
+    }
+
+    // For each struct, emit struct-level type descriptor, per-field type
+    // descriptors, AND per-field access tags (LLVM 17+ format).
+    //
+    // LLVM 17 TBAA format:
+    //   Type descriptor: !N = !{!"name", !parent, i64 offset}
+    //   Access tag:      !M = !{!base_type, !access_type, i64 offset, i64 size}
+    //
+    // Loads/stores must reference access tags, not type descriptors.
     for (const auto& [name, sm] : meta_map_->structs()) {
         auto struct_it = metadata_map_.find("struct." + name);
         if (struct_it == metadata_map_.end()) continue;
 
         int struct_id = struct_it->second;
+        // Struct type descriptor: child of the root
         module_out_ << "!" << struct_id << " = !{!\"struct." << name
                      << "\", !" << root_id << ", i64 0}\n";
 
+        // Compute real field offsets from the StructDecl's field types
         uint64_t offset = 0;
         for (size_t i = 0; i < sm.field_names.size(); ++i) {
             auto field_it = metadata_map_.find("field." + name + "." + sm.field_names[i]);
             if (field_it == metadata_map_.end()) continue;
 
-            module_out_ << "!" << field_it->second << " = !{!\"field."
+            int field_id = field_it->second;
+
+            // Compute the size of this field's type
+            uint64_t field_size = 4;  // default: i32/float
+            auto sd_it = struct_decls.find(name);
+            if (sd_it != struct_decls.end()) {
+                auto* sd = sd_it->second;
+                if (i < sd->fields().size()) {
+                    TypeId ft = sd->fields()[i].type;
+                    if (ft) {
+                        field_size = typeSizeBytes(ft);
+                        if (field_size == 0) field_size = 4;  // safety default
+                    }
+                }
+            }
+
+            // Emit type descriptor: !N = !{!"field.x", !struct_id, i64 offset}
+            module_out_ << "!" << field_id << " = !{!\"field."
                          << sm.field_names[i] << "\", !" << struct_id
                          << ", i64 " << offset << "}\n";
-            offset += 8;
+
+            // Emit access tag: !M = !{!struct_id, !field_id, i64 offset, i64 size}
+            auto access_it = metadata_map_.find("access." + name + "." + sm.field_names[i]);
+            if (access_it != metadata_map_.end()) {
+                module_out_ << "!" << access_it->second << " = !{!" << struct_id
+                             << ", !" << field_id << ", i64 " << offset
+                             << ", i64 " << field_size << "}\n";
+            }
+
+            // Advance offset by the field size (aligned to natural alignment)
+            uint64_t align = field_size;
+            if (align < 1) align = 1;
+            if (align > 8) align = 8;
+            // Round offset up to alignment
+            offset = (offset + align - 1) & ~(align - 1);
+            offset += field_size;
         }
     }
 
@@ -896,6 +1029,22 @@ void IRGenerator::emitStructDecl(StructDecl* sd) {
     if (sd && sd->alignment() > 0) {
         module_out_ << "; %struct." << sanitizeName(sd->name())
                     << " has alignment " << sd->alignment() << "\n";
+    }
+
+    // Emit SoA global arrays if this struct is SoA-transformed
+    if (meta_map_ && sd) {
+        auto* smeta = meta_map_->getStructMeta(sd->name());
+        if (smeta && smeta->transform.kind == TransformKind::SoATransform) {
+            // For each field, emit a global array
+            for (size_t i = 0; i < sd->fields().size(); ++i) {
+                const auto& field = sd->fields()[i];
+                std::string field_type = llvmType(field.type);
+                std::string array_name = sanitizeName(sd->name()) + "_" + field.name;
+                // Default size: 1024 elements (will be resized at runtime)
+                module_out_ << "@" << array_name
+                           << " = global [1024 x " << field_type << "] zeroinitializer\n";
+            }
+        }
     }
 }
 
@@ -1478,6 +1627,81 @@ void IRGenerator::emitStmt(Stmt* stmt) {
         // ---- if ----
         case NodeKind::IfStmt: {
             auto& is = cast<IfStmt>(*stmt);
+
+            // --- Pre-LLVM optimization: select conversion for branchless code ---
+            // When the metadata engine marks an if/else as profitable for select
+            // conversion (both branches are cheap, no side effects), emit a
+            // select instruction instead of a branch. This eliminates branch
+            // misprediction overhead and enables vectorization.
+            {
+                auto* nm = meta_map_ ? meta_map_->get(&is) : nullptr;
+                bool can_select = nm && nm->select_profit == SelectProfitability::Profitable
+                                  && is.hasElse()
+                                  && is.thenBlock() && !is.thenBlock()->stmts().empty()
+                                  && is.elseBlock() && !is.elseBlock()->stmts().empty()
+                                  && is.thenBlock()->stmts().size() == 1
+                                  && is.elseBlock()->stmts().size() == 1
+                                  && isa<ExprStmt>(is.thenBlock()->stmts()[0].get())
+                                  && isa<ExprStmt>(is.elseBlock()->stmts()[0].get());
+
+                if (can_select) {
+                    auto& then_es = cast<ExprStmt>(*is.thenBlock()->stmts()[0]);
+                    auto& else_es = cast<ExprStmt>(*is.elseBlock()->stmts()[0]);
+
+                    // Only convert if both expressions have non-void types
+                    TypeId then_type = then_es.expr()->getType();
+                    TypeId else_type = else_es.expr()->getType();
+
+                    if (then_type && else_type &&
+                        !then_type->isVoid() && !else_type->isVoid() &&
+                        !isAggregateType(then_type) && !isAggregateType(else_type)) {
+                        std::string cond_val = emitExpr(is.condition());
+                        // Ensure i1
+                        if (is.condition()->getType() && !is.condition()->getType()->isBool()) {
+                            std::string c = nextReg();
+                            body_ss_ << "  " << c << " = icmp ne " << llvmType(is.condition()->getType())
+                                     << " " << cond_val << ", 0\n";
+                            cond_val = c;
+                        }
+
+                        // Snapshot SSA state before emitting then branch
+                        SSASnapshot pre_then_snap = takeSnapshot();
+
+                        // Emit then expression
+                        std::string then_val = emitExpr(then_es.expr());
+
+                        // Snapshot after then
+                        SSASnapshot after_then_snap = takeSnapshot();
+
+                        // Restore SSA to pre-then state for else branch
+                        for (auto& [name, val] : pre_then_snap.values) {
+                            updateVarValue(name, val);
+                        }
+
+                        // Emit else expression
+                        std::string else_val = emitExpr(else_es.expr());
+
+                        // Emit select instruction
+                        std::string result_type = llvmType(then_type);
+                        if (result_type != "void" && !result_type.empty()) {
+                            std::string result = nextReg();
+                            body_ss_ << "  " << result << " = select i1 " << cond_val
+                                     << ", " << result_type << " " << then_val
+                                     << ", " << result_type << " " << else_val << "\n";
+
+                            // Merge SSA state: use after_then for vars not touched by else,
+                            // and current values for else-touched vars. For simplicity,
+                            // use after_then values for all vars and override with current.
+                            for (auto& [name, val] : after_then_snap.values) {
+                                updateVarValue(name, val);
+                            }
+                        }
+
+                        break;  // Skip the rest of the if/else emission
+                    }
+                }
+            }
+
             std::string cond = emitExpr(is.condition());
             // Ensure i1
             if (is.condition()->getType() && !is.condition()->getType()->isBool()) {
@@ -2570,7 +2794,18 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 if (isAggregateType(ft)) return gep;
                 std::string loaded = nextReg();
                 std::string tbaa = emitTBAAMetadataForField(st.name(), mem.field());
-                body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep << tbaa << "\n";
+
+                // Add !invariant.load for immutable reference access
+                std::string inv_meta;
+                if (isa<ReferenceType>(obj_type)) {
+                    auto it = metadata_map_.find("__invariant_load");
+                    if (it != metadata_map_.end()) {
+                        inv_meta = ", !invariant.load !" + std::to_string(it->second);
+                    }
+                }
+
+                body_ss_ << "  " << loaded << " = load " << llvmType(ft) << ", ptr " << gep
+                         << tbaa << inv_meta << "\n";
                 return loaded;
             }
 
@@ -2680,7 +2915,42 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         if (isAggregateType(ty)) return ptr_val;
         std::string ll = llvmType(ty);
         std::string reg = nextReg();
-        body_ss_ << "  " << reg << " = load " << ll << ", ptr " << ptr_val << "\n";
+
+        // Collect metadata annotations for this load
+        std::string load_meta;
+
+        // FIX 0.7: Add !invariant.load metadata when dereferencing an
+        // immutable reference (&T / ReferenceType). This tells LLVM the
+        // loaded value will not change, enabling more aggressive optimization.
+        TypeId operand_type = deref.operand()->getType();
+        if (operand_type && isa<ReferenceType>(operand_type)) {
+            // Allocate an !invariant.load metadata node if not yet created
+            auto it = metadata_map_.find("__invariant_load");
+            if (it == metadata_map_.end()) {
+                int inv_id = metadata_counter_++;
+                metadata_map_["__invariant_load"] = inv_id;
+                // The metadata node will be emitted by emitMetadata()
+                // We need to add it to metadata_entries_ as well
+                metadata_entries_.push_back({inv_id, "!{}"});
+            }
+            load_meta += ", !invariant.load !" + std::to_string(metadata_map_["__invariant_load"]);
+        }
+
+        // FIX 0.8: Add !nonnull metadata on smart pointer dereferences.
+        // After Box.new(), Rc.new(), Arc.new(), the pointer is guaranteed
+        // non-null. This helps LLVM eliminate null checks.
+        if (operand_type && isa<SmartPointerType>(operand_type)) {
+            auto it = metadata_map_.find("__nonnull");
+            if (it == metadata_map_.end()) {
+                int nn_id = metadata_counter_++;
+                metadata_map_["__nonnull"] = nn_id;
+                metadata_entries_.push_back({nn_id, "!{}"});
+            }
+            load_meta += ", !nonnull !" + std::to_string(metadata_map_["__nonnull"]);
+        }
+
+        body_ss_ << "  " << reg << " = load " << ll << ", ptr " << ptr_val
+                 << load_meta << "\n";
         return reg;
     }
 
@@ -3822,9 +4092,37 @@ void IRGenerator::emitPrefetchIfAnnotated(WhileStmt* loop) {
     body_ss_ << "  ; [prefetch] distance=" << distance
              << " (MetadataMap prefetch hint)\n";
 
-    // Emit the llvm.prefetch intrinsic
-    body_ss_ << "  call void @llvm.prefetch.p0(ptr null, i32 0, i32 3, i32 1)"
-             << " ; prefetch hint (alignment-guided)\n";
+    // Find the array variable and loop index from access patterns
+    // Access patterns are stored in nm->access_patterns
+    if (!nm->access_patterns.empty()) {
+        // Use the first access pattern to find the array + index
+        const auto& ap = nm->access_patterns.front();
+
+        // Look for the index variable in the loop body
+        // Walk the while condition to find "i < N" pattern
+        // Then compute prefetch address as: base_addr + (i + distance) * element_size
+
+        // For now, emit a more useful prefetch using the GEP we can compute
+        // from the access pattern's variable name
+        std::string var_name = ap.variable_name;
+        if (!var_name.empty()) {
+            // Get the base address of the array variable
+            std::string base_addr = getVarValue(var_name);
+            if (!base_addr.empty()) {
+                // Emit: prefetch(base + distance * cache_line_size)
+                std::string prefetch_addr = nextReg();
+                body_ss_ << "  " << prefetch_addr << " = getelementptr i8, ptr "
+                         << base_addr << ", i64 " << (distance * 64) << "\n";
+                body_ss_ << "  call void @llvm.prefetch.p0(ptr " << prefetch_addr
+                         << ", i32 0, i32 3, i32 1)\n";
+                return;
+            }
+        }
+    }
+
+    // Fallback: emit with null (old behavior, better than nothing for the
+    // prefetch declaration to be present)
+    body_ss_ << "  call void @llvm.prefetch.p0(ptr null, i32 0, i32 3, i32 1)\n";
 }
 
 // ============================================================================
