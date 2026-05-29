@@ -1909,22 +1909,22 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             break;
         }
 
-        // ---- switch (exhaustive pattern matching on enums) ----
-        case NodeKind::SwitchStmt: {
-            auto& sw = cast<SwitchStmt>(*stmt);
+        // ---- match (exhaustive pattern matching on enums) ----
+        case NodeKind::MatchStmt: {
+            auto& ms = cast<MatchStmt>(*stmt);
             // Emit as an if-else chain (basic implementation)
             // TODO: Optimize with jump tables for dense enum discriminants
-            std::string subject_val = emitExpr(sw.subject());
-            TypeId subject_type = sw.subject()->getType();
+            std::string subject_val = emitExpr(ms.subject());
+            TypeId subject_type = ms.subject()->getType();
             std::string ll_subject = llvmType(subject_type);
 
-            // Take a snapshot before the switch for phi node emission
+            // Take a snapshot before the match for phi node emission
             SSASnapshot entry_snap = takeSnapshot();
 
-            std::string merge_label = nextLabel("switch_merge");
+            std::string merge_label = nextLabel("match_merge");
             std::vector<std::string> arm_labels;
-            for (size_t i = 0; i < sw.armCount(); ++i) {
-                arm_labels.push_back(nextLabel("sw_case"));
+            for (size_t i = 0; i < ms.armCount(); ++i) {
+                arm_labels.push_back(nextLabel("match_arm"));
             }
 
             // Branch from current block to the first arm
@@ -1932,8 +1932,8 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 body_ss_ << "  br label %" << arm_labels[0] << "\n";
             }
 
-            for (size_t i = 0; i < sw.armCount(); ++i) {
-                const auto& arm = sw.arms()[i];
+            for (size_t i = 0; i < ms.armCount(); ++i) {
+                const auto& arm = ms.arms()[i];
                 emitBlockLabel(arm_labels[i]);
                 setTerminated(false);
 
@@ -1943,7 +1943,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 body_ss_ << "  " << cmp_reg << " = icmp eq " << ll_subject
                          << " " << subject_val << ", " << pattern_val << "\n";
 
-                std::string next_arm_label = (i + 1 < sw.armCount())
+                std::string next_arm_label = (i + 1 < ms.armCount())
                     ? arm_labels[i + 1] : merge_label;
                 std::string body_label = arm_labels[i] + ".body";
 
@@ -2735,27 +2735,6 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         } else {
             body_ss_ << "  " << reg << " = bitcast " << from_ll << " " << val << " to " << to_ll << "\n";
         }
-        return reg;
-    }
-
-    // ========================================================================
-    // Select expression (branchless conditional)
-    // ========================================================================
-    case NodeKind::SelectExpr: {
-        auto& sel = cast<SelectExpr>(*expr);
-        std::string cond = emitExpr(sel.condition());
-        if (sel.condition()->getType() && !sel.condition()->getType()->isBool()) {
-            std::string c = nextReg();
-            body_ss_ << "  " << c << " = icmp ne " << llvmType(sel.condition()->getType())
-                     << " " << cond << ", 0\n";
-            cond = c;
-        }
-        std::string tv = emitExpr(sel.trueExpr());
-        std::string fv = emitExpr(sel.falseExpr());
-        std::string ll = llvmType(expr->getType());
-        std::string reg = nextReg();
-        body_ss_ << "  " << reg << " = select i1 " << cond << ", " << ll << " " << tv
-                 << ", " << ll << " " << fv << "\n";
         return reg;
     }
 

@@ -58,6 +58,12 @@ void SemanticAnalyzer::analyze(
             case NodeKind::ImplDecl:
                 analyzeImplDecl(static_cast<ImplDecl&>(*decl));
                 break;
+            case NodeKind::ModuleDecl:
+                analyzeModuleDecl(static_cast<ModuleDecl&>(*decl));
+                break;
+            case NodeKind::UseDecl:
+                analyzeUseDecl(static_cast<UseDecl&>(*decl));
+                break;
             default:
                 break;
         }
@@ -735,11 +741,20 @@ void SemanticAnalyzer::analyzeStmt(Stmt& stmt) {
         case NodeKind::YieldStmt:
             analyzeYieldStmt(static_cast<YieldStmt&>(stmt));
             break;
-        case NodeKind::SwitchStmt:
-            analyzeSwitchStmt(static_cast<SwitchStmt&>(stmt));
+        case NodeKind::MatchStmt:
+            analyzeMatchStmt(static_cast<MatchStmt&>(stmt));
             break;
         case NodeKind::SpawnStmt:
             analyzeSpawnStmt(static_cast<SpawnStmt&>(stmt));
+            break;
+        case NodeKind::ConstDeclStmt:
+            analyzeConstDeclStmt(static_cast<ConstDeclStmt&>(stmt));
+            break;
+        case NodeKind::ParallelForStmt:
+            analyzeParallelForStmt(static_cast<ParallelForStmt&>(stmt));
+            break;
+        case NodeKind::StaticAssertStmt:
+            analyzeStaticAssertStmt(static_cast<StaticAssertStmt&>(stmt));
             break;
         default:
             emitError(stmt.sourceLoc(), "unknown statement kind");
@@ -1009,8 +1024,14 @@ TypeId SemanticAnalyzer::analyzeExpr(Expr& expr) {
             return analyzeAddrOfExpr(static_cast<AddrOfExpr&>(expr));
         case NodeKind::CastExpr:
             return analyzeCastExpr(static_cast<CastExpr&>(expr));
-        case NodeKind::SelectExpr:
-            return analyzeSelectExpr(static_cast<SelectExpr&>(expr));
+        case NodeKind::TypeofExpr:
+            return analyzeTypeofExpr(static_cast<TypeofExpr&>(expr));
+        case NodeKind::AlignofExpr:
+            return analyzeAlignofExpr(static_cast<AlignofExpr&>(expr));
+        case NodeKind::ReflectExpr:
+            return analyzeReflectExpr(static_cast<ReflectExpr&>(expr));
+        case NodeKind::AwaitExpr:
+            return analyzeAwaitExpr(static_cast<AwaitExpr&>(expr));
         case NodeKind::StructInitExpr:
             return analyzeStructInitExpr(static_cast<StructInitExpr&>(expr));
         case NodeKind::ArrayInitExpr:
@@ -1641,35 +1662,41 @@ TypeId SemanticAnalyzer::analyzeCastExpr(CastExpr& ce) {
     return target_type;
 }
 
-TypeId SemanticAnalyzer::analyzeSelectExpr(SelectExpr& se) {
-    TypeId cond_type = analyzeExpr(*se.condition());
-    TypeId true_type = analyzeExpr(*se.trueExpr());
-    TypeId false_type = analyzeExpr(*se.falseExpr());
+TypeId SemanticAnalyzer::analyzeTypeofExpr(TypeofExpr& te) {
+    TypeId operand_type = analyzeExpr(*te.operand());
+    if (operand_type.isNull()) {
+        te.setType(type_table_.getUSize());
+        return type_table_.getUSize();
+    }
+    // typeof returns a type descriptor — for now, represent as usize
+    te.setType(type_table_.getUSize());
+    return type_table_.getUSize();
+}
 
-    if (cond_type.isNull()) {
-        se.setType(TypeId());
+TypeId SemanticAnalyzer::analyzeAlignofExpr(AlignofExpr& ae) {
+    if (ae.isExprOperand() && ae.expr()) {
+        analyzeExpr(*ae.expr());
+    }
+    // alignof returns usize
+    ae.setType(type_table_.getUSize());
+    return type_table_.getUSize();
+}
+
+TypeId SemanticAnalyzer::analyzeReflectExpr(ReflectExpr& re) {
+    // reflect returns a type descriptor — for now, represent as usize
+    re.setType(type_table_.getUSize());
+    return type_table_.getUSize();
+}
+
+TypeId SemanticAnalyzer::analyzeAwaitExpr(AwaitExpr& ae) {
+    TypeId operand_type = analyzeExpr(*ae.operand());
+    if (operand_type.isNull()) {
+        ae.setType(TypeId());
         return TypeId();
     }
-
-    // Condition must be bool
-    if (!cond_type->isBool()) {
-        emitError(se.sourceLoc(),
-                  "select condition must be 'bool', got '" +
-                  cond_type->toString() + "'");
-    }
-
-    // Both branches must have compatible types
-    if (!true_type.isNull() && !false_type.isNull()) {
-        if (!typesCompatible(true_type, false_type)) {
-            emitError(se.sourceLoc(),
-                      "select branches have incompatible types: '" +
-                      true_type->toString() + "' and '" + false_type->toString() + "'");
-        }
-    }
-
-    TypeId result_type = true_type.isNull() ? false_type : true_type;
-    se.setType(result_type);
-    return result_type;
+    // For now, await returns the operand's type directly
+    ae.setType(operand_type);
+    return operand_type;
 }
 
 TypeId SemanticAnalyzer::analyzeStructInitExpr(StructInitExpr& sie) {
@@ -2114,15 +2141,15 @@ void SemanticAnalyzer::analyzeYieldStmt(YieldStmt& ys) {
 }
 
 // ============================================================================
-// Switch statement analysis
+// Match statement analysis
 // ============================================================================
-void SemanticAnalyzer::analyzeSwitchStmt(SwitchStmt& ss) {
+void SemanticAnalyzer::analyzeMatchStmt(MatchStmt& ms) {
     // Analyze the subject expression
-    TypeId subject_type = analyzeExpr(*ss.subject());
+    TypeId subject_type = analyzeExpr(*ms.subject());
 
     if (isPoisonType(subject_type)) {
         // Propagate poison through all arms
-        for (auto& arm : ss.arms()) {
+        for (auto& arm : ms.arms()) {
             if (arm.body) analyzeBlockStmt(*arm.body);
         }
         return;
@@ -2132,8 +2159,8 @@ void SemanticAnalyzer::analyzeSwitchStmt(SwitchStmt& ss) {
     if (!subject_type.isNull() &&
         !subject_type->isInteger() && !subject_type->isBool() &&
         !isa<EnumType>(subject_type)) {
-        emitError(ss.sourceLoc(),
-                  "switch subject must be an integer, bool, or enum type, got '" +
+        emitError(ms.sourceLoc(),
+                  "match subject must be an integer, bool, or enum type, got '" +
                   subject_type->toString() + "'");
     }
 
@@ -2142,13 +2169,13 @@ void SemanticAnalyzer::analyzeSwitchStmt(SwitchStmt& ss) {
     bool has_wildcard = false;
 
     // Analyze each arm
-    for (auto& arm : ss.arms()) {
+    for (auto& arm : ms.arms()) {
         if (arm.pattern) {
             TypeId pattern_type = analyzeExpr(*arm.pattern);
             if (!isPoisonType(pattern_type) && !subject_type.isNull() && !pattern_type.isNull()) {
                 if (!typesCompatible(subject_type, pattern_type)) {
                     emitError(arm.pattern->sourceLoc(),
-                              "switch arm pattern type '" + pattern_type->toString() +
+                              "match arm pattern type '" + pattern_type->toString() +
                               "' does not match subject type '" + subject_type->toString() + "'");
                 }
             }
@@ -2210,8 +2237,8 @@ void SemanticAnalyzer::analyzeSwitchStmt(SwitchStmt& ss) {
         auto& enum_type = cast<EnumType>(subject_type);
         for (const auto& variant : enum_type.variants()) {
             if (covered_variants.find(variant.name) == covered_variants.end()) {
-                emitWarning(ss.sourceLoc(),
-                            "switch does not cover enum variant '" + variant.name +
+                emitWarning(ms.sourceLoc(),
+                            "match does not cover enum variant '" + variant.name +
                             "' of enum '" + enum_type.name() + "'");
             }
         }
@@ -2240,6 +2267,82 @@ void SemanticAnalyzer::analyzeSpawnStmt(SpawnStmt& ss) {
                     "spawn expects a function call expression, got '" +
                     (task_type.isNull() ? std::string("<null>") : task_type->toString()) + "'");
     }
+}
+
+// ============================================================================
+// Const declaration analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeConstDeclStmt(ConstDeclStmt& cd) {
+    TypeId init_type;
+    if (cd.hasInit()) {
+        init_type = analyzeExpr(*cd.init());
+        if (cd.hasType() && !init_type.isNull()) {
+            if (!typesCompatible(cd.declaredType(), init_type)) {
+                emitError(cd.sourceLoc(),
+                          "const initializer type '" + init_type->toString() +
+                          "' does not match declared type '" + cd.declaredType()->toString() + "'");
+            }
+        }
+    }
+    // Register const in symbol table like val (immutable binding)
+    TypeId const_type = cd.hasType() ? cd.declaredType() : init_type;
+    if (!const_type.isNull()) {
+        symtab_.declareVal(cd.name(), const_type, cd.sourceLoc());
+    }
+}
+
+// ============================================================================
+// Parallel for statement analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeParallelForStmt(ParallelForStmt& ps) {
+    TypeId iter_type = analyzeExpr(*ps.iterable());
+
+    // Noalloc check: parallel for spawns tasks
+    if (in_noalloc_fn_) {
+        emitError(ps.sourceLoc(),
+                  "cannot use parallel for inside noalloc function: parallel iteration requires heap allocation for task scheduling");
+    }
+
+    if (ps.body()) {
+        auto guard = symtab_.scopedScope(Scope::ScopeKind::Block);
+        // Register iterator variable
+        if (!iter_type.isNull()) {
+            TypeId elem_type = iter_type;
+            if (isa<SliceType>(iter_type)) {
+                elem_type = cast<SliceType>(iter_type).element();
+            }
+            symtab_.declareVal(ps.iteratorName(), elem_type, ps.sourceLoc());
+        }
+        analyzeBlockStmt(*ps.body());
+    }
+}
+
+// ============================================================================
+// Static assert statement analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeStaticAssertStmt(StaticAssertStmt& sa) {
+    TypeId cond_type = analyzeExpr(*sa.condition());
+    if (!cond_type.isNull() && !cond_type->isBool()) {
+        emitError(sa.sourceLoc(),
+                  "static_assert condition must be bool, got '" + cond_type->toString() + "'");
+    }
+    // Actual compile-time evaluation happens in a later pass (comptime evaluator)
+}
+
+// ============================================================================
+// Module declaration analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeModuleDecl(ModuleDecl& /*md*/) {
+    // Module declarations are primarily a namespacing mechanism.
+    // Nothing to type-check here — registration happens during top-level pass.
+}
+
+// ============================================================================
+// Use declaration analysis
+// ============================================================================
+void SemanticAnalyzer::analyzeUseDecl(UseDecl& /*ud*/) {
+    // Cross-module resolution not yet implemented.
+    // Use declarations are registered but symbols aren't resolved yet.
 }
 
 // ============================================================================

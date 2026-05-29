@@ -164,11 +164,6 @@ bool AoSToSoAPass::transformAccesses(Program& program, const SoATransform& trans
             else if (auto* cast_expr = dyn_cast<CastExpr>(expr)) {
                 walk_expr(cast_expr->expr());
             }
-            else if (auto* select = dyn_cast<SelectExpr>(expr)) {
-                walk_expr(select->condition());
-                walk_expr(select->trueExpr());
-                walk_expr(select->falseExpr());
-            }
             else if (auto* unsafe = dyn_cast<UnsafeExpr>(expr)) {
                 walk_expr(unsafe->inner());
             }

@@ -396,13 +396,6 @@ void CFGBuilder::collectUsedVars(Expr& expr, std::unordered_set<std::string>& us
             collectUsedVars(*ce.expr(), used);
             break;
         }
-        case NodeKind::SelectExpr: {
-            auto& se = static_cast<SelectExpr&>(expr);
-            collectUsedVars(*se.condition(), used);
-            collectUsedVars(*se.trueExpr(), used);
-            collectUsedVars(*se.falseExpr(), used);
-            break;
-        }
         case NodeKind::StructInitExpr: {
             auto& sie = static_cast<StructInitExpr&>(expr);
             for (auto& init : sie.inits()) {
@@ -499,13 +492,6 @@ void CFGBuilder::collectBorrows(Expr& expr, std::vector<BorrowInfo>& borrows) {
             for (auto& arg : ce.args()) {
                 collectBorrows(*arg, borrows);
             }
-            break;
-        }
-        case NodeKind::SelectExpr: {
-            auto& se = static_cast<SelectExpr&>(expr);
-            collectBorrows(*se.condition(), borrows);
-            collectBorrows(*se.trueExpr(), borrows);
-            collectBorrows(*se.falseExpr(), borrows);
             break;
         }
         default:

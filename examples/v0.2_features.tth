@@ -1,7 +1,7 @@
 // Tether v0.2 Feature Demo — all 11 Infinite-Scale keywords
 // (Adapted to use only currently-supported syntax)
 
-// === switch: Exhaustive pattern matching ===
+// === match: Exhaustive pattern matching ===
 enum Color {
     Red,
     Green,
@@ -9,7 +9,7 @@ enum Color {
 }
 
 fn color_to_code(c: Color) i32 {
-    switch (c) {
+    match (c) {
         Color.Red -> {
             return 0xFF0000;
         }
@@ -52,7 +52,7 @@ fn main() i32 {
     // comptime expression
     val fib10: i32 = comptime 55;
 
-    // switch on enum
+    // match on enum
     val code: i32 = color_to_code(Color.Red);
 
     // inline function call

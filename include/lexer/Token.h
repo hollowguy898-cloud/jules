@@ -28,7 +28,6 @@ enum class TokenKind : uint16_t {
     KW_TRUE,
     KW_FALSE,
     KW_VOID,
-    KW_SELECT,
     KW_CAST,
     KW_MUT,
     KW_SIZEOF,
@@ -43,7 +42,6 @@ enum class TokenKind : uint16_t {
     KW_YIELD,
 
     // General-purpose & domain-specific keywords (v0.2 expansion)
-    KW_SWITCH,      // Exhaustive pattern matching on enums / data
     KW_TRAIT,       // Shared behavior contracts (zero-overhead polymorphism)
     KW_IMPL,        // Attach trait impls / methods to structs
     KW_INLINE,      // Force function/loop inlining at call site
@@ -54,6 +52,20 @@ enum class TokenKind : uint16_t {
     KW_STRIDE,      // Physical memory stride for tensor layouts
     KW_REDUCE,      // Hardware-native parallel reduction tree
     KW_SPAWN,       // Structured async task dispatch (work-stealing pool)
+
+    // General-purpose & domain-specific keywords (v0.3 expansion)
+    KW_MATCH,        // Pattern matching (replaces switch)
+    KW_CONST,        // Compile-time constant declaration
+    KW_MODULE,       // Module declaration
+    KW_USE,          // Selective import
+    KW_AS,           // Import aliasing
+    KW_ASYNC,        // Async function modifier
+    KW_AWAIT,        // Await expression
+    KW_TYPEOF,       // Type query expression
+    KW_ALIGNOF,      // Alignment query expression
+    KW_PARALLEL,     // Parallel for loop
+    KW_REFLECT,      // Compile-time reflection
+    KW_STATIC_ASSERT, // Compile-time assertion
 
     // Literals
     INT_LITERAL,
@@ -143,7 +155,7 @@ inline constexpr const char* tokenKindToString(TokenKind kind) {
         case TokenKind::KW_TRUE:        return "true";
         case TokenKind::KW_FALSE:       return "false";
         case TokenKind::KW_VOID:        return "void";
-        case TokenKind::KW_SELECT:      return "select";
+
         case TokenKind::KW_CAST:        return "cast";
         case TokenKind::KW_MUT:         return "mut";
         case TokenKind::KW_SIZEOF:      return "sizeof";
@@ -158,7 +170,6 @@ inline constexpr const char* tokenKindToString(TokenKind kind) {
         case TokenKind::KW_YIELD:       return "yield";
 
         // General-purpose & domain-specific keywords (v0.2 expansion)
-        case TokenKind::KW_SWITCH:      return "switch";
         case TokenKind::KW_TRAIT:       return "trait";
         case TokenKind::KW_IMPL:        return "impl";
         case TokenKind::KW_INLINE:      return "inline";
@@ -169,6 +180,20 @@ inline constexpr const char* tokenKindToString(TokenKind kind) {
         case TokenKind::KW_STRIDE:      return "stride";
         case TokenKind::KW_REDUCE:      return "reduce";
         case TokenKind::KW_SPAWN:       return "spawn";
+
+        // v0.3 expansion keywords
+        case TokenKind::KW_MATCH:         return "match";
+        case TokenKind::KW_CONST:         return "const";
+        case TokenKind::KW_MODULE:        return "module";
+        case TokenKind::KW_USE:           return "use";
+        case TokenKind::KW_AS:            return "as";
+        case TokenKind::KW_ASYNC:         return "async";
+        case TokenKind::KW_AWAIT:         return "await";
+        case TokenKind::KW_TYPEOF:        return "typeof";
+        case TokenKind::KW_ALIGNOF:       return "alignof";
+        case TokenKind::KW_PARALLEL:      return "parallel";
+        case TokenKind::KW_REFLECT:       return "reflect";
+        case TokenKind::KW_STATIC_ASSERT: return "static_assert";
 
         // Literals
         case TokenKind::INT_LITERAL:    return "integer literal";
@@ -289,7 +314,7 @@ public:
     bool isNot(TokenKind k) const { return kind_ != k; }
 
     bool isKeyword() const {
-        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_SPAWN;
+        return kind_ >= TokenKind::KW_VAL && kind_ <= TokenKind::KW_STATIC_ASSERT;
     }
 
     bool isLiteral() const {

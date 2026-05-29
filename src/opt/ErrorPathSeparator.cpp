@@ -226,14 +226,6 @@ void ErrorPathSeparatorPass::walkExpr(Expr* expr) {
             break;
         }
 
-        case NodeKind::SelectExpr: {
-            auto& select = cast<SelectExpr>(*expr);
-            walkExpr(select.condition());
-            walkExpr(select.trueExpr());
-            walkExpr(select.falseExpr());
-            break;
-        }
-
         case NodeKind::StructInitExpr: {
             auto& init = cast<StructInitExpr>(*expr);
             for (auto& field : init.inits()) {

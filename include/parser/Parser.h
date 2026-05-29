@@ -99,6 +99,8 @@ private:
     std::unique_ptr<StructDecl> parseStructDecl();
     std::unique_ptr<EnumDecl> parseEnumDecl();
     std::unique_ptr<ImportDecl> parseImportDecl();
+    std::unique_ptr<TopLevel> parseModuleDecl();
+    std::unique_ptr<TopLevel> parseUseDecl();
 
     // -----------------------------------------------------------------------
     // Statement parsing
@@ -116,7 +118,10 @@ private:
     std::unique_ptr<Stmt> parseErrdeferStmt();
     std::unique_ptr<Stmt> parseAtomicStmt();
     std::unique_ptr<YieldStmt> parseYieldStmt();
-    std::unique_ptr<Stmt> parseSwitchStmt();
+    std::unique_ptr<Stmt> parseMatchStmt();
+    std::unique_ptr<Stmt> parseConstDecl();
+    std::unique_ptr<Stmt> parseParallelForStmt();
+    std::unique_ptr<Stmt> parseStaticAssertStmt();
     std::unique_ptr<Stmt> parseSpawnStmt();
     std::unique_ptr<TraitDecl> parseTraitDecl();
     std::unique_ptr<ImplDecl> parseImplDecl();
@@ -145,7 +150,10 @@ private:
     std::unique_ptr<Expr> parseMemberExpr(std::unique_ptr<Expr> object);
     std::unique_ptr<Expr> parseIndexExpr(std::unique_ptr<Expr> object);
     std::unique_ptr<Expr> parseStructInitExpr(const std::string& type_name);
-    std::unique_ptr<Expr> parseSelectExpr();
+    std::unique_ptr<Expr> parseTypeofExpr();
+    std::unique_ptr<Expr> parseAlignofExpr();
+    std::unique_ptr<Expr> parseReflectExpr();
+    std::unique_ptr<Expr> parseAwaitExpr();
     std::unique_ptr<Expr> parseUnsafeExpr();
     std::unique_ptr<Expr> parseSizeofExpr();
 

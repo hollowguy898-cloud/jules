@@ -371,9 +371,9 @@ private:
                 collectAssignedVarsImpl(es.stmt(), result);
                 break;
             }
-            case NodeKind::SwitchStmt: {
-                auto& sw = cast<SwitchStmt>(*stmt);
-                for (const auto& arm : sw.arms()) {
+            case NodeKind::MatchStmt: {
+                auto& ms = cast<MatchStmt>(*stmt);
+                for (const auto& arm : ms.arms()) {
                     if (arm.body) collectAssignedVarsImpl(arm.body.get(), result);
                 }
                 break;

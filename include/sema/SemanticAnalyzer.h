@@ -140,8 +140,13 @@ private:
     void analyzeErrdeferStmt(ErrdeferStmt& es);
     void analyzeAtomicStmt(AtomicStmt& as);
     void analyzeYieldStmt(YieldStmt& ys);
-    void analyzeSwitchStmt(SwitchStmt& ss);
+    void analyzeMatchStmt(MatchStmt& ms);
     void analyzeSpawnStmt(SpawnStmt& ss);
+    void analyzeConstDeclStmt(ConstDeclStmt& cd);
+    void analyzeParallelForStmt(ParallelForStmt& ps);
+    void analyzeStaticAssertStmt(StaticAssertStmt& sa);
+    void analyzeModuleDecl(ModuleDecl& md);
+    void analyzeUseDecl(UseDecl& ud);
     void analyzeTraitDecl(TraitDecl& td);
     void analyzeImplDecl(ImplDecl& id);
 
@@ -163,7 +168,10 @@ private:
     TypeId analyzeDerefExpr(DerefExpr& de);
     TypeId analyzeAddrOfExpr(AddrOfExpr& ae);
     TypeId analyzeCastExpr(CastExpr& ce);
-    TypeId analyzeSelectExpr(SelectExpr& se);
+    TypeId analyzeTypeofExpr(TypeofExpr& te);
+    TypeId analyzeAlignofExpr(AlignofExpr& ae);
+    TypeId analyzeReflectExpr(ReflectExpr& re);
+    TypeId analyzeAwaitExpr(AwaitExpr& ae);
     TypeId analyzeStructInitExpr(StructInitExpr& sie);
     TypeId analyzeArrayInitExpr(ArrayInitExpr& aie);
     TypeId analyzeSizeofExpr(SizeofExpr& se);

@@ -113,10 +113,12 @@ static const KeywordEntry keyword_table[] = {
     // len 2
     {fnv1aHash("fn"),  TokenKind::KW_FN, 2},
     {fnv1aHash("if"),  TokenKind::KW_IF, 2},
+    {fnv1aHash("as"),  TokenKind::KW_AS, 2},
     // len 3
     {fnv1aHash("mut"), TokenKind::KW_MUT, 3},
     {fnv1aHash("soa"), TokenKind::KW_SOA, 3},
     {fnv1aHash("try"), TokenKind::KW_TRY, 3},
+    {fnv1aHash("use"), TokenKind::KW_USE, 3},
     {fnv1aHash("val"), TokenKind::KW_VAL, 3},
     {fnv1aHash("var"), TokenKind::KW_VAR, 3},
     // len 4
@@ -129,10 +131,13 @@ static const KeywordEntry keyword_table[] = {
     {fnv1aHash("void"),   TokenKind::KW_VOID, 4},
     // len 5
     {fnv1aHash("align"),  TokenKind::KW_ALIGN, 5},
+    {fnv1aHash("async"),  TokenKind::KW_ASYNC, 5},
     {fnv1aHash("break"),  TokenKind::KW_BREAK, 5},
     {fnv1aHash("catch"),  TokenKind::KW_CATCH, 5},
+    {fnv1aHash("const"),  TokenKind::KW_CONST, 5},
     {fnv1aHash("defer"),  TokenKind::KW_DEFER, 5},
     {fnv1aHash("false"),  TokenKind::KW_FALSE, 5},
+    {fnv1aHash("match"),  TokenKind::KW_MATCH, 5},
     {fnv1aHash("shape"),  TokenKind::KW_SHAPE, 5},
     {fnv1aHash("spawn"),  TokenKind::KW_SPAWN, 5},
     {fnv1aHash("trait"),  TokenKind::KW_TRAIT, 5},
@@ -142,22 +147,28 @@ static const KeywordEntry keyword_table[] = {
     {fnv1aHash("atomic"),   TokenKind::KW_ATOMIC, 6},
     {fnv1aHash("import"),   TokenKind::KW_IMPORT, 6},
     {fnv1aHash("inline"),   TokenKind::KW_INLINE, 6},
+    {fnv1aHash("module"),   TokenKind::KW_MODULE, 6},
     {fnv1aHash("opaque"),   TokenKind::KW_OPAQUE, 6},
     {fnv1aHash("reduce"),   TokenKind::KW_REDUCE, 6},
     {fnv1aHash("return"),   TokenKind::KW_RETURN, 6},
-    {fnv1aHash("select"),   TokenKind::KW_SELECT, 6},
     {fnv1aHash("sizeof"),   TokenKind::KW_SIZEOF, 6},
     {fnv1aHash("stride"),   TokenKind::KW_STRIDE, 6},
     {fnv1aHash("struct"),   TokenKind::KW_STRUCT, 6},
-    {fnv1aHash("switch"),   TokenKind::KW_SWITCH, 6},
+    {fnv1aHash("typeof"),   TokenKind::KW_TYPEOF, 6},
     {fnv1aHash("unsafe"),   TokenKind::KW_UNSAFE, 6},
     // len 7
+    {fnv1aHash("alignof"),  TokenKind::KW_ALIGNOF, 7},
+    {fnv1aHash("await"),    TokenKind::KW_AWAIT, 7},
     {fnv1aHash("noalloc"),  TokenKind::KW_NOALLOC, 7},
     // len 8
     {fnv1aHash("comptime"), TokenKind::KW_COMPTIME, 8},
     {fnv1aHash("continue"), TokenKind::KW_CONTINUE, 8},
     {fnv1aHash("errdefer"), TokenKind::KW_ERRDEFER, 8},
+    {fnv1aHash("parallel"), TokenKind::KW_PARALLEL, 8},
+    {fnv1aHash("reflect"),  TokenKind::KW_REFLECT, 8},
     {fnv1aHash("restrict"), TokenKind::KW_RESTRICT, 8},
+    // len 12
+    {fnv1aHash("static_assert"), TokenKind::KW_STATIC_ASSERT, 12},
 };
 static constexpr size_t keyword_table_size = sizeof(keyword_table) / sizeof(keyword_table[0]);
 
@@ -444,7 +455,7 @@ Token Lexer::scanIdentifierOrKeyword() {
 TokenKind Lexer::lookupKeyword(std::string_view text) const {
     // Quick rejection: keywords are 2-8 chars
     auto len = text.size();
-    if (len < 2 || len > 8) return TokenKind::IDENTIFIER;
+    if (len < 2 || len > 12) return TokenKind::IDENTIFIER;
 
     uint32_t h = fnv1aHash(text);
 
@@ -482,13 +493,13 @@ TokenKind Lexer::lookupKeyword(std::string_view text) const {
             KW_CASE("struct",   KW_STRUCT);
             KW_CASE("unsafe",   KW_UNSAFE);
             KW_CASE("return",   KW_RETURN);
-            KW_CASE("select",   KW_SELECT);
+
             KW_CASE("sizeof",   KW_SIZEOF);
             KW_CASE("import",   KW_IMPORT);
             KW_CASE("atomic",   KW_ATOMIC);
             KW_CASE("opaque",   KW_OPAQUE);
             // v0.2 expansion keywords
-            KW_CASE("switch",   KW_SWITCH);
+
             KW_CASE("trait",    KW_TRAIT);
             KW_CASE("impl",     KW_IMPL);
             KW_CASE("inline",   KW_INLINE);
@@ -501,6 +512,19 @@ TokenKind Lexer::lookupKeyword(std::string_view text) const {
             KW_CASE("spawn",    KW_SPAWN);
             KW_CASE("continue", KW_CONTINUE);
             KW_CASE("errdefer", KW_ERRDEFER);
+            // v0.3 expansion keywords
+            KW_CASE("as",            KW_AS);
+            KW_CASE("use",           KW_USE);
+            KW_CASE("async",         KW_ASYNC);
+            KW_CASE("const",         KW_CONST);
+            KW_CASE("match",         KW_MATCH);
+            KW_CASE("module",        KW_MODULE);
+            KW_CASE("alignof",       KW_ALIGNOF);
+            KW_CASE("await",         KW_AWAIT);
+            KW_CASE("typeof",        KW_TYPEOF);
+            KW_CASE("parallel",      KW_PARALLEL);
+            KW_CASE("reflect",       KW_REFLECT);
+            KW_CASE("static_assert", KW_STATIC_ASSERT);
 #undef KW_CASE
             default: break;
         }

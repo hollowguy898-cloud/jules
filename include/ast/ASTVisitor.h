@@ -58,8 +58,14 @@ public:
                 return derived().visitAddrOfExpr(static_cast<AddrOfExpr&>(node));
             case NodeKind::CastExpr:
                 return derived().visitCastExpr(static_cast<CastExpr&>(node));
-            case NodeKind::SelectExpr:
-                return derived().visitSelectExpr(static_cast<SelectExpr&>(node));
+            case NodeKind::TypeofExpr:
+                return derived().visitTypeofExpr(static_cast<TypeofExpr&>(node));
+            case NodeKind::AlignofExpr:
+                return derived().visitAlignofExpr(static_cast<AlignofExpr&>(node));
+            case NodeKind::ReflectExpr:
+                return derived().visitReflectExpr(static_cast<ReflectExpr&>(node));
+            case NodeKind::AwaitExpr:
+                return derived().visitAwaitExpr(static_cast<AwaitExpr&>(node));
             case NodeKind::StructInitExpr:
                 return derived().visitStructInitExpr(static_cast<StructInitExpr&>(node));
             case NodeKind::ArrayInitExpr:
@@ -106,8 +112,14 @@ public:
                 return derived().visitExprStmt(static_cast<ExprStmt&>(node));
             case NodeKind::BlockStmt:
                 return derived().visitBlockStmt(static_cast<BlockStmt&>(node));
-            case NodeKind::SwitchStmt:
-                return derived().visitSwitchStmt(static_cast<SwitchStmt&>(node));
+            case NodeKind::MatchStmt:
+                return derived().visitMatchStmt(static_cast<MatchStmt&>(node));
+            case NodeKind::ConstDeclStmt:
+                return derived().visitConstDeclStmt(static_cast<ConstDeclStmt&>(node));
+            case NodeKind::ParallelForStmt:
+                return derived().visitParallelForStmt(static_cast<ParallelForStmt&>(node));
+            case NodeKind::StaticAssertStmt:
+                return derived().visitStaticAssertStmt(static_cast<StaticAssertStmt&>(node));
             case NodeKind::SpawnStmt:
                 return derived().visitSpawnStmt(static_cast<SpawnStmt&>(node));
 
@@ -124,6 +136,10 @@ public:
                 return derived().visitTraitDecl(static_cast<TraitDecl&>(node));
             case NodeKind::ImplDecl:
                 return derived().visitImplDecl(static_cast<ImplDecl&>(node));
+            case NodeKind::ModuleDecl:
+                return derived().visitModuleDecl(static_cast<ModuleDecl&>(node));
+            case NodeKind::UseDecl:
+                return derived().visitUseDecl(static_cast<UseDecl&>(node));
         }
         return retDefault();
     }
@@ -157,8 +173,14 @@ public:
                 return derived().visitAddrOfExpr(static_cast<const AddrOfExpr&>(node));
             case NodeKind::CastExpr:
                 return derived().visitCastExpr(static_cast<const CastExpr&>(node));
-            case NodeKind::SelectExpr:
-                return derived().visitSelectExpr(static_cast<const SelectExpr&>(node));
+            case NodeKind::TypeofExpr:
+                return derived().visitTypeofExpr(static_cast<const TypeofExpr&>(node));
+            case NodeKind::AlignofExpr:
+                return derived().visitAlignofExpr(static_cast<const AlignofExpr&>(node));
+            case NodeKind::ReflectExpr:
+                return derived().visitReflectExpr(static_cast<const ReflectExpr&>(node));
+            case NodeKind::AwaitExpr:
+                return derived().visitAwaitExpr(static_cast<const AwaitExpr&>(node));
             case NodeKind::StructInitExpr:
                 return derived().visitStructInitExpr(static_cast<const StructInitExpr&>(node));
             case NodeKind::ArrayInitExpr:
@@ -203,8 +225,14 @@ public:
                 return derived().visitExprStmt(static_cast<const ExprStmt&>(node));
             case NodeKind::BlockStmt:
                 return derived().visitBlockStmt(static_cast<const BlockStmt&>(node));
-            case NodeKind::SwitchStmt:
-                return derived().visitSwitchStmt(static_cast<const SwitchStmt&>(node));
+            case NodeKind::MatchStmt:
+                return derived().visitMatchStmt(static_cast<const MatchStmt&>(node));
+            case NodeKind::ConstDeclStmt:
+                return derived().visitConstDeclStmt(static_cast<const ConstDeclStmt&>(node));
+            case NodeKind::ParallelForStmt:
+                return derived().visitParallelForStmt(static_cast<const ParallelForStmt&>(node));
+            case NodeKind::StaticAssertStmt:
+                return derived().visitStaticAssertStmt(static_cast<const StaticAssertStmt&>(node));
             case NodeKind::SpawnStmt:
                 return derived().visitSpawnStmt(static_cast<const SpawnStmt&>(node));
             case NodeKind::FnDecl:
@@ -219,6 +247,10 @@ public:
                 return derived().visitTraitDecl(static_cast<const TraitDecl&>(node));
             case NodeKind::ImplDecl:
                 return derived().visitImplDecl(static_cast<const ImplDecl&>(node));
+            case NodeKind::ModuleDecl:
+                return derived().visitModuleDecl(static_cast<const ModuleDecl&>(node));
+            case NodeKind::UseDecl:
+                return derived().visitUseDecl(static_cast<const UseDecl&>(node));
         }
         return retDefault();
     }
@@ -284,10 +316,22 @@ public:
         return retDefault();
     }
 
-    Ret visitSelectExpr(SelectExpr& node) {
-        traverseExpr(node.condition());
-        traverseExpr(node.trueExpr());
-        traverseExpr(node.falseExpr());
+    Ret visitTypeofExpr(TypeofExpr& node) {
+        traverseExpr(node.operand());
+        return retDefault();
+    }
+
+    Ret visitAlignofExpr(AlignofExpr& node) {
+        if (node.isExprOperand() && node.expr()) {
+            traverseExpr(node.expr());
+        }
+        return retDefault();
+    }
+
+    Ret visitReflectExpr(ReflectExpr&) { return retDefault(); }
+
+    Ret visitAwaitExpr(AwaitExpr& node) {
+        traverseExpr(node.operand());
         return retDefault();
     }
 
@@ -419,12 +463,28 @@ public:
         return retDefault();
     }
 
-    Ret visitSwitchStmt(SwitchStmt& node) {
+    Ret visitMatchStmt(MatchStmt& node) {
         traverseExpr(node.subject());
         for (auto& arm : node.arms()) {
             traverseExpr(arm.pattern.get());
             traverseStmt(arm.body.get());
         }
+        return retDefault();
+    }
+
+    Ret visitConstDeclStmt(ConstDeclStmt& node) {
+        if (node.init()) traverseExpr(node.init());
+        return retDefault();
+    }
+
+    Ret visitParallelForStmt(ParallelForStmt& node) {
+        traverseExpr(node.iterable());
+        traverseStmt(node.body());
+        return retDefault();
+    }
+
+    Ret visitStaticAssertStmt(StaticAssertStmt& node) {
+        traverseExpr(node.condition());
         return retDefault();
     }
 
@@ -455,6 +515,10 @@ public:
         return retDefault();
     }
 
+    Ret visitModuleDecl(ModuleDecl&) { return retDefault(); }
+
+    Ret visitUseDecl(UseDecl&) { return retDefault(); }
+
     // -----------------------------------------------------------------------
     // Const visit overloads (traverse const AST)
     // -----------------------------------------------------------------------
@@ -473,7 +537,10 @@ public:
     Ret visitDerefExpr(const DerefExpr&) { return retDefault(); }
     Ret visitAddrOfExpr(const AddrOfExpr&) { return retDefault(); }
     Ret visitCastExpr(const CastExpr&) { return retDefault(); }
-    Ret visitSelectExpr(const SelectExpr&) { return retDefault(); }
+    Ret visitTypeofExpr(const TypeofExpr&) { return retDefault(); }
+    Ret visitAlignofExpr(const AlignofExpr&) { return retDefault(); }
+    Ret visitReflectExpr(const ReflectExpr&) { return retDefault(); }
+    Ret visitAwaitExpr(const AwaitExpr&) { return retDefault(); }
     Ret visitStructInitExpr(const StructInitExpr&) { return retDefault(); }
     Ret visitArrayInitExpr(const ArrayInitExpr&) { return retDefault(); }
     Ret visitSizeofExpr(const SizeofExpr&) { return retDefault(); }
@@ -498,7 +565,10 @@ public:
     Ret visitContinueStmt(const ContinueStmt&) { return retDefault(); }
     Ret visitExprStmt(const ExprStmt&) { return retDefault(); }
     Ret visitBlockStmt(const BlockStmt&) { return retDefault(); }
-    Ret visitSwitchStmt(const SwitchStmt&) { return retDefault(); }
+    Ret visitMatchStmt(const MatchStmt&) { return retDefault(); }
+    Ret visitConstDeclStmt(const ConstDeclStmt&) { return retDefault(); }
+    Ret visitParallelForStmt(const ParallelForStmt&) { return retDefault(); }
+    Ret visitStaticAssertStmt(const StaticAssertStmt&) { return retDefault(); }
     Ret visitSpawnStmt(const SpawnStmt&) { return retDefault(); }
 
     Ret visitFnDecl(const FnDecl&) { return retDefault(); }
@@ -507,6 +577,8 @@ public:
     Ret visitImportDecl(const ImportDecl&) { return retDefault(); }
     Ret visitTraitDecl(const TraitDecl&) { return retDefault(); }
     Ret visitImplDecl(const ImplDecl&) { return retDefault(); }
+    Ret visitModuleDecl(const ModuleDecl&) { return retDefault(); }
+    Ret visitUseDecl(const UseDecl&) { return retDefault(); }
 
 protected:
     // -----------------------------------------------------------------------

@@ -1,7 +1,7 @@
-// Test switch with integer subject
+// Test match with integer subject
 
 fn classify(x: i32) i32 {
-    switch (x) {
+    match (x) {
         0 -> {
             return 0;
         }

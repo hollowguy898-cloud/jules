@@ -12,7 +12,7 @@ void test_lexer() {
 
     // Test 1: Keywords
     {
-        Lexer lex("val var struct enum fn pure unsafe if else while defer return break continue true false void select cast mut sizeof import", "test");
+        Lexer lex("val var struct enum fn pure unsafe if else while defer return break continue true false void cast mut sizeof import match const module use as async await typeof alignof parallel reflect", "test");
         auto tokens = lex.tokenize();
         assert(tokens[0].kind() == TokenKind::KW_VAL);
         assert(tokens[1].kind() == TokenKind::KW_VAR);
@@ -269,7 +269,7 @@ void test_parser() {
     {
         const char* src = R"(
             fn exprs(a: i32) i32 {
-                val b = select(a > 0, a, -a);
+                val b = typeof(a);
                 val c = a cast i64;
                 val d = unsafe(a + 1);
                 return b;
@@ -286,7 +286,7 @@ void test_parser() {
             }
         }
         assert(!parser.hasErrors());
-        std::cout << "  Select/cast/unsafe expressions: PASS" << std::endl;
+        std::cout << "  Typeof/cast/unsafe expressions: PASS" << std::endl;
     }
 
     // Test 8: Pointer types

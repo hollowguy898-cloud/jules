@@ -549,14 +549,6 @@ bool EscapeAnalysisPass::checkEscape(Expr* expr, const std::string& var_name) {
             break;
         }
 
-        case NodeKind::SelectExpr: {
-            auto& select = cast<SelectExpr>(*expr);
-            if (checkEscape(select.condition(), var_name)) return true;
-            if (checkEscape(select.trueExpr(), var_name)) return true;
-            if (checkEscape(select.falseExpr(), var_name)) return true;
-            break;
-        }
-
         case NodeKind::StructInitExpr: {
             auto& init = cast<StructInitExpr>(*expr);
             // Storing our variable into a struct initializer escapes it
@@ -659,13 +651,6 @@ bool EscapeAnalysisPass::exprReferencesVar(Expr* expr,
         case NodeKind::CastExpr: {
             auto& cast_expr = cast<CastExpr>(*expr);
             return exprReferencesVar(cast_expr.expr(), var_name);
-        }
-
-        case NodeKind::SelectExpr: {
-            auto& select = cast<SelectExpr>(*expr);
-            return exprReferencesVar(select.condition(), var_name) ||
-                   exprReferencesVar(select.trueExpr(), var_name) ||
-                   exprReferencesVar(select.falseExpr(), var_name);
         }
 
         case NodeKind::StructInitExpr: {

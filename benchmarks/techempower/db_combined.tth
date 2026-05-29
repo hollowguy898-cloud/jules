@@ -8,7 +8,7 @@
 //   4. Fortunes
 //   5. JSON serialization (non-DB baseline)
 //
-// Exercises v0.2 features: switch on enum, inline, noalloc, struct init,
+// Exercises v0.2 features: match on enum, inline, noalloc, struct init,
 // postfix cast, while-with-increment, val/var declarations
 // ============================================================================
 
@@ -28,7 +28,7 @@ struct DbResult {
     ok: bool
 }
 
-// ---- Benchmark type as enum for switch test ----
+// ---- Benchmark type as enum for match test ----
 enum BenchmarkType {
     SingleQuery,
     MultipleQueries,
@@ -288,9 +288,9 @@ fn handle_json_serialization() i32 {
     return 26;
 }
 
-// ==== Dispatcher using switch on enum ====
+// ==== Dispatcher using match on enum ====
 fn handle_benchmark(btype: BenchmarkType, seed: u64) i32 {
-    switch (btype) {
+    match (btype) {
         BenchmarkType.SingleQuery -> {
             return handle_single_query(seed);
         }

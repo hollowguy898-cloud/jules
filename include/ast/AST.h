@@ -110,7 +110,6 @@ enum class NodeKind : uint16_t {
     DerefExpr,
     AddrOfExpr,
     CastExpr,
-    SelectExpr,
     StructInitExpr,
     ArrayInitExpr,
     SizeofExpr,
@@ -120,6 +119,11 @@ enum class NodeKind : uint16_t {
     // v0.2 expansion expressions
     ComptimeExpr,     // Compile-time evaluation: comptime expr
     ReduceExpr,       // Parallel reduction: reduce(op, expr, axis=N)
+    // v0.3 expansion expressions
+    TypeofExpr,       // Type query: typeof(expr)
+    AlignofExpr,      // Alignment query: alignof(type)
+    ReflectExpr,      // Compile-time reflection: reflect(T)
+    AwaitExpr,        // Async await: await expr
     // Statements
     VarDeclStmt,
     ValDeclStmt,
@@ -136,8 +140,12 @@ enum class NodeKind : uint16_t {
     AtomicStmt,
     YieldStmt,
     // v0.2 expansion statements
-    SwitchStmt,       // Exhaustive pattern matching on enums
     SpawnStmt,        // Structured async task dispatch
+    // v0.3 expansion statements
+    ConstDeclStmt,    // Compile-time constant: const name = value
+    MatchStmt,        // Pattern matching: match expr { ... } (replaces SwitchStmt)
+    ParallelForStmt,  // Parallel loop: parallel for item in iter { body }
+    StaticAssertStmt, // Compile-time assertion: static_assert(cond, "msg")
     // Top-level declarations
     FnDecl,
     StructDecl,
@@ -146,6 +154,9 @@ enum class NodeKind : uint16_t {
     // v0.2 expansion top-level declarations
     TraitDecl,        // Shared behavior contracts
     ImplDecl,         // Trait/behavior implementation
+    // v0.3 expansion top-level declarations
+    ModuleDecl,       // Module declaration: module name;
+    UseDecl,          // Selective import: use module::name as alias;
 };
 
 // ============================================================================
@@ -228,7 +239,7 @@ public:
 
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::IntLiteral && k <= NodeKind::ReduceExpr;
+        return k >= NodeKind::IntLiteral && k <= NodeKind::AwaitExpr;
     }
 
 protected:
@@ -246,7 +257,7 @@ class Stmt : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::VarDeclStmt && k <= NodeKind::SpawnStmt;
+        return k >= NodeKind::VarDeclStmt && k <= NodeKind::StaticAssertStmt;
     }
 
 protected:
@@ -261,7 +272,7 @@ class TopLevel : public ASTNode {
 public:
     static bool classof(const ASTNode* n) {
         auto k = n->getKind();
-        return k >= NodeKind::FnDecl && k <= NodeKind::ImplDecl;
+        return k >= NodeKind::FnDecl && k <= NodeKind::UseDecl;
     }
 
 protected:
@@ -600,44 +611,6 @@ public:
 private:
     std::unique_ptr<Expr> expr_;
     TypeId target_type_;
-};
-
-// ---- SelectExpr ----
-// Branchless conditional: select(cond, a, b) - like Rust's if as expression
-class SelectExpr : public Expr {
-public:
-    SelectExpr(SourceLocation loc,
-               std::unique_ptr<Expr> condition,
-               std::unique_ptr<Expr> true_expr,
-               std::unique_ptr<Expr> false_expr)
-        : Expr(NodeKind::SelectExpr, std::move(loc))
-        , condition_(std::move(condition))
-        , true_expr_(std::move(true_expr))
-        , false_expr_(std::move(false_expr))
-    {}
-
-    Expr* condition() { return condition_.get(); }
-    const Expr* condition() const { return condition_.get(); }
-    Expr* trueExpr() { return true_expr_.get(); }
-    const Expr* trueExpr() const { return true_expr_.get(); }
-    Expr* falseExpr() { return false_expr_.get(); }
-    const Expr* falseExpr() const { return false_expr_.get(); }
-
-    std::unique_ptr<Expr> takeCondition() { return std::move(condition_); }
-    std::unique_ptr<Expr> takeTrueExpr() { return std::move(true_expr_); }
-    std::unique_ptr<Expr> takeFalseExpr() { return std::move(false_expr_); }
-
-    static bool classof(const ASTNode* n) {
-        return n->getKind() == NodeKind::SelectExpr;
-    }
-
-    void accept(ASTVisitor& visitor) override;
-    void accept(ConstASTVisitor& visitor) const override;
-
-private:
-    std::unique_ptr<Expr> condition_;
-    std::unique_ptr<Expr> true_expr_;
-    std::unique_ptr<Expr> false_expr_;
 };
 
 // ---- DesignatedInit ----
@@ -1122,32 +1095,33 @@ private:
     std::unique_ptr<Expr> value_;
 };
 
-// ---- SwitchStmt ----
-// Exhaustive pattern matching on enums: switch (expr) { pattern => body, ... }
+// ---- MatchStmt ----
+// Pattern matching: match (expr) { pattern => body, ... }
+// Works in both statement and expression position.
 // Compiles into highly optimized hardware jump tables or branchless cascades.
 // The compiler enforces exhaustive checking: every enum variant must be handled.
-struct SwitchArm {
+struct MatchArm {
     std::unique_ptr<Expr> pattern;  // Pattern to match (enum variant, literal, or _)
     std::unique_ptr<BlockStmt> body;
 };
 
-class SwitchStmt : public Stmt {
+class MatchStmt : public Stmt {
 public:
-    SwitchStmt(SourceLocation loc, std::unique_ptr<Expr> subject,
-               std::vector<SwitchArm> arms)
-        : Stmt(NodeKind::SwitchStmt, std::move(loc))
+    MatchStmt(SourceLocation loc, std::unique_ptr<Expr> subject,
+              std::vector<MatchArm> arms)
+        : Stmt(NodeKind::MatchStmt, std::move(loc))
         , subject_(std::move(subject))
         , arms_(std::move(arms))
     {}
 
     Expr* subject() { return subject_.get(); }
     const Expr* subject() const { return subject_.get(); }
-    const std::vector<SwitchArm>& arms() const { return arms_; }
-    std::vector<SwitchArm>& arms() { return arms_; }
+    const std::vector<MatchArm>& arms() const { return arms_; }
+    std::vector<MatchArm>& arms() { return arms_; }
     size_t armCount() const { return arms_.size(); }
 
     static bool classof(const ASTNode* n) {
-        return n->getKind() == NodeKind::SwitchStmt;
+        return n->getKind() == NodeKind::MatchStmt;
     }
 
     void accept(ASTVisitor& visitor) override;
@@ -1155,7 +1129,161 @@ public:
 
 private:
     std::unique_ptr<Expr> subject_;
-    std::vector<SwitchArm> arms_;
+    std::vector<MatchArm> arms_;
+};
+
+// ---- ConstDeclStmt ----
+// Compile-time constant: const name = value
+class ConstDeclStmt : public Stmt {
+public:
+    ConstDeclStmt(SourceLocation loc, std::string name, TypeId type,
+                  std::unique_ptr<Expr> init)
+        : Stmt(NodeKind::ConstDeclStmt, std::move(loc))
+        , name_(std::move(name))
+        , type_(type)
+        , init_(std::move(init))
+    {}
+    const std::string& name() const { return name_; }
+    TypeId declaredType() const { return type_; }
+    bool hasType() const { return !type_.isNull(); }
+    Expr* init() { return init_.get(); }
+    const Expr* init() const { return init_.get(); }
+    std::unique_ptr<Expr> takeInit() { return std::move(init_); }
+    bool hasInit() const { return init_ != nullptr; }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::ConstDeclStmt; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::string name_;
+    TypeId type_;
+    std::unique_ptr<Expr> init_;
+};
+
+// ---- ParallelForStmt ----
+// Parallel loop: parallel for name in iterable { body }
+class ParallelForStmt : public Stmt {
+public:
+    ParallelForStmt(SourceLocation loc, std::string iterator_name,
+                    std::unique_ptr<Expr> iterable,
+                    std::unique_ptr<BlockStmt> body)
+        : Stmt(NodeKind::ParallelForStmt, std::move(loc))
+        , iterator_name_(std::move(iterator_name))
+        , iterable_(std::move(iterable))
+        , body_(std::move(body))
+    {}
+    const std::string& iteratorName() const { return iterator_name_; }
+    Expr* iterable() { return iterable_.get(); }
+    const Expr* iterable() const { return iterable_.get(); }
+    BlockStmt* body() { return body_.get(); }
+    const BlockStmt* body() const { return body_.get(); }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::ParallelForStmt; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::string iterator_name_;
+    std::unique_ptr<Expr> iterable_;
+    std::unique_ptr<BlockStmt> body_;
+};
+
+// ---- StaticAssertStmt ----
+// Compile-time assertion: static_assert(condition, "message")
+class StaticAssertStmt : public Stmt {
+public:
+    StaticAssertStmt(SourceLocation loc, std::unique_ptr<Expr> condition,
+                     std::string message = "")
+        : Stmt(NodeKind::StaticAssertStmt, std::move(loc))
+        , condition_(std::move(condition))
+        , message_(std::move(message))
+    {}
+    Expr* condition() { return condition_.get(); }
+    const Expr* condition() const { return condition_.get(); }
+    const std::string& message() const { return message_; }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::StaticAssertStmt; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::unique_ptr<Expr> condition_;
+    std::string message_;
+};
+
+// ---- TypeofExpr ----
+// Type query: typeof(expr) — returns the TypeId of the expression's type
+class TypeofExpr : public Expr {
+public:
+    TypeofExpr(SourceLocation loc, std::unique_ptr<Expr> operand)
+        : Expr(NodeKind::TypeofExpr, std::move(loc))
+        , operand_(std::move(operand))
+    {}
+    Expr* operand() { return operand_.get(); }
+    const Expr* operand() const { return operand_.get(); }
+    std::unique_ptr<Expr> takeOperand() { return std::move(operand_); }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::TypeofExpr; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::unique_ptr<Expr> operand_;
+};
+
+// ---- AlignofExpr ----
+// Alignment query: alignof(type) — returns the alignment of the type
+class AlignofExpr : public Expr {
+public:
+    AlignofExpr(SourceLocation loc, TypeId target_type)
+        : Expr(NodeKind::AlignofExpr, std::move(loc))
+        , target_type_(target_type)
+        , expr_(nullptr)
+    {}
+    AlignofExpr(SourceLocation loc, std::unique_ptr<Expr> expr)
+        : Expr(NodeKind::AlignofExpr, std::move(loc))
+        , target_type_()
+        , expr_(std::move(expr))
+    {}
+    TypeId targetType() const { return target_type_; }
+    Expr* expr() { return expr_.get(); }
+    const Expr* expr() const { return expr_.get(); }
+    bool isTypeOperand() const { return !target_type_.isNull(); }
+    bool isExprOperand() const { return expr_ != nullptr; }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::AlignofExpr; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    TypeId target_type_;
+    std::unique_ptr<Expr> expr_;
+};
+
+// ---- ReflectExpr ----
+// Compile-time reflection: reflect(T) — returns type metadata
+class ReflectExpr : public Expr {
+public:
+    ReflectExpr(SourceLocation loc, TypeId target_type)
+        : Expr(NodeKind::ReflectExpr, std::move(loc))
+        , target_type_(target_type)
+    {}
+    TypeId targetType() const { return target_type_; }
+    void setTargetType(TypeId t) { target_type_ = t; }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::ReflectExpr; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    TypeId target_type_;
+};
+
+// ---- AwaitExpr ----
+// Async await: await expr — suspends until the async operation completes
+class AwaitExpr : public Expr {
+public:
+    AwaitExpr(SourceLocation loc, std::unique_ptr<Expr> operand)
+        : Expr(NodeKind::AwaitExpr, std::move(loc))
+        , operand_(std::move(operand))
+    {}
+    Expr* operand() { return operand_.get(); }
+    const Expr* operand() const { return operand_.get(); }
+    std::unique_ptr<Expr> takeOperand() { return std::move(operand_); }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::AwaitExpr; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::unique_ptr<Expr> operand_;
 };
 
 // ---- SpawnStmt ----
@@ -1380,6 +1508,7 @@ public:
         , is_pure_(is_pure)
         , is_inline_(false)
         , is_noalloc_(false)
+        , is_async_(false)
         , error_type_(error_type)
         , directives_(std::move(directives))
     {}
@@ -1399,6 +1528,8 @@ public:
     void setInline(bool v) { is_inline_ = v; }
     bool isNoalloc() const { return is_noalloc_; }
     void setNoalloc(bool v) { is_noalloc_ = v; }
+    bool isAsync() const { return is_async_; }
+    void setAsync(bool v) { is_async_ = v; }
     TypeId errorType() const { return error_type_; }
     bool canError() const { return !error_type_.isNull(); }
     const std::vector<CompilerDirective>& directives() const { return directives_; }
@@ -1439,6 +1570,7 @@ private:
     bool is_pure_;
     bool is_inline_;
     bool is_noalloc_;
+    bool is_async_ = false;
     TypeId error_type_;
     std::vector<CompilerDirective> directives_;
 };
@@ -1612,6 +1744,48 @@ private:
     std::vector<std::unique_ptr<FnDecl>> methods_;
 };
 
+// ---- ModuleDecl ----
+// Module declaration: module name;
+// Declares the current file as part of a named module for namespacing.
+class ModuleDecl : public TopLevel {
+public:
+    ModuleDecl(SourceLocation loc, std::string name)
+        : TopLevel(NodeKind::ModuleDecl, std::move(loc))
+        , name_(std::move(name))
+    {}
+    const std::string& name() const { return name_; }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::ModuleDecl; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::string name_;
+};
+
+// ---- UseDecl ----
+// Selective import: use module::name or use module::name as alias
+// Brings specific symbols from other modules into the current scope.
+class UseDecl : public TopLevel {
+public:
+    UseDecl(SourceLocation loc, std::string module_path, std::string item_name,
+            std::string alias = "")
+        : TopLevel(NodeKind::UseDecl, std::move(loc))
+        , module_path_(std::move(module_path))
+        , item_name_(std::move(item_name))
+        , alias_(std::move(alias))
+    {}
+    const std::string& modulePath() const { return module_path_; }
+    const std::string& itemName() const { return item_name_; }
+    const std::string& alias() const { return alias_; }
+    bool hasAlias() const { return !alias_.empty(); }
+    static bool classof(const ASTNode* n) { return n->getKind() == NodeKind::UseDecl; }
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+private:
+    std::string module_path_;
+    std::string item_name_;
+    std::string alias_;
+};
+
 // ============================================================================
 // Visitor base classes (abstract, for dynamic dispatch)
 // ============================================================================
@@ -1634,7 +1808,10 @@ public:
     virtual void visitDerefExpr(DerefExpr&) {}
     virtual void visitAddrOfExpr(AddrOfExpr&) {}
     virtual void visitCastExpr(CastExpr&) {}
-    virtual void visitSelectExpr(SelectExpr&) {}
+    virtual void visitTypeofExpr(TypeofExpr&) {}
+    virtual void visitAlignofExpr(AlignofExpr&) {}
+    virtual void visitReflectExpr(ReflectExpr&) {}
+    virtual void visitAwaitExpr(AwaitExpr&) {}
     virtual void visitStructInitExpr(StructInitExpr&) {}
     virtual void visitArrayInitExpr(ArrayInitExpr&) {}
     virtual void visitSizeofExpr(SizeofExpr&) {}
@@ -1659,7 +1836,10 @@ public:
     virtual void visitErrdeferStmt(ErrdeferStmt&) {}
     virtual void visitAtomicStmt(AtomicStmt&) {}
     virtual void visitYieldStmt(YieldStmt&) {}
-    virtual void visitSwitchStmt(SwitchStmt&) {}
+    virtual void visitMatchStmt(MatchStmt&) {}
+    virtual void visitConstDeclStmt(ConstDeclStmt&) {}
+    virtual void visitParallelForStmt(ParallelForStmt&) {}
+    virtual void visitStaticAssertStmt(StaticAssertStmt&) {}
     virtual void visitSpawnStmt(SpawnStmt&) {}
 
     // Top-level visitors
@@ -1668,6 +1848,8 @@ public:
     virtual void visitEnumDecl(EnumDecl&) {}
     virtual void visitImportDecl(ImportDecl&) {}
     virtual void visitTraitDecl(TraitDecl&) {}
+    virtual void visitModuleDecl(ModuleDecl&) {}
+    virtual void visitUseDecl(UseDecl&) {}
     virtual void visitImplDecl(ImplDecl&) {}
 };
 
@@ -1689,7 +1871,10 @@ public:
     virtual void visitDerefExpr(const DerefExpr&) {}
     virtual void visitAddrOfExpr(const AddrOfExpr&) {}
     virtual void visitCastExpr(const CastExpr&) {}
-    virtual void visitSelectExpr(const SelectExpr&) {}
+    virtual void visitTypeofExpr(const TypeofExpr&) {}
+    virtual void visitAlignofExpr(const AlignofExpr&) {}
+    virtual void visitReflectExpr(const ReflectExpr&) {}
+    virtual void visitAwaitExpr(const AwaitExpr&) {}
     virtual void visitStructInitExpr(const StructInitExpr&) {}
     virtual void visitArrayInitExpr(const ArrayInitExpr&) {}
     virtual void visitSizeofExpr(const SizeofExpr&) {}
@@ -1714,7 +1899,10 @@ public:
     virtual void visitErrdeferStmt(const ErrdeferStmt&) {}
     virtual void visitAtomicStmt(const AtomicStmt&) {}
     virtual void visitYieldStmt(const YieldStmt&) {}
-    virtual void visitSwitchStmt(const SwitchStmt&) {}
+    virtual void visitMatchStmt(const MatchStmt&) {}
+    virtual void visitConstDeclStmt(const ConstDeclStmt&) {}
+    virtual void visitParallelForStmt(const ParallelForStmt&) {}
+    virtual void visitStaticAssertStmt(const StaticAssertStmt&) {}
     virtual void visitSpawnStmt(const SpawnStmt&) {}
 
     // Top-level visitors
@@ -1723,6 +1911,8 @@ public:
     virtual void visitEnumDecl(const EnumDecl&) {}
     virtual void visitImportDecl(const ImportDecl&) {}
     virtual void visitTraitDecl(const TraitDecl&) {}
+    virtual void visitModuleDecl(const ModuleDecl&) {}
+    virtual void visitUseDecl(const UseDecl&) {}
     virtual void visitImplDecl(const ImplDecl&) {}
 };
 
@@ -1769,8 +1959,17 @@ inline void AddrOfExpr::accept(ConstASTVisitor& v) const { v.visitAddrOfExpr(*th
 inline void CastExpr::accept(ASTVisitor& v) { v.visitCastExpr(*this); }
 inline void CastExpr::accept(ConstASTVisitor& v) const { v.visitCastExpr(*this); }
 
-inline void SelectExpr::accept(ASTVisitor& v) { v.visitSelectExpr(*this); }
-inline void SelectExpr::accept(ConstASTVisitor& v) const { v.visitSelectExpr(*this); }
+inline void TypeofExpr::accept(ASTVisitor& v) { v.visitTypeofExpr(*this); }
+inline void TypeofExpr::accept(ConstASTVisitor& v) const { v.visitTypeofExpr(*this); }
+
+inline void AlignofExpr::accept(ASTVisitor& v) { v.visitAlignofExpr(*this); }
+inline void AlignofExpr::accept(ConstASTVisitor& v) const { v.visitAlignofExpr(*this); }
+
+inline void ReflectExpr::accept(ASTVisitor& v) { v.visitReflectExpr(*this); }
+inline void ReflectExpr::accept(ConstASTVisitor& v) const { v.visitReflectExpr(*this); }
+
+inline void AwaitExpr::accept(ASTVisitor& v) { v.visitAwaitExpr(*this); }
+inline void AwaitExpr::accept(ConstASTVisitor& v) const { v.visitAwaitExpr(*this); }
 
 inline void StructInitExpr::accept(ASTVisitor& v) { v.visitStructInitExpr(*this); }
 inline void StructInitExpr::accept(ConstASTVisitor& v) const { v.visitStructInitExpr(*this); }
@@ -1817,8 +2016,17 @@ inline void AtomicStmt::accept(ConstASTVisitor& v) const { v.visitAtomicStmt(*th
 inline void YieldStmt::accept(ASTVisitor& v) { v.visitYieldStmt(*this); }
 inline void YieldStmt::accept(ConstASTVisitor& v) const { v.visitYieldStmt(*this); }
 
-inline void SwitchStmt::accept(ASTVisitor& v) { v.visitSwitchStmt(*this); }
-inline void SwitchStmt::accept(ConstASTVisitor& v) const { v.visitSwitchStmt(*this); }
+inline void MatchStmt::accept(ASTVisitor& v) { v.visitMatchStmt(*this); }
+inline void MatchStmt::accept(ConstASTVisitor& v) const { v.visitMatchStmt(*this); }
+
+inline void ConstDeclStmt::accept(ASTVisitor& v) { v.visitConstDeclStmt(*this); }
+inline void ConstDeclStmt::accept(ConstASTVisitor& v) const { v.visitConstDeclStmt(*this); }
+
+inline void ParallelForStmt::accept(ASTVisitor& v) { v.visitParallelForStmt(*this); }
+inline void ParallelForStmt::accept(ConstASTVisitor& v) const { v.visitParallelForStmt(*this); }
+
+inline void StaticAssertStmt::accept(ASTVisitor& v) { v.visitStaticAssertStmt(*this); }
+inline void StaticAssertStmt::accept(ConstASTVisitor& v) const { v.visitStaticAssertStmt(*this); }
 
 inline void SpawnStmt::accept(ASTVisitor& v) { v.visitSpawnStmt(*this); }
 inline void SpawnStmt::accept(ConstASTVisitor& v) const { v.visitSpawnStmt(*this); }
@@ -1855,6 +2063,12 @@ inline void EnumDecl::accept(ConstASTVisitor& v) const { v.visitEnumDecl(*this);
 
 inline void ImportDecl::accept(ASTVisitor& v) { v.visitImportDecl(*this); }
 inline void ImportDecl::accept(ConstASTVisitor& v) const { v.visitImportDecl(*this); }
+
+inline void ModuleDecl::accept(ASTVisitor& v) { v.visitModuleDecl(*this); }
+inline void ModuleDecl::accept(ConstASTVisitor& v) const { v.visitModuleDecl(*this); }
+
+inline void UseDecl::accept(ASTVisitor& v) { v.visitUseDecl(*this); }
+inline void UseDecl::accept(ConstASTVisitor& v) const { v.visitUseDecl(*this); }
 
 inline void TraitDecl::accept(ASTVisitor& v) { v.visitTraitDecl(*this); }
 inline void TraitDecl::accept(ConstASTVisitor& v) const { v.visitTraitDecl(*this); }

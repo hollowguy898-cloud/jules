@@ -174,11 +174,16 @@ void Parser::synchronize() {
             case TokenKind::KW_ERRDEFER:
             case TokenKind::KW_ATOMIC:
             case TokenKind::KW_YIELD:
-            case TokenKind::KW_SWITCH:
+            case TokenKind::KW_MATCH:
             case TokenKind::KW_TRAIT:
             case TokenKind::KW_IMPL:
             case TokenKind::KW_COMPTIME:
             case TokenKind::KW_SPAWN:
+            case TokenKind::KW_CONST:
+            case TokenKind::KW_MODULE:
+            case TokenKind::KW_USE:
+            case TokenKind::KW_PARALLEL:
+            case TokenKind::KW_STATIC_ASSERT:
             case TokenKind::KW_REDUCE:
             case TokenKind::KW_TRY:
             case TokenKind::RBRACE:
@@ -226,8 +231,8 @@ SourceLocation Parser::locFrom(const Token& token) const {
 std::unique_ptr<TopLevel> Parser::parseTopLevel() {
     auto directives = parseDirectives();
 
-    // Handle fn modifiers: inline, noalloc — these prefix fn declarations
-    if (check(TokenKind::KW_INLINE) || check(TokenKind::KW_NOALLOC)) {
+    // Handle fn modifiers: inline, noalloc, async — these prefix fn declarations
+    if (check(TokenKind::KW_INLINE) || check(TokenKind::KW_NOALLOC) || check(TokenKind::KW_ASYNC)) {
         return parseFnDecl(std::move(directives));
     }
 
@@ -252,6 +257,24 @@ std::unique_ptr<TopLevel> Parser::parseTopLevel() {
     }
     if (check(TokenKind::KW_IMPORT)) {
         return parseImportDecl();
+    }
+    if (check(TokenKind::KW_MODULE)) {
+        return parseModuleDecl();
+    }
+    if (check(TokenKind::KW_USE)) {
+        return parseUseDecl();
+    }
+    if (check(TokenKind::KW_CONST)) {
+        // const at top level: parse as a statement wrapped in a block-less context
+        SourceLocation const_loc = loc();
+        auto stmt = parseConstDecl();
+        // We can't return a Stmt as TopLevel directly, so wrap in an ExprStmt via FnDecl
+        // Actually, for simplicity, just parse it as a statement. The semantic analyzer
+        // will handle it. But TopLevel expects TopLevel nodes... let's just skip for now
+        // and treat const at top level as a special case.
+        // For now, emit an error suggesting to use const inside fn/struct
+        error("const at top level is not yet supported — use const inside function or struct scope");
+        return nullptr;
     }
     if (check(TokenKind::KW_OPAQUE)) {
         SourceLocation opaque_loc = loc();
@@ -303,9 +326,10 @@ std::vector<CompilerDirective> Parser::parseDirectives() {
 std::unique_ptr<FnDecl> Parser::parseFnDecl(
         std::vector<CompilerDirective> directives) {
     SourceLocation fn_loc = loc();
-    // Handle fn modifiers: inline, noalloc
+    // Handle fn modifiers: inline, noalloc, async
     bool is_inline = match(TokenKind::KW_INLINE);
     bool is_noalloc = match(TokenKind::KW_NOALLOC);
+    bool is_async = match(TokenKind::KW_ASYNC);
     consume(TokenKind::KW_FN, "expected 'fn'");
 
     Token name_tok = consume(TokenKind::IDENTIFIER, "expected function name");
@@ -374,6 +398,7 @@ std::unique_ptr<FnDecl> Parser::parseFnDecl(
         std::move(directives));
     result->setInline(is_inline);
     result->setNoalloc(is_noalloc);
+    result->setAsync(is_async);
     if (!return_type_text.empty()) {
         result->unresolved_return_type_name = return_type_text;
     }
@@ -560,8 +585,14 @@ std::unique_ptr<Stmt> Parser::parseStmt() {
             return parseAtomicStmt();
         case TokenKind::KW_YIELD:
             return parseYieldStmt();
-        case TokenKind::KW_SWITCH:
-            return parseSwitchStmt();
+        case TokenKind::KW_MATCH:
+            return parseMatchStmt();
+        case TokenKind::KW_CONST:
+            return parseConstDecl();
+        case TokenKind::KW_PARALLEL:
+            return parseParallelForStmt();
+        case TokenKind::KW_STATIC_ASSERT:
+            return parseStaticAssertStmt();
         case TokenKind::KW_SPAWN:
             return parseSpawnStmt();
         case TokenKind::KW_UNSAFE: {
@@ -1443,9 +1474,14 @@ std::unique_ptr<Expr> Parser::parsePrimaryExpr() {
             return std::make_unique<TryExpr>(std::move(try_loc), std::move(operand));
         }
 
-        // select(cond, a, b)
-        case TokenKind::KW_SELECT:
-            return parseSelectExpr();
+        case TokenKind::KW_TYPEOF:
+            return parseTypeofExpr();
+        case TokenKind::KW_ALIGNOF:
+            return parseAlignofExpr();
+        case TokenKind::KW_REFLECT:
+            return parseReflectExpr();
+        case TokenKind::KW_AWAIT:
+            return parseAwaitExpr();
 
         // unsafe(expr) in expression context
         case TokenKind::KW_UNSAFE:
@@ -1645,25 +1681,6 @@ std::unique_ptr<Expr> Parser::parseStructInitExpr(const std::string& type_name) 
             "expected '}' after struct initialization");
     return std::make_unique<StructInitExpr>(
         std::move(init_loc), type_name, std::move(inits));
-}
-
-std::unique_ptr<Expr> Parser::parseSelectExpr() {
-    SourceLocation sel_loc = loc();
-    consume(TokenKind::KW_SELECT, "expected 'select'");
-    consume(TokenKind::LPAREN, "expected '(' after 'select'");
-
-    auto condition = parseExpr();
-    consume(TokenKind::COMMA, "expected ',' after select condition");
-
-    auto true_expr = parseExpr();
-    consume(TokenKind::COMMA, "expected ',' after select true expression");
-
-    auto false_expr = parseExpr();
-    consume(TokenKind::RPAREN, "expected ')' after select expression");
-
-    return std::make_unique<SelectExpr>(
-        std::move(sel_loc), std::move(condition),
-        std::move(true_expr), std::move(false_expr));
 }
 
 std::unique_ptr<Expr> Parser::parseUnsafeExpr() {
@@ -2098,34 +2115,35 @@ BinaryOp Parser::tokenToCompoundAssignOp(TokenKind kind) const {
     }
 }
 
-std::unique_ptr<Stmt> Parser::parseSwitchStmt() {
-    SourceLocation switch_loc = loc();
-    consume(TokenKind::KW_SWITCH, "expected 'switch'");
+std::unique_ptr<Stmt> Parser::parseMatchStmt() {
+    SourceLocation match_loc = loc();
+    consume(TokenKind::KW_MATCH, "expected 'match'");
 
-    consume(TokenKind::LPAREN, "expected '(' after 'switch'");
+    consume(TokenKind::LPAREN, "expected '(' after 'match'");
     auto subject = parseExpr();
-    consume(TokenKind::RPAREN, "expected ')' after switch subject");
+    consume(TokenKind::RPAREN, "expected ')' after match subject");
 
-    consume(TokenKind::LBRACE, "expected '{' after switch subject");
+    consume(TokenKind::LBRACE, "expected '{' after match subject");
 
-    std::vector<SwitchArm> arms;
+    std::vector<MatchArm> arms;
     while (!check(TokenKind::RBRACE) && !isAtEnd()) {
-        SwitchArm arm;
-        if (check(TokenKind::KW_VAL) || check(TokenKind::KW_VAR)) {
-            // val/var pattern binding
-            arm.pattern = parseExpr();
+        MatchArm arm;
+        // Handle wildcard patterns: 'else' or '_' as catch-all
+        if (check(TokenKind::KW_ELSE)) {
+            SourceLocation else_loc = loc();
+            advance(); // consume 'else'
+            arm.pattern = std::make_unique<IdentExpr>(std::move(else_loc), "else");
         } else {
             arm.pattern = parseExpr();
         }
-        consume(TokenKind::ARROW, "expected '->' in switch arm");
+        consume(TokenKind::ARROW, "expected '->' in match arm");
         arm.body = parseBlockStmt();
-        arms.push_back(std::move(arm));
-        // Commas between switch arms are optional
+        // Commas between match arms are optional
         match(TokenKind::COMMA);
     }
 
-    consume(TokenKind::RBRACE, "expected '}' after switch arms");
-    return std::make_unique<SwitchStmt>(std::move(switch_loc), std::move(subject), std::move(arms));
+    consume(TokenKind::RBRACE, "expected '}' after match arms");
+    return std::make_unique<MatchStmt>(std::move(match_loc), std::move(subject), std::move(arms));
 }
 
 std::unique_ptr<Stmt> Parser::parseSpawnStmt() {
@@ -2237,6 +2255,155 @@ std::unique_ptr<ImplDecl> Parser::parseImplDecl() {
     return std::make_unique<ImplDecl>(
         std::move(impl_loc), std::move(trait_name), std::move(struct_name),
         std::move(methods));
+}
+
+// ============================================================================
+// Const declaration parsing
+// ============================================================================
+std::unique_ptr<Stmt> Parser::parseConstDecl() {
+    SourceLocation const_loc = loc();
+    consume(TokenKind::KW_CONST, "expected 'const'");
+    Token name_tok = consume(TokenKind::IDENTIFIER, "expected constant name");
+    TypeId type;
+    if (match(TokenKind::COLON)) {
+        type = parseType();
+    }
+    consume(TokenKind::EQ, "expected '=' in const declaration");
+    auto init = parseExpr();
+    match(TokenKind::SEMI);
+    return std::make_unique<ConstDeclStmt>(std::move(const_loc), std::string(name_tok.text()), type, std::move(init));
+}
+
+// ============================================================================
+// Parallel for statement parsing
+// ============================================================================
+std::unique_ptr<Stmt> Parser::parseParallelForStmt() {
+    SourceLocation par_loc = loc();
+    consume(TokenKind::KW_PARALLEL, "expected 'parallel'");
+    // "for" is not a keyword in Tether, so we accept it as an identifier
+    if (check(TokenKind::IDENTIFIER) && peek().text() == "for") {
+        advance(); // consume 'for'
+    } else {
+        error("expected 'for' after 'parallel'");
+    }
+    Token name_tok = consume(TokenKind::IDENTIFIER, "expected iterator name");
+    // "in" is not a keyword either
+    if (check(TokenKind::IDENTIFIER) && peek().text() == "in") {
+        advance(); // consume 'in'
+    } else {
+        error("expected 'in' after iterator name in parallel for");
+    }
+    auto iterable = parseExpr();
+    auto body = parseBlockStmt();
+    return std::make_unique<ParallelForStmt>(
+        std::move(par_loc), std::string(name_tok.text()), std::move(iterable), std::move(body));
+}
+
+// ============================================================================
+// Static assert parsing
+// ============================================================================
+std::unique_ptr<Stmt> Parser::parseStaticAssertStmt() {
+    SourceLocation sa_loc = loc();
+    consume(TokenKind::KW_STATIC_ASSERT, "expected 'static_assert'");
+    consume(TokenKind::LPAREN, "expected '(' after 'static_assert'");
+    auto condition = parseExpr();
+    std::string message;
+    if (match(TokenKind::COMMA)) {
+        Token msg_tok = consume(TokenKind::STRING_LITERAL, "expected assertion message string");
+        std::string_view raw = msg_tok.text().substr(1, msg_tok.text().size() - 2);
+        message = std::string(raw);
+    }
+    consume(TokenKind::RPAREN, "expected ')' after static_assert arguments");
+    match(TokenKind::SEMI);
+    return std::make_unique<StaticAssertStmt>(std::move(sa_loc), std::move(condition), std::move(message));
+}
+
+// ============================================================================
+// Typeof expression parsing
+// ============================================================================
+std::unique_ptr<Expr> Parser::parseTypeofExpr() {
+    SourceLocation typeof_loc = loc();
+    consume(TokenKind::KW_TYPEOF, "expected 'typeof'");
+    consume(TokenKind::LPAREN, "expected '(' after 'typeof'");
+    auto operand = parseExpr();
+    consume(TokenKind::RPAREN, "expected ')' after typeof argument");
+    return std::make_unique<TypeofExpr>(std::move(typeof_loc), std::move(operand));
+}
+
+// ============================================================================
+// Alignof expression parsing
+// ============================================================================
+std::unique_ptr<Expr> Parser::parseAlignofExpr() {
+    SourceLocation alignof_loc = loc();
+    consume(TokenKind::KW_ALIGNOF, "expected 'alignof'");
+    consume(TokenKind::LPAREN, "expected '(' after 'alignof'");
+    auto inner = parseExpr();
+    consume(TokenKind::RPAREN, "expected ')' after alignof argument");
+    return std::make_unique<AlignofExpr>(std::move(alignof_loc), std::move(inner));
+}
+
+// ============================================================================
+// Reflect expression parsing
+// ============================================================================
+std::unique_ptr<Expr> Parser::parseReflectExpr() {
+    SourceLocation reflect_loc = loc();
+    consume(TokenKind::KW_REFLECT, "expected 'reflect'");
+    consume(TokenKind::LPAREN, "expected '(' after 'reflect'");
+    auto operand = parseExpr();
+    consume(TokenKind::RPAREN, "expected ')' after reflect argument");
+    // ReflectExpr takes a TypeId, but at parse time we have an expression.
+    // Store with null TypeId; semantic analysis will resolve it.
+    // We use the type_annotations_ side channel to record the operand text.
+    auto result = std::make_unique<ReflectExpr>(std::move(reflect_loc), TypeId());
+    if (auto* ident = dyn_cast<IdentExpr>(operand.get())) {
+        recordTypeAnnotation(result.get(), ident->name());
+    }
+    return result;
+}
+
+// ============================================================================
+// Await expression parsing
+// ============================================================================
+std::unique_ptr<Expr> Parser::parseAwaitExpr() {
+    SourceLocation await_loc = loc();
+    consume(TokenKind::KW_AWAIT, "expected 'await'");
+    auto operand = parseExpr();
+    return std::make_unique<AwaitExpr>(std::move(await_loc), std::move(operand));
+}
+
+// ============================================================================
+// Module declaration parsing
+// ============================================================================
+std::unique_ptr<TopLevel> Parser::parseModuleDecl() {
+    SourceLocation mod_loc = loc();
+    consume(TokenKind::KW_MODULE, "expected 'module'");
+    Token name_tok = consume(TokenKind::IDENTIFIER, "expected module name");
+    consume(TokenKind::SEMI, "expected ';' after module declaration");
+    return std::make_unique<ModuleDecl>(std::move(mod_loc), std::string(name_tok.text()));
+}
+
+// ============================================================================
+// Use declaration parsing
+// ============================================================================
+std::unique_ptr<TopLevel> Parser::parseUseDecl() {
+    SourceLocation use_loc = loc();
+    consume(TokenKind::KW_USE, "expected 'use'");
+    Token module_tok = consume(TokenKind::IDENTIFIER, "expected module name after 'use'");
+    std::string module_path(module_tok.text());
+    // Support double-colon paths: use foo::bar::baz
+    while (check(TokenKind::COLON_COLON) && !isAtEnd()) {
+        advance(); // consume ::
+        Token part = consume(TokenKind::IDENTIFIER, "expected module path component");
+        module_path += "::";
+        module_path += part.text();
+    }
+    std::string item_name;
+    if (match(TokenKind::KW_AS)) {
+        Token alias_tok = consume(TokenKind::IDENTIFIER, "expected alias name after 'as'");
+        item_name = std::string(alias_tok.text());
+    }
+    consume(TokenKind::SEMI, "expected ';' after use declaration");
+    return std::make_unique<UseDecl>(std::move(use_loc), std::move(module_path), std::move(item_name), std::string());
 }
 
 } // namespace tether

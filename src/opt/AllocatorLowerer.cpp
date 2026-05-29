@@ -189,11 +189,6 @@ bool AllocatorLowererPass::walkExpr(Expr* expr, TypeTable& type_table) {
     else if (auto* cast_expr = dyn_cast<CastExpr>(expr)) {
         if (walkExpr(cast_expr->expr(), type_table)) changed = true;
     }
-    else if (auto* select = dyn_cast<SelectExpr>(expr)) {
-        if (walkExpr(select->condition(), type_table)) changed = true;
-        if (walkExpr(select->trueExpr(), type_table)) changed = true;
-        if (walkExpr(select->falseExpr(), type_table)) changed = true;
-    }
     else if (auto* try_expr = dyn_cast<TryExpr>(expr)) {
         if (walkExpr(try_expr->operand(), type_table)) changed = true;
     }

@@ -264,11 +264,6 @@ bool OpaqueBarrierPass::walkExpr(Expr* expr, TypeTable& type_table) {
         }
         if (walkExpr(cast_expr->expr(), type_table)) found = true;
     }
-    else if (auto* select = dyn_cast<SelectExpr>(expr)) {
-        if (walkExpr(select->condition(), type_table)) found = true;
-        if (walkExpr(select->trueExpr(), type_table)) found = true;
-        if (walkExpr(select->falseExpr(), type_table)) found = true;
-    }
     else if (auto* try_expr = dyn_cast<TryExpr>(expr)) {
         if (walkExpr(try_expr->operand(), type_table)) found = true;
     }

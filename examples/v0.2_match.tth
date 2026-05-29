@@ -1,4 +1,4 @@
-// Test switch keyword
+// Test match keyword
 
 enum Color {
     Red,
@@ -7,7 +7,7 @@ enum Color {
 }
 
 fn color_code(c: Color) i32 {
-    switch (c) {
+    match (c) {
         Color.Red -> {
             return 1;
         }
