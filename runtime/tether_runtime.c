@@ -178,23 +178,23 @@ TetherAllocator tether_fixed_buffer_allocator(TetherFixedBuffer* fb) {
 void* tether_heap_alloc(TetherAllocator* alloc, size_t size) {
     (void)alloc;
     if (size == 0) return NULL;
-    return malloc(size);
+    return tether_malloc(size);
 }
 
 void* tether_heap_realloc(TetherAllocator* alloc, void* ptr, size_t old_size, size_t new_size) {
     (void)alloc;
     (void)old_size;
     if (new_size == 0) {
-        free(ptr);
+        tether_free(ptr);
         return NULL;
     }
-    return realloc(ptr, new_size);
+    return tether_realloc(ptr, new_size);
 }
 
 void tether_heap_free(TetherAllocator* alloc, void* ptr, size_t size) {
     (void)alloc;
     (void)size;
-    free(ptr);
+    tether_free(ptr);
 }
 
 void tether_heap_reset(TetherAllocator* alloc) {
@@ -213,6 +213,62 @@ TetherAllocator tether_heap_allocator(void) {
 }
 
 /* ============================================================================
+ * Thread-local small-box cache implementation
+ * ============================================================================ */
+
+static __thread TetherBoxCache tl_box_cache = { .count = 0, .capacity = TETHER_SMALL_BOX_CACHE_SIZE };
+
+TetherBoxCache* tether_box_cache_get(void) { return &tl_box_cache; }
+
+void* tether_box_cache_alloc(TetherBoxCache* cache, int64_t size) {
+    if (cache->count > 0 && size <= TETHER_SMALL_BOX_THRESHOLD) {
+        return cache->blocks[--cache->count];
+    }
+    return tether_malloc((size_t)size);
+}
+
+void tether_box_cache_free(TetherBoxCache* cache, void* ptr, int64_t size) {
+    if (ptr && cache->count < cache->capacity && size <= TETHER_SMALL_BOX_THRESHOLD) {
+        cache->blocks[cache->count++] = ptr;
+        return;
+    }
+    tether_free(ptr);
+}
+
+/* ============================================================================
+ * Batched allocation (allocation fusion) implementation
+ * ============================================================================ */
+
+TetherAllocBatch tether_batch_alloc(int64_t total_size) {
+    TetherAllocBatch batch;
+    batch.buffer = tether_malloc((size_t)total_size);
+    batch.capacity = total_size;
+    batch.offset = 0;
+    batch.count = 0;
+    return batch;
+}
+
+void* tether_batch_carve(TetherAllocBatch* batch, int64_t size) {
+    if (!batch || !batch->buffer || size <= 0) return NULL;
+    int64_t aligned_offset = align_up(batch->offset, 16); /* 16-byte alignment for all types */
+    if (aligned_offset + size > batch->capacity) return NULL;
+    void* result = (char*)batch->buffer + aligned_offset;
+    batch->offset = aligned_offset + size;
+    batch->count++;
+    return result;
+}
+
+void tether_batch_free(TetherAllocBatch* batch) {
+    if (batch && batch->buffer) {
+        tether_free(batch->buffer);
+        batch->buffer = NULL;
+        batch->capacity = 0;
+        batch->offset = 0;
+        batch->count = 0;
+    }
+}
+
+/* ============================================================================
  * Box operations
  * ============================================================================ */
 
@@ -224,7 +280,8 @@ TetherBox tether_box_new(const void* data, int64_t size) {
         return box;
     }
 
-    box.ptr = malloc((size_t)size);
+    TetherBoxCache* cache = tether_box_cache_get();
+    box.ptr = (char*)tether_box_cache_alloc(cache, size);
     if (box.ptr) {
         memcpy(box.ptr, data, (size_t)size);
         box.size = size;
@@ -236,7 +293,8 @@ TetherBox tether_box_new(const void* data, int64_t size) {
 
 void tether_box_drop(TetherBox* box) {
     if (box && box->ptr) {
-        free(box->ptr);
+        TetherBoxCache* cache = tether_box_cache_get();
+        tether_box_cache_free(cache, box->ptr, box->size);
         box->ptr  = NULL;
         box->size = 0;
     }
@@ -263,7 +321,7 @@ TetherRc tether_rc_new(const void* data, int64_t size) {
 
     /* Allocate: refcount (8 bytes) + data */
     int64_t total = sizeof(int64_t) + size;
-    void* block = malloc((size_t)total);
+    void* block = tether_malloc((size_t)total);
     if (!block) {
         rc.ptr       = NULL;
         rc.data_size = 0;
@@ -306,7 +364,7 @@ void tether_rc_drop(TetherRc* rc) {
     (*refcount_ptr)--;
 
     if (*refcount_ptr <= 0) {
-        free(rc->ptr);
+        tether_free(rc->ptr);
     }
 
     rc->ptr       = NULL;
@@ -355,7 +413,7 @@ TetherArc tether_arc_new(const void* data, int64_t size) {
     }
 
     int64_t total = sizeof(_Atomic int64_t) + size;
-    void* block = malloc((size_t)total);
+    void* block = tether_malloc((size_t)total);
     if (!block) {
         arc.ptr       = NULL;
         arc.data_size = 0;
@@ -400,7 +458,7 @@ void tether_arc_drop(TetherArc* arc) {
 
     if (old_count <= 1) {
         /* This was the last reference; free the block */
-        free(arc->ptr);
+        tether_free(arc->ptr);
     }
 
     arc->ptr       = NULL;
@@ -448,6 +506,37 @@ void tether_print_str(const char* str, int64_t len) {
     }
 }
 
+/* ============================================================================
+ * Optimized string operations
+ *
+ * These functions support the zero-copy string slice and fast string equality
+ * optimizations in the Tether compiler:
+ *   - tether_str_eq:    O(1) for interned strings, O(n) worst-case
+ *   - tether_str_slice: Zero-copy substring (just adjusts pointer + length)
+ * ============================================================================ */
+
+/* Fast string equality — checks length first, then pointer equality (for
+ * interned strings), then falls back to memcmp. When the Tether compiler
+ * interns string literals, identical strings share the same pointer, making
+ * this O(1) in the common case. */
+bool tether_str_eq(const char* a, int64_t a_len, const char* b, int64_t b_len) {
+    if (a_len != b_len) return false;
+    if (a == b) return true;  /* Same pointer = interned or same slice */
+    return memcmp(a, b, (size_t)a_len) == 0;
+}
+
+/* Zero-copy string slice — just adjusts pointer and length.
+ * No memcpy, no allocation. The returned slice points into the
+ * original string's memory, making substring operations O(1). */
+TetherSlice_void tether_str_slice(const char* str, int64_t str_len,
+                                   int64_t start, int64_t len) {
+    (void)str_len;  /* Total length available for bounds checking in future */
+    TetherSlice_void result;
+    result.ptr = (void*)(str + start);
+    result.len = len;
+    return result;
+}
+
 void tether_print_ln(void) {
     printf("\n");
 }
@@ -486,6 +575,10 @@ struct TetherTask {
 // --- Global work queue (simple locked deque) ---
 #define TETHER_MAX_QUEUED_TASKS 65536
 
+// --- Adaptive spin parameters (configurable) ---
+#define TETHER_DEFAULT_SPIN_COUNT   100    // Pure spin iterations (Phase 1)
+#define TETHER_DEFAULT_YIELD_COUNT  1000   // sched_yield iterations (Phase 2)
+
 static struct {
     TetherTask*    tasks[TETHER_MAX_QUEUED_TASKS];
     atomic_int     head;
@@ -496,6 +589,9 @@ static struct {
     pthread_t*      threads;
     uint32_t        num_threads;
     int             initialized;
+    // Adaptive spin parameters for tether_task_await()
+    uint32_t        spin_count;    // Phase 1: pure CPU spin iterations
+    uint32_t        yield_count;   // Phase 2: sched_yield iterations
 } g_taskpool;
 
 // --- Worker thread function ---
@@ -533,6 +629,9 @@ static void* tether_worker_thread(void* arg) {
             atomic_store(&task->state, TETHER_TASK_RUNNING);
             task->result = task->fn(task->ctx);
             atomic_store(&task->state, TETHER_TASK_DONE);
+            // Signal any threads that might be waiting in tether_task_await
+            // (Phase 3 of adaptive spinning blocks on this cond var)
+            pthread_cond_broadcast(&g_taskpool.not_empty);
         }
     }
     return NULL;
@@ -549,6 +648,8 @@ void tether_taskpool_init(uint32_t num_threads) {
 
     g_taskpool.num_threads = num_threads;
     g_taskpool.shutdown = 0;
+    g_taskpool.spin_count = TETHER_DEFAULT_SPIN_COUNT;
+    g_taskpool.yield_count = TETHER_DEFAULT_YIELD_COUNT;
     atomic_store(&g_taskpool.head, 0);
     atomic_store(&g_taskpool.tail, 0);
     pthread_mutex_init(&g_taskpool.lock, NULL);
@@ -620,8 +721,41 @@ TetherTaskHandle tether_spawn(TetherTaskFn fn, void* ctx, uint64_t ctx_size) {
 void* tether_task_await(TetherTaskHandle handle) {
     if (!handle.task) return NULL;
 
-    // Spin-wait with yield for low latency (suitable for HFT use cases)
-    while (atomic_load(&handle.task->state) != TETHER_TASK_DONE) {
+    // Adaptive spin strategy:
+    // Phase 1: Spin for spin_count iterations (low latency for short tasks)
+    // Phase 2: sched_yield for yield_count iterations (medium latency)
+    // Phase 3: pthread_cond_wait (for long waits, saves CPU)
+    //
+    // This gives nanosecond latency for HFT (short tasks done in Phase 1)
+    // while not burning CPU for general workloads (long tasks block in Phase 3).
+
+    uint32_t spin_count = g_taskpool.spin_count;
+    uint32_t yield_count = g_taskpool.yield_count;
+
+    // Phase 1: Pure spin (for very short tasks — nanosecond latency)
+    for (uint32_t i = 0; i < spin_count; i++) {
+        if (atomic_load(&handle.task->state) == TETHER_TASK_DONE) {
+            goto done;
+        }
+        // CPU pause hint for spin-wait loops — reduces power consumption
+        // and improves performance on hyperthreaded CPUs
+#if defined(__x86_64__) || defined(_M_X64)
+        __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__)
+        __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__riscv)
+        __asm__ __volatile__("pause" ::: "memory");
+#else
+        // No pause instruction available — rely on compiler barrier
+        __asm__ __volatile__("" ::: "memory");
+#endif
+    }
+
+    // Phase 2: sched_yield (for medium-duration tasks)
+    for (uint32_t i = 0; i < yield_count; i++) {
+        if (atomic_load(&handle.task->state) == TETHER_TASK_DONE) {
+            goto done;
+        }
 #ifdef _WIN32
         SwitchToThread();
 #else
@@ -629,15 +763,28 @@ void* tether_task_await(TetherTaskHandle handle) {
 #endif
     }
 
-    void* result = handle.task->result;
-
-    // Clean up context copy
-    if (handle.task->ctx && handle.task->ctx_size > 0) {
-        free(handle.task->ctx);
+    // Phase 3: Block on condition variable (for long tasks — saves CPU)
+    // The worker thread signals g_taskpool.not_empty after completing a task.
+    {
+        pthread_mutex_lock(&g_taskpool.lock);
+        while (atomic_load(&handle.task->state) != TETHER_TASK_DONE) {
+            pthread_cond_wait(&g_taskpool.not_empty, &g_taskpool.lock);
+        }
+        pthread_mutex_unlock(&g_taskpool.lock);
     }
 
-    free(handle.task);
-    return result;
+done:
+    {
+        void* result = handle.task->result;
+
+        // Clean up context copy
+        if (handle.task->ctx && handle.task->ctx_size > 0) {
+            free(handle.task->ctx);
+        }
+
+        free(handle.task);
+        return result;
+    }
 }
 
 int tether_task_is_done(TetherTaskHandle handle) {
@@ -647,6 +794,11 @@ int tether_task_is_done(TetherTaskHandle handle) {
 
 uint32_t tether_taskpool_thread_count(void) {
     return g_taskpool.num_threads;
+}
+
+void tether_taskpool_set_spin_params(uint32_t spin_count, uint32_t yield_count) {
+    g_taskpool.spin_count = spin_count;
+    g_taskpool.yield_count = yield_count;
 }
 
 /* ============================================================================

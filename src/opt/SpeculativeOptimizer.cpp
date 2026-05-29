@@ -92,8 +92,8 @@ void SpeculativeOptimizerPass::walkStmt(Stmt* stmt, SpeculativeOptResult& result
                         then_unlikely = false;
                     } else {
                         // Check if one path is marked cold
-                        auto* then_nm = meta_map_->get(&is.thenBlock());
-                        auto* else_nm = is.hasElse() ? meta_map_->get(&is.elseBlock()) : nullptr;
+                        auto* then_nm = meta_map_->get(is.thenBlock());
+                        auto* else_nm = is.hasElse() ? meta_map_->get(is.elseBlock()) : nullptr;
                         if (then_nm && then_nm->llvm_meta.cold_path) {
                             then_unlikely = true;
                         } else if (else_nm && else_nm->llvm_meta.cold_path) {
@@ -156,9 +156,9 @@ void SpeculativeOptimizerPass::walkStmt(Stmt* stmt, SpeculativeOptResult& result
 
             // Walk sub-expressions
             walkExpr(is.condition(), result);
-            walkStmt(&is.thenBlock(), result);
+            walkStmt(is.thenBlock(), result);
             if (is.hasElse()) {
-                walkStmt(&is.elseBlock(), result);
+                walkStmt(is.elseBlock(), result);
             }
             break;
         }
@@ -173,12 +173,12 @@ void SpeculativeOptimizerPass::walkStmt(Stmt* stmt, SpeculativeOptResult& result
         }
         case NodeKind::VarDeclStmt: {
             auto& vd = cast<VarDeclStmt>(*stmt);
-            walkExpr(vd.value(), result);
+            if (vd.hasInit()) walkExpr(vd.init(), result);
             break;
         }
         case NodeKind::ValDeclStmt: {
             auto& vd = cast<ValDeclStmt>(*stmt);
-            walkExpr(vd.value(), result);
+            if (vd.hasInit()) walkExpr(vd.init(), result);
             break;
         }
         case NodeKind::AssignStmt: {
@@ -204,7 +204,7 @@ void SpeculativeOptimizerPass::walkStmt(Stmt* stmt, SpeculativeOptResult& result
         }
         case NodeKind::MatchStmt: {
             auto& ms = cast<MatchStmt>(*stmt);
-            walkExpr(ms.scrutinee(), result);
+            walkExpr(ms.subject(), result);
             for (auto& arm : ms.arms()) {
                 if (arm.body) walkStmt(arm.body.get(), result);
             }
@@ -398,8 +398,8 @@ bool SpeculativeOptimizerPass::isWorthSpeculating(IfStmt& is) {
     }
 
     // Check if one path is marked cold
-    auto* then_nm = meta_map_->get(&is.thenBlock());
-    auto* else_nm = is.hasElse() ? meta_map_->get(&is.elseBlock()) : nullptr;
+    auto* then_nm = meta_map_->get(is.thenBlock());
+    auto* else_nm = is.hasElse() ? meta_map_->get(is.elseBlock()) : nullptr;
 
     if (then_nm && then_nm->llvm_meta.cold_path) return true;
     if (else_nm && else_nm->llvm_meta.cold_path) return true;

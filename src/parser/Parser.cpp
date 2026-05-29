@@ -313,6 +313,8 @@ std::vector<CompilerDirective> Parser::parseDirectives() {
             directives.push_back(CompilerDirective::Polly);
         } else if (text == "simd") {
             directives.push_back(CompilerDirective::Simd);
+        } else if (text == "tailcall") {
+            directives.push_back(CompilerDirective::Tailcall);
         } else {
             std::string err_msg = "unknown compiler directive '@";
             err_msg.append(text);
@@ -1851,6 +1853,63 @@ TypeId Parser::parseType() {
             consumeGT(); // consume > (handles >> splitting)
 
             return type_table_.getSmartPointer(inner, sp_kind);
+        }
+
+        // SIMD vector type: simd<T, N>
+        // Syntax: simd<f32, 4> or simd<i32, 8>
+        // Also shorthand: f32x4, f64x2, i32x4, i64x2, i8x16, i16x8,
+        //                u8x16, u16x8, u32x4, u64x2
+        if (name == "simd" && peekNext().kind() == TokenKind::LT) {
+            advance(); // consume 'simd'
+            consume(TokenKind::LT, "expected '<' after 'simd'");
+            TypeId element = parseType();
+            consume(TokenKind::COMMA, "expected ',' after simd element type");
+            Token count_tok = consume(TokenKind::INT_LITERAL, "expected simd lane count");
+            uint32_t count = static_cast<uint32_t>(std::stoull(std::string(count_tok.text())));
+            consumeGT(); // consume > (handles >> splitting)
+            return type_table_.getSimdVector(element, count);
+        }
+
+        // SIMD shorthand types: f32x4, i32x8, etc.
+        {
+            TypeId simd_elem;
+            uint32_t simd_count = 0;
+            // Parse the shorthand: type_prefix + "x" + count
+            // e.g. "f32x4" -> f32, 4; "i8x16" -> i8, 16
+            if (name.size() > 3) {
+                // Find the 'x' separator
+                auto xpos = name.find('x');
+                if (xpos != std::string::npos && xpos > 0 && xpos < name.size() - 1) {
+                    std::string elem_name = name.substr(0, xpos);
+                    std::string count_str = name.substr(xpos + 1);
+                    bool count_valid = !count_str.empty();
+                    for (char c : count_str) {
+                        if (!std::isdigit(static_cast<unsigned char>(c))) {
+                            count_valid = false;
+                            break;
+                        }
+                    }
+                    if (count_valid) {
+                        simd_count = static_cast<uint32_t>(std::stoull(count_str));
+                        // Resolve element type
+                        if (elem_name == "f32")    simd_elem = type_table_.getF32();
+                        else if (elem_name == "f64") simd_elem = type_table_.getF64();
+                        else if (elem_name == "i8")  simd_elem = type_table_.getI8();
+                        else if (elem_name == "i16") simd_elem = type_table_.getI16();
+                        else if (elem_name == "i32") simd_elem = type_table_.getI32();
+                        else if (elem_name == "i64") simd_elem = type_table_.getI64();
+                        else if (elem_name == "u8")  simd_elem = type_table_.getU8();
+                        else if (elem_name == "u16") simd_elem = type_table_.getU16();
+                        else if (elem_name == "u32") simd_elem = type_table_.getU32();
+                        else if (elem_name == "u64") simd_elem = type_table_.getU64();
+
+                        if (simd_elem && simd_count > 0) {
+                            advance(); // consume the identifier
+                            return type_table_.getSimdVector(simd_elem, simd_count);
+                        }
+                    }
+                }
+            }
         }
 
         // Named type (struct/enum/alias)

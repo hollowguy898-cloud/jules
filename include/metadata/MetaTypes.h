@@ -217,6 +217,34 @@ struct NodeMeta {
     bool in_unsafe_block = false;        // This node is inside an unsafe block
     bool moved_out = false;              // This variable has been moved out
     uint32_t lifetime_id = static_cast<uint32_t>(-1);  // Assigned lifetime for this reference (INVALID_LIFETIME = -1)
+
+    // Compile-time evaluation results (from ComptimeEvalPass)
+    bool comptime_evaluated = false;     // This expression was fully evaluated at compile time
+    int64_t comptime_int_value = 0;      // Valid when comptime_evaluated && kind == Int
+    double comptime_float_value = 0.0;   // Valid when comptime_evaluated && kind == Float
+    bool comptime_bool_value = false;    // Valid when comptime_evaluated && kind == Bool
+    std::string comptime_string_value;   // Valid when comptime_evaluated && kind == String
+
+    // SROA (Scalar Replacement of Aggregates) — set by SROAPass
+    bool sroa_eligible = false;              // This struct variable can be SROA'd
+    std::vector<std::string> sroa_field_names;  // Names for the decomposed fields (e.g. "p.x", "p.y")
+
+    // Niched error type optimization (from NichedErrorPass)
+    // When niched_error = true, the ErrorType uses pointer niche or integer
+    // niche encoding instead of a separate i1 error flag, eliminating
+    // the overhead of error handling in the common (success) path.
+    enum class NichedErrorKind : uint8_t {
+        PointerNiche,    // ptr with low bit as error flag
+        IntegerNiche,    // i64 with high bit as error flag
+        StructFallback,  // Traditional { T, i1 } struct
+    };
+    bool niched_error = false;              // This ErrorType uses niche encoding
+    NichedErrorKind niched_error_kind = NichedErrorKind::StructFallback;
+
+    // Allocation fusion (from AllocFusionPass)
+    bool alloc_fused = false;            // This Box allocation is part of a fused batch
+    int64_t alloc_batch_size = 0;        // Total batch size (only set on the first allocation in a batch)
+    int64_t alloc_batch_offset = 0;      // Offset within the batch for this allocation
 };
 
 // ============================================================================

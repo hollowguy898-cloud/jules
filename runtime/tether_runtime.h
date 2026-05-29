@@ -24,6 +24,25 @@
 #include <string.h>
 #include <stdio.h>
 
+/* ============================================================================
+ * Allocator abstraction — mimalloc / malloc dispatch
+ *
+ * When TETHER_USE_MIMALLOC is defined, Box/Rc/Arc allocations use
+ * mimalloc for 2-3x faster allocation on hot paths.
+ * If mimalloc is not available, falls back to malloc.
+ * ============================================================================ */
+
+#ifdef TETHER_USE_MIMALLOC
+#include <mimalloc.h>
+#define tether_malloc(size)        mi_malloc(size)
+#define tether_free(ptr)           mi_free(ptr)
+#define tether_realloc(ptr, size)  mi_realloc(ptr, size)
+#else
+#define tether_malloc(size)        malloc(size)
+#define tether_free(ptr)           free(ptr)
+#define tether_realloc(ptr, size)  realloc(ptr, size)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -208,6 +227,55 @@ void tether_heap_reset(TetherAllocator* alloc);
 TetherAllocator tether_heap_allocator(void);
 
 /* ============================================================================
+ * Thread-local small-box cache
+ *
+ * Avoids the global allocator lock for common small allocations (≤256 bytes).
+ * Each thread gets its own cache of pre-allocated blocks.
+ * ============================================================================ */
+
+#define TETHER_SMALL_BOX_CACHE_SIZE 64
+#define TETHER_SMALL_BOX_THRESHOLD  256
+
+typedef struct TetherBoxCache {
+    void*    blocks[TETHER_SMALL_BOX_CACHE_SIZE];
+    int      count;
+    int      capacity;
+} TetherBoxCache;
+
+/* Get the thread-local Box cache */
+TetherBoxCache* tether_box_cache_get(void);
+
+/* Allocate from the thread-local cache, or fall through to allocator */
+void* tether_box_cache_alloc(TetherBoxCache* cache, int64_t size);
+
+/* Return a block to the thread-local cache */
+void tether_box_cache_free(TetherBoxCache* cache, void* ptr, int64_t size);
+
+/* ============================================================================
+ * Batched Allocation — Allocation Fusion
+ *
+ * Multiple Box.new() calls in sequence can be fused into a single allocation.
+ * The caller allocates a batch, then carves individual Boxes out of it.
+ * Similar to Zig's ArenaAllocator but at the type level.
+ * ============================================================================ */
+
+typedef struct TetherAllocBatch {
+    void*    buffer;     /* Pre-allocated memory chunk */
+    int64_t  capacity;   /* Total buffer size */
+    int64_t  offset;     /* Current carve offset */
+    int64_t  count;      /* Number of allocations carved from this batch */
+} TetherAllocBatch;
+
+/* Create a batch allocator with the given total size */
+TetherAllocBatch tether_batch_alloc(int64_t total_size);
+
+/* Carve `size` bytes from the batch. Returns NULL if exhausted. */
+void* tether_batch_carve(TetherAllocBatch* batch, int64_t size);
+
+/* Free the entire batch at once (all individual allocations become invalid) */
+void tether_batch_free(TetherAllocBatch* batch);
+
+/* ============================================================================
  * Box operations
  * ============================================================================ */
 
@@ -283,6 +351,26 @@ void tether_print_bool(bool value);
 /* Print a UTF-8 string with given length followed by nothing */
 void tether_print_str(const char* str, int64_t len);
 
+/* ============================================================================
+ * Optimized string operations
+ *
+ * Fast string equality and zero-copy string slicing. These are used by
+ * the Tether codegen to optimize string comparisons and substring operations.
+ * ============================================================================ */
+
+/* Fast string equality — checks length first, then pointer equality (for
+ * interned strings), then falls back to memcmp.
+ * Returns true if the strings are equal, false otherwise.
+ * When the Tether compiler interns string literals, identical strings
+ * share the same pointer, making this O(1) in the common case. */
+bool tether_str_eq(const char* a, int64_t a_len, const char* b, int64_t b_len);
+
+/* Zero-copy string slice — just adjusts pointer and length.
+ * No memcpy, no allocation. The returned slice points into the
+ * original string's memory, making substring operations O(1). */
+TetherSlice_void tether_str_slice(const char* str, int64_t str_len,
+                                   int64_t start, int64_t len);
+
 /* Print a newline */
 void tether_print_ln(void);
 
@@ -330,6 +418,15 @@ int tether_task_is_done(TetherTaskHandle handle);
 // Get the number of worker threads in the task pool.
 uint32_t tether_taskpool_thread_count(void);
 
+// Configure the adaptive spin parameters for tether_task_await().
+// spin_count: number of pure CPU spin iterations (default: 100)
+// yield_count: number of sched_yield iterations (default: 1000)
+// After both phases, falls through to blocking wait on cond var.
+// For HFT workloads: set spin_count high (10000+) and yield_count to 0
+// For general workloads: use defaults (100 spin + 1000 yield + block)
+// For power-saving: set both to 0 to immediately block
+void tether_taskpool_set_spin_params(uint32_t spin_count, uint32_t yield_count);
+
 /* ============================================================================
  * Deoptimization support (Nuclear #8: Speculative Optimization)
  *
@@ -359,6 +456,41 @@ void tether_deopt(uint64_t deopt_id, void* frame);
  * Pass NULL to restore the default handler. */
 typedef void (*TetherDeoptCallback)(TetherDeoptInfo* info);
 void tether_register_deopt_handler(TetherDeoptCallback callback);
+
+/* ============================================================================
+ * SIMD Vector Intrinsics
+ *
+ * These map directly to LLVM vector instructions for maximum performance.
+ * The IRGenerator emits these as LLVM vector operations, not function calls.
+ *
+ * Type syntax:  simd<T, N>   where T is a primitive type, N is power-of-2
+ * Shorthand:    f32x4, f64x2, i32x4, i64x2, i8x16, i16x8,
+ *               u8x16, u16x8, u32x4, u64x2
+ *
+ * The following operations are emitted as LLVM IR vector intrinsics by the
+ * code generator — they are NOT C function calls:
+ * ============================================================================ */
+
+/* SIMD load/store — aligned for best performance */
+/* simd<T, N> simd_load<T, N>(T* ptr) */
+/* void simd_store<T, N>(simd<T, N> vec, T* ptr) */
+
+/* SIMD arithmetic — element-wise operations */
+/* simd<T, N> simd_add<T, N>(simd<T, N> a, simd<T, N> b) */
+/* simd<T, N> simd_sub<T, N>(simd<T, N> a, simd<T, N> b) */
+/* simd<T, N> simd_mul<T, N>(simd<T, N> a, simd<T, N> b) */
+/* simd<T, N> simd_div<T, N>(simd<T, N> a, simd<T, N> b) */
+
+/* SIMD horizontal reduction */
+/* T simd_reduce_add<T, N>(simd<T, N> vec) */
+/* T simd_reduce_mul<T, N>(simd<T, N> vec) */
+/* T simd_reduce_min<T, N>(simd<T, N> vec) */
+/* T simd_reduce_max<T, N>(simd<T, N> vec) */
+
+/* SIMD shuffle/gather/scatter */
+/* simd<T, M> simd_shuffle<M, N, T>(simd<T, N> a, simd<T, N> b, int32_t mask[M]) */
+/* simd<T, N> simd_gather<T, N>(simd<T*, N> ptrs) */
+/* void simd_scatter<T, N>(simd<T, N> vals, simd<T*, N> ptrs) */
 
 #ifdef __cplusplus
 } /* extern "C" */

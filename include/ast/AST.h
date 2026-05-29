@@ -88,7 +88,8 @@ enum class CompilerDirective : uint8_t {
     Superoptimize,
     Polly,
     Simd,
-    Unsafe  // @unsafe directive or unsafe block
+    Tailcall,  // @tailcall directive — guarantees tail call optimization
+    Unsafe     // @unsafe directive or unsafe block
 };
 
 std::string compilerDirectiveToString(CompilerDirective d);

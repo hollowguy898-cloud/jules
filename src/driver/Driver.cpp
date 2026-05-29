@@ -571,6 +571,14 @@ bool Driver::runBackend() {
             cmd << " -fpass-plugin=" << pass_plugin;
         }
 
+        // PGO: profile-generate / profile-use flags for the backend compile step
+        if (profile_generate_) {
+            cmd << " -fprofile-generate";
+        }
+        if (!profile_use_.empty()) {
+            cmd << " -fprofile-use=" << profile_use_;
+        }
+
         cmd << " -c " << ir_file_path_;
 
         if (emit_type_ == EmitType::Assembly) {

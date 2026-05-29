@@ -68,9 +68,9 @@ private:
     // =======================================================================
     // Type helpers
     // =======================================================================
-    std::string llvmType(TypeId type) const;
-    std::string llvmReturnType(TypeId type, bool can_error) const;
-    std::string llvmParamType(TypeId type) const;
+    std::string llvmType(TypeId type);
+    std::string llvmReturnType(TypeId type, bool can_error);
+    std::string llvmParamType(TypeId type);
     std::string sanitizeName(const std::string& name) const;
     std::string zeroConstant(const std::string& llvm_type) const;
     bool        isAggregateType(TypeId type) const;
@@ -273,9 +273,41 @@ private:
         return info ? info->needs_alloca : false;
     }
 
+    // =======================================================================
+    // SROA (Scalar Replacement of Aggregates) helpers
+    //
+    // When a struct variable has sroa_eligible metadata, the IR generator
+    // decomposes it into individual SSA variables for each field instead
+    // of using alloca for the whole struct.
+    // =======================================================================
+
+    // Check if a variable is an SROA-decomposed variable
+    bool isSROAVariable(const std::string& name) const {
+        return sroa_vars_.count(name) > 0;
+    }
+
+    // Generate the SSA variable name for an SROA field
+    // e.g., sroaFieldName("p", "x") → "p.x"
+    static std::string sroaFieldName(const std::string& var_name,
+                                     const std::string& field_name) {
+        return var_name + "." + field_name;
+    }
+
+    // Track which variables are SROA'd and their field mappings.
+    // Key: original variable name (e.g., "p")
+    // Value: pair of (field_names, field_types) for the decomposed fields
+    struct SROAVarInfo {
+        std::string struct_type_name;          // e.g., "Point"
+        std::vector<std::string> field_names;  // e.g., {"x", "y"}
+        std::vector<TypeId> field_types;       // e.g., {f64, f64}
+    };
+    std::unordered_map<std::string, SROAVarInfo> sroa_vars_;
+
     // Determine if a variable should use SSA (scalar, non-address-taken)
     bool shouldUseSSA(TypeId type) const {
         if (!type) return false;
+        // SimdVector types use SSA — LLVM vectors are first-class SSA values
+        if (isa<SimdVectorType>(type)) return true;
         if (isAggregateType(type)) return false;
         // References and pointers are just ptr values — SSA friendly
         // Smart pointers: Box is ptr (SSA), Rc/Arc are aggregate (not SSA)
@@ -283,8 +315,9 @@ private:
             auto& sp = cast<SmartPointerType>(type);
             return sp.smartPointerKind() == SmartPointerKind::Box;
         }
-        // Error types are aggregates
-        if (isa<ErrorType>(type)) return false;
+        // Error types: niched (pointer/integer niche) are SSA-friendly scalars,
+        // struct fallback is an aggregate
+        if (isa<ErrorType>(type)) return !isAggregateType(type);
         return true;
     }
 
@@ -540,6 +573,7 @@ public:
     TypeId      current_fn_error_type_;  // BUG FIX: stored for correct default terminator
     bool        current_can_error_   = false;
     bool        current_fn_has_simd_ = false;
+    bool        current_fn_has_tailcall_ = false;  // @tailcall directive for current function
     std::string current_fn_name_;
     std::string current_ret_alloca_; // alloca for the aggregate return value
     std::string current_err_slot_;   // callee-side: name of the ptr %err_slot parameter

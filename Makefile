@@ -270,6 +270,17 @@ propeller-clean:
 	@bash $(PROPELLER) clean
 
 # ============================================================================
+# PGO (Profile-Guided Optimization) targets
+# ============================================================================
+
+# One-command PGO cycle
+# Usage: make pgo SOURCE=benchmarks/fibonacci.tth
+# Optional: ARGS="--iterations 1000" to pass arguments to the benchmark
+.PHONY: pgo
+pgo: $(TARGET)
+	@bash scripts/pgo.sh $(SOURCE) $(ARGS)
+
+# ============================================================================
 # Help
 # ============================================================================
 
@@ -303,6 +314,10 @@ help:
 	@echo "  propeller-optimize  - Phase 3: Rebuild with PGO + BB sections + lld"
 	@echo "  propeller-bench     - Benchmark: baseline vs PGO vs Propeller"
 	@echo "  propeller-clean     - Clean Propeller temp files"
+	@echo ""
+	@echo "PGO (Profile-Guided Optimization):"
+	@echo "  pgo                 - One-command PGO cycle: instrument -> profile -> optimize"
+	@echo "                        Usage: make pgo SOURCE=benchmarks/propeller_bench.tth"
 	@echo ""
 	@echo "Variables:"
 	@echo "  CXX       - C++ compiler (default: g++)"

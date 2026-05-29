@@ -1,5 +1,6 @@
 #pragma once
 
+#include "opt/PreLLVMPassBase.h"
 #include "metadata/MetaTypes.h"
 #include "ast/AST.h"
 #include "sema/Type.h"

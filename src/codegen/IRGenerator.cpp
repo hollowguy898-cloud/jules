@@ -66,8 +66,34 @@ bool IRGenerator::isAggregateType(TypeId type) const {
             auto& sp = cast<SmartPointerType>(type);
             return sp.smartPointerKind() != SmartPointerKind::Box;
         }
-        case TypeKind::Error:
-            return true;
+        case TypeKind::Error: {
+            // Niched error types (pointer niche or integer niche) are NOT
+            // aggregates — they're single scalar values. Only the struct
+            // fallback representation is an aggregate.
+            auto& err = cast<ErrorType>(type);
+            TypeId succ = err.successType();
+            if (succ && (isa<PointerType>(succ) || isa<ReferenceType>(succ) ||
+                         isa<MutReferenceType>(succ))) {
+                return false;  // Pointer niche: single ptr
+            }
+            if (succ && isa<SmartPointerType>(succ)) {
+                auto& sp = cast<SmartPointerType>(succ);
+                if (sp.smartPointerKind() == SmartPointerKind::Box) {
+                    return false;  // Box niche: single ptr
+                }
+                return true;  // Rc/Arc: aggregate struct
+            }
+            if (succ && isa<PrimitiveType>(succ)) {
+                auto& prim = cast<PrimitiveType>(succ);
+                if (prim.isInteger() && prim.bitWidth() <= 32) {
+                    return false;  // Integer niche: single i64
+                }
+                if (prim.isBool()) {
+                    return false;  // Bool niche: single i8
+                }
+            }
+            return true;  // Struct fallback: aggregate { T, i1 }
+        }
         case TypeKind::Stride:
         case TypeKind::Tensor:
             return true;
@@ -75,6 +101,8 @@ bool IRGenerator::isAggregateType(TypeId type) const {
             return true;  // shape is an array of i64 — aggregate
         case TypeKind::Poison:
             return false;
+        case TypeKind::SimdVector:
+            return false;  // Vectors are SSA-friendly — not aggregates
         default:
             return false;
     }
@@ -126,8 +154,34 @@ uint64_t IRGenerator::typeSizeBytes(TypeId type) const {
             auto& err = cast<ErrorType>(type);
             // BUG FIX: Guard against null success type
             if (err.successType().isNull()) return 2; // i1 flag + padding
-            uint64_t vs = typeSizeBytes(err.successType());
-            uint64_t va = typeAlignmentBytes(err.successType());
+            TypeId succ = err.successType();
+            // Niched representations are smaller:
+            // - Pointer niche: just a ptr (8 bytes)
+            // - Integer niche: i64 (8 bytes)
+            // - Bool niche: i8 (1 byte)
+            // - Struct fallback: { T, i1 }
+            if (succ && (isa<PointerType>(succ) || isa<ReferenceType>(succ) ||
+                         isa<MutReferenceType>(succ))) {
+                return 8;  // Pointer niche: single ptr
+            }
+            if (succ && isa<SmartPointerType>(succ)) {
+                auto& sp = cast<SmartPointerType>(succ);
+                if (sp.smartPointerKind() == SmartPointerKind::Box) {
+                    return 8;  // Box niche: single ptr
+                }
+            }
+            if (succ && isa<PrimitiveType>(succ)) {
+                auto& prim = cast<PrimitiveType>(succ);
+                if (prim.isInteger() && prim.bitWidth() <= 32) {
+                    return 8;  // Integer niche: i64
+                }
+                if (prim.isBool()) {
+                    return 1;  // Bool niche: i8
+                }
+            }
+            // Struct fallback: traditional { T, i1 }
+            uint64_t vs = typeSizeBytes(succ);
+            uint64_t va = typeAlignmentBytes(succ);
             if (va == 0) va = 1;
             vs = ((vs + va - 1) / va) * va;
             return vs + 1;
@@ -143,6 +197,11 @@ uint64_t IRGenerator::typeSizeBytes(TypeId type) const {
         case TypeKind::Opaque: {
             auto& ot = cast<OpaqueType>(type);
             return ot.sizeBytes();
+        }
+        // SimdVectorType: element_size * count
+        case TypeKind::SimdVector: {
+            auto& sv = cast<SimdVectorType>(type);
+            return sv.elementType().isNull() ? 0 : typeSizeBytes(sv.elementType()) * sv.count();
         }
         default: return 8;
     }
@@ -186,6 +245,16 @@ uint64_t IRGenerator::typeAlignmentBytes(TypeId type) const {
             auto& ot = cast<OpaqueType>(type);
             return std::max<uint64_t>(1, ot.sizeBytes() / 8);
         }
+        // SimdVectorType: vectors need 16/32-byte alignment for best perf
+        case TypeKind::SimdVector: {
+            auto& sv = cast<SimdVectorType>(type);
+            uint64_t elem_align = sv.elementType().isNull() ? 1 : typeAlignmentBytes(sv.elementType());
+            uint64_t natural = elem_align * sv.count();
+            // Vectors up to 16 bytes align to 16; larger align to 32
+            if (natural <= 16) return 16;
+            if (natural <= 32) return 32;
+            return 64;
+        }
         default:                     return 8;
     }
 }
@@ -193,7 +262,7 @@ uint64_t IRGenerator::typeAlignmentBytes(TypeId type) const {
 // ============================================================================
 // llvmType
 // ============================================================================
-std::string IRGenerator::llvmType(TypeId type) const {
+std::string IRGenerator::llvmType(TypeId type) {
     if (!type) return "ptr";
     switch (type->getKind()) {
         case TypeKind::Primitive: {
@@ -254,7 +323,53 @@ std::string IRGenerator::llvmType(TypeId type) const {
             auto key = type->toString();
             auto it = needed_types_.find(key);
             if (it != needed_types_.end()) return it->second.llvm_name;
-            std::string vt = llvmType(err.successType());
+            TypeId succ = err.successType();
+
+            // --- Niched representation for pointer-like types ---
+            // When the success type is a pointer/reference/Box, we can use a
+            // single ptr with the lowest bit as error flag (valid pointers are
+            // always aligned, so bit 0 = 0 on success, bit 0 = 1 on error).
+            if (succ && (isa<PointerType>(succ) || isa<ReferenceType>(succ) ||
+                         isa<MutReferenceType>(succ))) {
+                std::string ln = "%error.niched." + sanitizeName(succ->toString());
+                needed_types_[key] = {ln, "ptr"};  // Just a pointer
+                type_emit_order_.push_back(key);
+                return ln;
+            }
+            // Box<T> is also a pointer
+            if (succ && isa<SmartPointerType>(succ)) {
+                auto& sp = cast<SmartPointerType>(succ);
+                if (sp.smartPointerKind() == SmartPointerKind::Box) {
+                    std::string ln = "%error.niched." + sanitizeName(succ->toString());
+                    needed_types_[key] = {ln, "ptr"};
+                    type_emit_order_.push_back(key);
+                    return ln;
+                }
+            }
+
+            // --- Niched representation for small integers ---
+            // When the success type is an integer <= 32 bits, use i64 with
+            // the high bit as the error flag. This eliminates the { i32, i1 }
+            // struct (which has padding waste) in favor of a single i64.
+            if (succ && isa<PrimitiveType>(succ)) {
+                auto& prim = cast<PrimitiveType>(succ);
+                if (prim.isInteger() && prim.bitWidth() <= 32) {
+                    std::string ln = "%error.niched." + sanitizeName(succ->toString());
+                    needed_types_[key] = {ln, "i64"};
+                    type_emit_order_.push_back(key);
+                    return ln;
+                }
+                // Bool fits in i8 with high bit as error flag
+                if (prim.isBool()) {
+                    std::string ln = "%error.niched." + sanitizeName(succ->toString());
+                    needed_types_[key] = {ln, "i8"};
+                    type_emit_order_.push_back(key);
+                    return ln;
+                }
+            }
+
+            // --- Struct fallback for aggregates ---
+            std::string vt = llvmType(succ);
             return (vt == "void") ? "{ i1 }" : "{ " + vt + ", i1 }";
         }
         case TypeKind::Fn:
@@ -296,6 +411,14 @@ std::string IRGenerator::llvmType(TypeId type) const {
         if (it != needed_types_.end()) return it->second.llvm_name;
         return "%tensor." + sanitizeName(tt.toString());
     }
+    // SimdVectorType: emitted as LLVM vector type <N x T>
+    if (isa<SimdVectorType>(type)) {
+        auto& sv = cast<SimdVectorType>(type);
+        std::string elem_type = llvmType(sv.elementType());
+        uint32_t count = sv.count();
+        // LLVM vector type: <N x T>
+        return "<" + std::to_string(count) + " x " + elem_type + ">";
+    }
 
     return "ptr";
 }
@@ -306,7 +429,7 @@ std::string IRGenerator::llvmType(TypeId type) const {
 //   Zig-style: error-returning functions return just the success type;
 //   the error code is communicated via an out-parameter (ptr %err_slot).
 // ============================================================================
-std::string IRGenerator::llvmReturnType(TypeId type, bool can_error) const {
+std::string IRGenerator::llvmReturnType(TypeId type, bool can_error) {
     if (can_error) {
         if (!type || !isa<ErrorType>(type)) {
             // Defensive: error-returning function but type is not ErrorType
@@ -322,7 +445,7 @@ std::string IRGenerator::llvmReturnType(TypeId type, bool can_error) const {
 // ============================================================================
 // llvmParamType
 // ============================================================================
-std::string IRGenerator::llvmParamType(TypeId type) const {
+std::string IRGenerator::llvmParamType(TypeId type) {
     return llvmType(type);
 }
 
@@ -522,10 +645,49 @@ void IRGenerator::collectNeededTypes(TypeId type) {
             auto& err = cast<ErrorType>(type);
             TypeId st = err.successType();
             collectNeededTypes(st);
-            std::string vt = llvmType(st);
-            std::string body = (vt == "void") ? "{ i1 }" : "{ " + vt + ", i1 }";
+
+            // Determine niche representation for this error type
+            bool use_pointer_niche = st && (isa<PointerType>(st) || isa<ReferenceType>(st) ||
+                                            isa<MutReferenceType>(st));
+            bool use_box_niche = false;
+            if (st && isa<SmartPointerType>(st)) {
+                auto& sp = cast<SmartPointerType>(st);
+                use_box_niche = sp.smartPointerKind() == SmartPointerKind::Box;
+            }
+            bool use_integer_niche = false;
+            bool use_bool_niche = false;
+            if (st && isa<PrimitiveType>(st)) {
+                auto& prim = cast<PrimitiveType>(st);
+                if (prim.isInteger() && prim.bitWidth() <= 32) {
+                    use_integer_niche = true;
+                } else if (prim.isBool()) {
+                    use_bool_niche = true;
+                }
+            }
+
             std::string st_name = st.isNull() ? "unknown" : st->toString();
-            std::string ln = "%error." + sanitizeName(st_name);
+            std::string ln;
+            std::string body;
+
+            if (use_pointer_niche || use_box_niche) {
+                // Pointer niche: single ptr, error = low-bit-set sentinel
+                ln = "%error.niched." + sanitizeName(st_name);
+                body = "ptr";
+            } else if (use_integer_niche) {
+                // Integer niche: i64 with high bit as error flag
+                ln = "%error.niched." + sanitizeName(st_name);
+                body = "i64";
+            } else if (use_bool_niche) {
+                // Bool niche: i8 with high bit as error flag
+                ln = "%error.niched." + sanitizeName(st_name);
+                body = "i8";
+            } else {
+                // Struct fallback: traditional { T, i1 }
+                std::string vt = llvmType(st);
+                body = (vt == "void") ? "{ i1 }" : "{ " + vt + ", i1 }";
+                ln = "%error." + sanitizeName(st_name);
+            }
+
             needed_types_[key] = {ln, body};
             type_emit_order_.push_back(key);
             break;
@@ -644,6 +806,17 @@ void IRGenerator::emitRuntimeDecls() {
     }
     if (needed_runtime_.count("tether_deopt")) {
         module_out_ << "declare void @tether_deopt(i64, ptr) noreturn cold\n"; any = true;
+    }
+    // Optimized string equality — checks length first, then pointer
+    // equality (for interned strings), then falls back to memcmp.
+    // Returns i1 (bool).
+    if (needed_runtime_.count("tether_str_eq")) {
+        module_out_ << "declare i1 @tether_str_eq(ptr nocapture readonly, i64, ptr nocapture readonly, i64) nounwind readonly\n"; any = true;
+    }
+    // Zero-copy string slice — just adjusts pointer and length, no memcpy.
+    // Returns { ptr, i64 } (a slice).
+    if (needed_runtime_.count("tether_str_slice")) {
+        module_out_ << "declare { ptr, i64 } @tether_str_slice(ptr nocapture readonly, i64, i64, i64) nounwind readonly\n"; any = true;
     }
     if (any) module_out_ << "\n";
 }
@@ -1342,6 +1515,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     current_err_slot_.clear();
     caller_err_slot_.clear();
     current_fn_has_simd_ = fn->hasDirective(CompilerDirective::Simd);
+    current_fn_has_tailcall_ = fn->hasDirective(CompilerDirective::Tailcall);
     deopt_counter_ = 0;
     current_block_label_ = "entry";
 
@@ -1500,6 +1674,14 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     // Inlining attribute (alwaysinline / inlinehint)
     sig += inlining_attr;
 
+    // --- @tailcall directive: add "tail-call" function attribute ---
+    // When a function has @tailcall, we add the "tail-call" attribute to
+    // tell LLVM's optimizer to ensure tail call optimization. We also
+    // emit musttail on self-recursive calls (handled in CallExpr emission).
+    if (fn->hasDirective(CompilerDirective::Tailcall)) {
+        sig += " \"tail-call\"";
+    }
+
     // --- Metadata engine: hot/cold function attributes from L5 ---
     if (meta_map_) {
         auto* nm = meta_map_->get(fn);
@@ -1535,6 +1717,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
             case CompilerDirective::Superoptimize: key = "jules.superoptimize"; break;
             case CompilerDirective::Polly:         key = "jules.polly"; break;
             case CompilerDirective::Simd:          key = "jules.simd"; break;
+            case CompilerDirective::Tailcall:       key = "jules.tailcall"; break;
         }
         int id = getMetadataId(key);
         metadata_comment += " ; directive:" + key + " (!" + std::to_string(id) + ")";
@@ -1747,6 +1930,94 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             if (var_type.isNull() && vd.hasInit()) var_type = vd.init()->getType();
             std::string ll = llvmType(var_type);
 
+            // --- Pre-LLVM optimization: SROA (Scalar Replacement of Aggregates) ---
+            // If this variable has sroa_eligible metadata, decompose it into
+            // individual SSA variables for each field instead of using alloca.
+            if (meta_map_ && var_type && isa<StructType>(var_type)) {
+                const NodeMeta* nm = meta_map_->get(stmt);
+                if (nm && nm->sroa_eligible) {
+                    auto& st = cast<StructType>(var_type);
+                    // Register SROA mapping for this variable
+                    SROAVarInfo sroa_info;
+                    sroa_info.struct_type_name = st.name();
+
+                    // If there's an initializer, we need to extract each field's
+                    // value from the StructInitExpr.
+                    // First, emit the struct init to get a pointer to the value.
+                    // Then extract each field via GEP+load.
+                    std::string init_ptr;
+                    if (vd.hasInit()) {
+                        init_ptr = emitExpr(vd.init());
+                    }
+
+                    for (size_t fi = 0; fi < st.fields().size(); ++fi) {
+                        const auto& field = st.fields()[fi];
+                        std::string field_ssa_name = sroaFieldName(vd.name(), field.name);
+                        std::string field_ll = llvmType(field.type);
+
+                        sroa_info.field_names.push_back(field.name);
+                        sroa_info.field_types.push_back(field.type);
+
+                        if (vd.hasInit() && !init_ptr.empty()) {
+                            // Extract field value from the initialized struct
+                            std::string gep = nextReg();
+                            body_ss_ << "  " << gep << " = getelementptr " << ll
+                                     << ", ptr " << init_ptr << ", i32 0, i32 " << fi << "\n";
+                            if (isAggregateType(field.type)) {
+                                // Aggregate field — track as alloca pointer
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    "",            // current_value
+                                    field_ll,      // llvm_type
+                                    field.type,    // tether_type
+                                    true,          // needs_alloca
+                                    gep            // alloca_name (points into the struct)
+                                });
+                            } else {
+                                // Scalar field — load and track as SSA value
+                                std::string loaded = nextReg();
+                                body_ss_ << "  " << loaded << " = load " << field_ll
+                                         << ", ptr " << gep << "\n";
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    loaded,        // current_value
+                                    field_ll,      // llvm_type
+                                    field.type,    // tether_type
+                                    false,         // needs_alloca
+                                    ""             // alloca_name
+                                });
+                            }
+                        } else {
+                            // No initializer — zero-initialize each field
+                            if (isAggregateType(field.type)) {
+                                std::string aname = makeAllocaName(field_ssa_name);
+                                alloca_ss_ << "  " << aname << " = alloca " << field_ll << "\n";
+                                needed_runtime_.insert("memset");
+                                body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << aname
+                                         << ", i8 0, i64 " << typeSizeBytes(field.type)
+                                         << ", i1 false)\n";
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    "",            // current_value
+                                    field_ll,      // llvm_type
+                                    field.type,    // tether_type
+                                    true,          // needs_alloca
+                                    aname          // alloca_name
+                                });
+                            } else {
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    zeroConstant(field_ll),  // current_value
+                                    field_ll,                // llvm_type
+                                    field.type,              // tether_type
+                                    false,                   // needs_alloca
+                                    ""                       // alloca_name
+                                });
+                            }
+                        }
+                    }
+
+                    sroa_vars_[vd.name()] = std::move(sroa_info);
+                    break;  // SROA handled — skip the normal alloca path
+                }
+            }
+
             if (shouldUseSSA(var_type)) {
                 // SSA: track value directly, no alloca
                 std::string val;
@@ -1796,6 +2067,89 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             TypeId val_type = vd.declaredType();
             if (val_type.isNull() && vd.hasInit()) val_type = vd.init()->getType();
             std::string ll = llvmType(val_type);
+
+            // --- Pre-LLVM optimization: SROA (Scalar Replacement of Aggregates) ---
+            // If this variable has sroa_eligible metadata, decompose it into
+            // individual SSA variables for each field instead of using alloca.
+            if (meta_map_ && val_type && isa<StructType>(val_type)) {
+                const NodeMeta* nm = meta_map_->get(stmt);
+                if (nm && nm->sroa_eligible) {
+                    auto& st = cast<StructType>(val_type);
+                    // Register SROA mapping for this variable
+                    SROAVarInfo sroa_info;
+                    sroa_info.struct_type_name = st.name();
+
+                    // Emit the struct init to get a pointer to the value.
+                    std::string init_ptr;
+                    if (vd.hasInit()) {
+                        init_ptr = emitExpr(vd.init());
+                    }
+
+                    for (size_t fi = 0; fi < st.fields().size(); ++fi) {
+                        const auto& field = st.fields()[fi];
+                        std::string field_ssa_name = sroaFieldName(vd.name(), field.name);
+                        std::string field_ll = llvmType(field.type);
+
+                        sroa_info.field_names.push_back(field.name);
+                        sroa_info.field_types.push_back(field.type);
+
+                        if (vd.hasInit() && !init_ptr.empty()) {
+                            // Extract field value from the initialized struct
+                            std::string gep = nextReg();
+                            body_ss_ << "  " << gep << " = getelementptr " << ll
+                                     << ", ptr " << init_ptr << ", i32 0, i32 " << fi << "\n";
+                            if (isAggregateType(field.type)) {
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    "",            // current_value
+                                    field_ll,      // llvm_type
+                                    field.type,    // tether_type
+                                    true,          // needs_alloca
+                                    gep            // alloca_name
+                                });
+                            } else {
+                                std::string loaded = nextReg();
+                                body_ss_ << "  " << loaded << " = load " << field_ll
+                                         << ", ptr " << gep << "\n";
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    loaded,        // current_value
+                                    field_ll,      // llvm_type
+                                    field.type,    // tether_type
+                                    false,         // needs_alloca
+                                    ""             // alloca_name
+                                });
+                            }
+                        } else {
+                            // No initializer — zero-initialize each field
+                            if (isAggregateType(field.type)) {
+                                std::string aname = makeAllocaName(field_ssa_name);
+                                alloca_ss_ << "  " << aname << " = alloca " << field_ll << "\n";
+                                needed_runtime_.insert("memset");
+                                body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << aname
+                                         << ", i8 0, i64 " << typeSizeBytes(field.type)
+                                         << ", i1 false)\n";
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    "",            // current_value
+                                    field_ll,      // llvm_type
+                                    field.type,    // tether_type
+                                    true,          // needs_alloca
+                                    aname          // alloca_name
+                                });
+                            } else {
+                                registerVar(field_ssa_name, SSAVarInfo{
+                                    zeroConstant(field_ll),  // current_value
+                                    field_ll,                // llvm_type
+                                    field.type,              // tether_type
+                                    false,                   // needs_alloca
+                                    ""                       // alloca_name
+                                });
+                            }
+                        }
+                    }
+
+                    sroa_vars_[vd.name()] = std::move(sroa_info);
+                    break;  // SROA handled — skip the normal alloca path
+                }
+            }
 
             if (shouldUseSSA(val_type)) {
                 // SSA: track value directly, no alloca
@@ -2567,6 +2921,79 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         return reg;
     }
 
+    // ========================================================================
+    // Comptime-evaluated expression: emit the precomputed constant value
+    // instead of the full expression tree. This eliminates entire categories
+    // of runtime computation — the Zig philosophy: if it can be computed at
+    // compile time, it IS computed at compile time.
+    // ========================================================================
+    if (meta_map_) {
+        const NodeMeta* nm = meta_map_->get(expr);
+        if (nm && nm->comptime_evaluated) {
+            TypeId ty = expr->getType();
+            std::string ll_type = ty ? llvmType(ty) : "i64";
+
+            // Int comptime value
+            if (nm->comptime_int_value != 0 || (ty && ty->isInteger())) {
+                // Check if it's actually an int type (not just default 0)
+                // We use a heuristic: if the type is integer or the value is non-zero
+                // or the type is bool, treat as int
+                if (ty && (ty->isInteger() || ty->isBool())) {
+                    if (ty->isBool()) {
+                        return nm->comptime_bool_value ? "true" : "false";
+                    }
+                    // Integer constant
+                    if (ty->isFloat()) {
+                        // Int stored as float context
+                        double d = static_cast<double>(nm->comptime_int_value);
+                        uint64_t bits;
+                        std::memcpy(&bits, &d, sizeof(d));
+                        std::ostringstream oss;
+                        oss << "0x" << std::hex << std::setfill('0') << std::setw(16) << bits;
+                        return oss.str();
+                    }
+                    return std::to_string(nm->comptime_int_value);
+                }
+            }
+
+            // Float comptime value
+            if (ty && ty->isFloat()) {
+                double d = nm->comptime_float_value;
+                uint64_t bits;
+                std::memcpy(&bits, &d, sizeof(d));
+                std::ostringstream oss;
+                oss << "0x" << std::hex << std::setfill('0') << std::setw(16) << bits;
+                return oss.str();
+            }
+
+            // Bool comptime value (for bool-typed expressions)
+            if (ty && ty->isBool()) {
+                return nm->comptime_bool_value ? "true" : "false";
+            }
+
+            // String comptime value
+            if (!nm->comptime_string_value.empty()) {
+                const std::string& s = nm->comptime_string_value;
+                auto it = string_constants_.find(s);
+                int idx;
+                if (it != string_constants_.end()) {
+                    idx = it->second;
+                } else {
+                    idx = string_counter_++;
+                    string_constants_[s] = idx;
+                }
+                std::string reg = nextReg();
+                size_t len = s.size() + 1;
+                body_ss_ << "  " << reg << " = getelementptr [" << len << " x i8], ptr @.str."
+                         << idx << ", i64 0, i64 0 ; comptime string\n";
+                return reg;
+            }
+
+            // Fallback: if comptime_evaluated is set but we couldn't determine
+            // the value type, fall through to normal codegen
+        }
+    }
+
     switch (expr->getKind()) {
 
     // ========================================================================
@@ -2606,9 +3033,11 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     case NodeKind::StringLiteral: {
         auto& lit = cast<StringLiteral>(*expr);
         const std::string& s = lit.value();
+
         auto it = string_constants_.find(s);
         int idx;
         if (it != string_constants_.end()) {
+            // String constant deduplication: reuse existing global constant
             idx = it->second;
         } else {
             idx = string_counter_++;
@@ -2780,6 +3209,75 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         // the operand type.
         TypeId operand_type;
         bool is_cmp = (op >= BinaryOp::Eq && op <= BinaryOp::Ge);
+
+        // ---- String slice comparison optimization ----
+        // When comparing two string slices ([]u8) with == or !=, use the
+        // optimized tether_str_eq runtime function which checks length first,
+        // then pointer equality (for interned strings), then falls back to
+        // memcmp. This makes interned string comparison O(1).
+        if (is_cmp && (op == BinaryOp::Eq || op == BinaryOp::Ne)) {
+            auto isStringSlice = [](TypeId t) -> bool {
+                if (!t || !isa<SliceType>(t)) return false;
+                TypeId elem = cast<SliceType>(t).element();
+                if (elem.isNull() || !isa<PrimitiveType>(elem)) return false;
+                return cast<PrimitiveType>(elem).primitiveKind() == PrimitiveKind::U8;
+            };
+
+            bool lhs_is_string_slice = isStringSlice(lhs_type);
+            bool rhs_is_string_slice = isStringSlice(rhs_type);
+
+            if (lhs_is_string_slice && rhs_is_string_slice) {
+                // Emit call to tether_str_eq(ptr, len, ptr, len) -> i1
+                // Both operands are slice values: { ptr, i64 }
+                // We need to extract the ptr and len from each slice.
+                std::string lhs_alloca = emitLValue(bin.left());
+                std::string rhs_alloca = emitLValue(bin.right());
+
+                // Extract lhs.ptr
+                std::string lhs_ptr_ptr = nextReg();
+                body_ss_ << "  " << lhs_ptr_ptr << " = getelementptr { ptr, i64 }, ptr "
+                         << lhs_alloca << ", i32 0, i32 0\n";
+                std::string lhs_ptr = nextReg();
+                body_ss_ << "  " << lhs_ptr << " = load ptr, ptr " << lhs_ptr_ptr << "\n";
+
+                // Extract lhs.len
+                std::string lhs_len_ptr = nextReg();
+                body_ss_ << "  " << lhs_len_ptr << " = getelementptr { ptr, i64 }, ptr "
+                         << lhs_alloca << ", i32 0, i32 1\n";
+                std::string lhs_len = nextReg();
+                body_ss_ << "  " << lhs_len << " = load i64, ptr " << lhs_len_ptr << "\n";
+
+                // Extract rhs.ptr
+                std::string rhs_ptr_ptr = nextReg();
+                body_ss_ << "  " << rhs_ptr_ptr << " = getelementptr { ptr, i64 }, ptr "
+                         << rhs_alloca << ", i32 0, i32 0\n";
+                std::string rhs_ptr = nextReg();
+                body_ss_ << "  " << rhs_ptr << " = load ptr, ptr " << rhs_ptr_ptr << "\n";
+
+                // Extract rhs.len
+                std::string rhs_len_ptr = nextReg();
+                body_ss_ << "  " << rhs_len_ptr << " = getelementptr { ptr, i64 }, ptr "
+                         << rhs_alloca << ", i32 0, i32 1\n";
+                std::string rhs_len = nextReg();
+                body_ss_ << "  " << rhs_len << " = load i64, ptr " << rhs_len_ptr << "\n";
+
+                // Call tether_str_eq
+                needed_runtime_.insert("tether_str_eq");
+                std::string eq_result = nextReg();
+                body_ss_ << "  " << eq_result << " = call i1 @tether_str_eq(ptr "
+                         << lhs_ptr << ", i64 " << lhs_len << ", ptr "
+                         << rhs_ptr << ", i64 " << rhs_len << ")\n";
+
+                // For !=, invert the result
+                if (op == BinaryOp::Ne) {
+                    std::string ne_result = nextReg();
+                    body_ss_ << "  " << ne_result << " = xor i1 " << eq_result << ", true\n";
+                    return ne_result;
+                }
+                return eq_result;
+            }
+        }
+
         if (is_cmp) {
             // For comparisons, determine the operand type from the common type
             // of the two operands. If they differ, use the larger type
@@ -2967,12 +3465,34 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             body_ss_ << "  fence acquire ; [opaque barrier] before FFI call\n";
         }
 
+        // --- @tailcall directive: emit musttail for self-recursive calls ---
+        // When the current function has @tailcall and this call is a
+        // self-recursive call (calling the current function), emit
+        // `musttail call` instead of `call`. This guarantees TCO at the
+        // LLVM level — if LLVM can't satisfy it, it's a compile error.
+        bool is_self_recursive_tailcall = false;
+        if (current_fn_name_ == std::string(dyn_cast<IdentExpr>(callee_expr) ?
+                     dyn_cast<IdentExpr>(callee_expr)->name() : "")) {
+            // Check if the current function has @tailcall directive
+            // We need to check the current FnDecl — we do this by checking
+            // if the current function name matches and the directive is set
+            // (we set a flag at emitFnDecl entry based on the FnDecl)
+            is_self_recursive_tailcall = current_fn_has_tailcall_;
+        }
+
+        std::string call_keyword;
+        if (is_self_recursive_tailcall) {
+            call_keyword = "musttail call";
+        } else {
+            call_keyword = "call";
+        }
+
         // Emit the call — for void returns, don't assign to a register
         if (ret_ll == "void") {
-            body_ss_ << "  call void " << callee << "(";
+            body_ss_ << "  " << call_keyword << " void " << callee << "(";
         } else {
             result = nextReg();
-            body_ss_ << "  " << result << " = call " << ret_ll << " " << callee << "(";
+            body_ss_ << "  " << result << " = " << call_keyword << " " << ret_ll << " " << callee << "(";
         }
         for (size_t i = 0; i < arg_vals.size(); ++i) {
             if (i > 0) body_ss_ << ", ";
@@ -3038,6 +3558,32 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         {
             std::string soa_result = emitSoAAccessIfAnnotated(expr);
             if (!soa_result.empty()) return soa_result;
+        }
+
+        // --- Pre-LLVM optimization: SROA field access ---
+        // If the object of this MemberExpr is an SROA-decomposed variable
+        // (e.g., p.x where p is SROA'd), look up the field's SSA value
+        // directly instead of GEP+load.
+        if (mem.object()->getKind() == NodeKind::IdentExpr) {
+            auto& ident = cast<IdentExpr>(*mem.object());
+            if (isSROAVariable(ident.name())) {
+                std::string field_ssa = sroaFieldName(ident.name(), mem.field());
+                SSAVarInfo* info = lookupVar(field_ssa);
+                if (info) {
+                    if (info->needs_alloca) {
+                        // Aggregate field — return the alloca pointer
+                        if (isAggregateType(info->tether_type)) return info->alloca_name;
+                        std::string ll = info->llvm_type;
+                        std::string reg = nextReg();
+                        body_ss_ << "  " << reg << " = load " << ll << ", ptr "
+                                 << info->alloca_name << "\n";
+                        return reg;
+                    } else {
+                        // Scalar field — return the SSA value directly
+                        return info->current_value;
+                    }
+                }
+            }
         }
 
         // Smart pointer field access
@@ -3849,6 +4395,30 @@ std::string IRGenerator::emitLValue(Expr* expr) {
             auto& mem = cast<MemberExpr>(*expr);
             TypeId obj_type = mem.object()->getType();
 
+            // --- Pre-LLVM optimization: SROA field lvalue ---
+            // If the object is an SROA-decomposed variable, look up the
+            // field's alloca/pointer directly instead of GEP on the struct.
+            if (mem.object()->getKind() == NodeKind::IdentExpr) {
+                auto& ident = cast<IdentExpr>(*mem.object());
+                if (isSROAVariable(ident.name())) {
+                    std::string field_ssa = sroaFieldName(ident.name(), mem.field());
+                    SSAVarInfo* info = lookupVar(field_ssa);
+                    if (info) {
+                        if (info->needs_alloca) {
+                            return info->alloca_name;
+                        }
+                        // SSA-tracked scalar field — materialize an alloca
+                        std::string aname = makeAllocaName(field_ssa);
+                        alloca_ss_ << "  " << aname << " = alloca " << info->llvm_type << "\n";
+                        body_ss_ << "  store " << info->llvm_type << " " << info->current_value
+                                 << ", ptr " << aname << "\n";
+                        info->alloca_name = aname;
+                        info->needs_alloca = true;
+                        return aname;
+                    }
+                }
+            }
+
             // Pointer/reference deref
             if (obj_type && (isa<PointerType>(obj_type) || isa<ReferenceType>(obj_type) ||
                             isa<MutReferenceType>(obj_type))) {
@@ -4232,58 +4802,236 @@ void IRGenerator::emitArcDrop(const std::string& arc_ptr, TypeId pointee_type) {
 // ============================================================================
 std::string IRGenerator::emitErrorCheck(const std::string& result_ptr, TypeId error_type) {
     auto& err = cast<ErrorType>(error_type);
-    std::string vt = llvmType(err.successType());
+    TypeId succ = err.successType();
+    std::string vt = llvmType(succ);
 
-    // Zig-style: Check the err_slot for errors instead of extracting from
-    // a return struct.  The caller_err_slot_ was set by the CallExpr handler.
-    std::string err_code = nextReg();
-    body_ss_ << "  " << err_code << " = load i32, ptr " << caller_err_slot_ << "\n";
-    std::string ef = nextReg();
-    body_ss_ << "  " << ef << " = icmp ne i32 " << err_code << ", 0\n";
-
-    std::string err_l = nextLabel("error.propagate");
-    std::string ok_l  = nextLabel("error.ok");
-    // Error paths are cold: annotate with branch weight metadata so LLVM
-    // places error blocks in cold sections and optimizes the happy path.
-    int prof_id = getBranchWeightMetadataId(1, 10000);
-    body_ss_ << "  br i1 " << ef << ", label %" << err_l << ", label %" << ok_l
-             << ", !prof !" << prof_id << "\n";
-
-    // Error block
-    body_ss_ << err_l << ":\n";
-    setTerminated(false);
-    emitDeferBlocks();
-    if (current_can_error_) {
-        // Zig-style: store error code to current function's err_slot
-        // and return zero/poison of the success type
-        body_ss_ << "  store i32 " << err_code << ", ptr " << current_err_slot_ << "\n";
-        std::string crt = llvmType(current_return_type_);
-        if (crt == "void") {
-            body_ss_ << "  ret void\n";
-        } else {
-            body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
-        }
-    } else {
-        // Non-error-returning function — return zero of the actual return type
-        if (current_return_type_ && !current_return_type_->isVoid()) {
-            std::string rt = llvmType(current_return_type_);
-            body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
-        } else {
-            body_ss_ << "  ret void\n";
+    // Determine if this error type uses niche optimization
+    bool use_pointer_niche = succ && (isa<PointerType>(succ) || isa<ReferenceType>(succ) ||
+                                      isa<MutReferenceType>(succ));
+    bool use_box_niche = false;
+    if (succ && isa<SmartPointerType>(succ)) {
+        auto& sp = cast<SmartPointerType>(succ);
+        use_box_niche = sp.smartPointerKind() == SmartPointerKind::Box;
+    }
+    bool use_integer_niche = false;
+    bool use_bool_niche = false;
+    if (succ && isa<PrimitiveType>(succ)) {
+        auto& prim = cast<PrimitiveType>(succ);
+        if (prim.isInteger() && prim.bitWidth() <= 32) {
+            use_integer_niche = true;
+        } else if (prim.isBool()) {
+            use_bool_niche = true;
         }
     }
-    setTerminated(true);
 
-    // OK block
-    body_ss_ << ok_l << ":\n";
-    setTerminated(false);
+    if (use_pointer_niche || use_box_niche) {
+        // ====================================================================
+        // Pointer niche: check if the lowest bit of the pointer is set
+        // Valid pointers are always aligned, so bit 0 = 0 on success,
+        // bit 0 = 1 on error (sentinel value).
+        // ====================================================================
+        std::string ptr_val = nextReg();
+        body_ss_ << "  " << ptr_val << " = load ptr, ptr " << result_ptr << "\n";
+        std::string intptr_val = nextReg();
+        body_ss_ << "  " << intptr_val << " = ptrtoint ptr " << ptr_val << " to i64\n";
+        std::string ef = nextReg();
+        body_ss_ << "  " << ef << " = icmp ne i64 " << intptr_val << ", 0\n";
+        // Actually: check the low bit — error if bit 0 is set
+        std::string low_bit = nextReg();
+        body_ss_ << "  " << low_bit << " = and i64 " << intptr_val << ", 1\n";
+        std::string ef2 = nextReg();
+        body_ss_ << "  " << ef2 << " = icmp ne i64 " << low_bit << ", 0\n";
 
-    if (vt == "void") return "";
-    // result_ptr is a pointer to an alloca containing the success value
-    if (isAggregateType(err.successType())) return result_ptr;
-    std::string vr = nextReg();
-    body_ss_ << "  " << vr << " = load " << vt << ", ptr " << result_ptr << "\n";
-    return vr;
+        std::string err_l = nextLabel("error.propagate");
+        std::string ok_l  = nextLabel("error.ok");
+        int prof_id = getBranchWeightMetadataId(1, 10000);
+        body_ss_ << "  br i1 " << ef2 << ", label %" << err_l << ", label %" << ok_l
+                 << ", !prof !" << prof_id << "\n";
+
+        // Error block: extract error code from the pointer (bits 1..31 shifted right)
+        body_ss_ << err_l << ":\n";
+        setTerminated(false);
+        emitDeferBlocks();
+        std::string err_code = nextReg();
+        body_ss_ << "  " << err_code << " = lshr i64 " << intptr_val << ", 1\n";
+        std::string err_code_i32 = nextReg();
+        body_ss_ << "  " << err_code_i32 << " = trunc i64 " << err_code << " to i32\n";
+        if (current_can_error_) {
+            body_ss_ << "  store i32 " << err_code_i32 << ", ptr " << current_err_slot_ << "\n";
+            std::string crt = llvmType(current_return_type_);
+            if (crt == "void") {
+                body_ss_ << "  ret void\n";
+            } else {
+                body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
+            }
+        } else {
+            if (current_return_type_ && !current_return_type_->isVoid()) {
+                std::string rt = llvmType(current_return_type_);
+                body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
+            } else {
+                body_ss_ << "  ret void\n";
+            }
+        }
+        setTerminated(true);
+
+        // OK block: return the pointer value as-is (it's a valid pointer)
+        body_ss_ << ok_l << ":\n";
+        setTerminated(false);
+        return ptr_val;
+
+    } else if (use_integer_niche) {
+        // ====================================================================
+        // Integer niche: check if the high bit of the i64 is set
+        // Success values fit in the lower 32 bits, error has the 63rd bit set.
+        // ====================================================================
+        std::string ival = nextReg();
+        body_ss_ << "  " << ival << " = load i64, ptr " << result_ptr << "\n";
+        std::string high_bit = nextReg();
+        body_ss_ << "  " << high_bit << " = ashr i64 " << ival << ", 63\n";
+        std::string ef = nextReg();
+        body_ss_ << "  " << ef << " = icmp ne i64 " << high_bit << ", 0\n";
+
+        std::string err_l = nextLabel("error.propagate");
+        std::string ok_l  = nextLabel("error.ok");
+        int prof_id = getBranchWeightMetadataId(1, 10000);
+        body_ss_ << "  br i1 " << ef << ", label %" << err_l << ", label %" << ok_l
+                 << ", !prof !" << prof_id << "\n";
+
+        // Error block: extract error code from lower 32 bits
+        body_ss_ << err_l << ":\n";
+        setTerminated(false);
+        emitDeferBlocks();
+        std::string err_code = nextReg();
+        body_ss_ << "  " << err_code << " = trunc i64 " << ival << " to i32\n";
+        if (current_can_error_) {
+            body_ss_ << "  store i32 " << err_code << ", ptr " << current_err_slot_ << "\n";
+            std::string crt = llvmType(current_return_type_);
+            if (crt == "void") {
+                body_ss_ << "  ret void\n";
+            } else {
+                body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
+            }
+        } else {
+            if (current_return_type_ && !current_return_type_->isVoid()) {
+                std::string rt = llvmType(current_return_type_);
+                body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
+            } else {
+                body_ss_ << "  ret void\n";
+            }
+        }
+        setTerminated(true);
+
+        // OK block: truncate i64 to the actual integer type
+        body_ss_ << ok_l << ":\n";
+        setTerminated(false);
+        std::string result = nextReg();
+        body_ss_ << "  " << result << " = trunc i64 " << ival << " to " << vt << "\n";
+        return result;
+
+    } else if (use_bool_niche) {
+        // ====================================================================
+        // Bool niche: check if the high bit of the i8 is set
+        // Success: 0 or 1 in the lower bit, error has bit 7 set.
+        // ====================================================================
+        std::string ival = nextReg();
+        body_ss_ << "  " << ival << " = load i8, ptr " << result_ptr << "\n";
+        std::string high_bit = nextReg();
+        body_ss_ << "  " << high_bit << " = ashr i8 " << ival << ", 7\n";
+        std::string ef = nextReg();
+        body_ss_ << "  " << ef << " = icmp ne i8 " << high_bit << ", 0\n";
+
+        std::string err_l = nextLabel("error.propagate");
+        std::string ok_l  = nextLabel("error.ok");
+        int prof_id = getBranchWeightMetadataId(1, 10000);
+        body_ss_ << "  br i1 " << ef << ", label %" << err_l << ", label %" << ok_l
+                 << ", !prof !" << prof_id << "\n";
+
+        // Error block
+        body_ss_ << err_l << ":\n";
+        setTerminated(false);
+        emitDeferBlocks();
+        std::string err_code = nextReg();
+        body_ss_ << "  " << err_code << " = zext i8 " << ival << " to i32\n";
+        if (current_can_error_) {
+            body_ss_ << "  store i32 " << err_code << ", ptr " << current_err_slot_ << "\n";
+            std::string crt = llvmType(current_return_type_);
+            if (crt == "void") {
+                body_ss_ << "  ret void\n";
+            } else {
+                body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
+            }
+        } else {
+            if (current_return_type_ && !current_return_type_->isVoid()) {
+                std::string rt = llvmType(current_return_type_);
+                body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
+            } else {
+                body_ss_ << "  ret void\n";
+            }
+        }
+        setTerminated(true);
+
+        // OK block: truncate to i1
+        body_ss_ << ok_l << ":\n";
+        setTerminated(false);
+        std::string result = nextReg();
+        body_ss_ << "  " << result << " = trunc i8 " << ival << " to i1\n";
+        return result;
+
+    } else {
+        // ====================================================================
+        // Struct fallback: traditional err_slot check (Zig-style)
+        // ====================================================================
+        // Zig-style: Check the err_slot for errors instead of extracting from
+        // a return struct.  The caller_err_slot_ was set by the CallExpr handler.
+        std::string err_code = nextReg();
+        body_ss_ << "  " << err_code << " = load i32, ptr " << caller_err_slot_ << "\n";
+        std::string ef = nextReg();
+        body_ss_ << "  " << ef << " = icmp ne i32 " << err_code << ", 0\n";
+
+        std::string err_l = nextLabel("error.propagate");
+        std::string ok_l  = nextLabel("error.ok");
+        // Error paths are cold: annotate with branch weight metadata so LLVM
+        // places error blocks in cold sections and optimizes the happy path.
+        int prof_id = getBranchWeightMetadataId(1, 10000);
+        body_ss_ << "  br i1 " << ef << ", label %" << err_l << ", label %" << ok_l
+                 << ", !prof !" << prof_id << "\n";
+
+        // Error block
+        body_ss_ << err_l << ":\n";
+        setTerminated(false);
+        emitDeferBlocks();
+        if (current_can_error_) {
+            // Zig-style: store error code to current function's err_slot
+            // and return zero/poison of the success type
+            body_ss_ << "  store i32 " << err_code << ", ptr " << current_err_slot_ << "\n";
+            std::string crt = llvmType(current_return_type_);
+            if (crt == "void") {
+                body_ss_ << "  ret void\n";
+            } else {
+                body_ss_ << "  ret " << crt << " " << zeroConstant(crt) << "\n";
+            }
+        } else {
+            // Non-error-returning function — return zero of the actual return type
+            if (current_return_type_ && !current_return_type_->isVoid()) {
+                std::string rt = llvmType(current_return_type_);
+                body_ss_ << "  ret " << rt << " " << zeroConstant(rt) << "\n";
+            } else {
+                body_ss_ << "  ret void\n";
+            }
+        }
+        setTerminated(true);
+
+        // OK block
+        body_ss_ << ok_l << ":\n";
+        setTerminated(false);
+
+        if (vt == "void") return "";
+        // result_ptr is a pointer to an alloca containing the success value
+        if (isAggregateType(err.successType())) return result_ptr;
+        std::string vr = nextReg();
+        body_ss_ << "  " << vr << " = load " << vt << ", ptr " << result_ptr << "\n";
+        return vr;
+    }
 }
 
 // ============================================================================

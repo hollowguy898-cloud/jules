@@ -27,7 +27,9 @@ static void printUsage(const char* prog_name) {
         << "  --emit-ir         Emit LLVM IR (.ll)\n"
         << "  --emit-exe        Emit an executable (default)\n"
         << "  --profile-generate  Generate PGO profile data (-fprofile-generate)\n"
+        << "  --pgo-generate      Alias for --profile-generate\n"
         << "  --profile-use <path> Use PGO profile data (-fprofile-use)\n"
+        << "  --pgo-use <path>     Alias for --profile-use\n"
         << "  --target <triple>  Cross-compilation target (x86_64, aarch64, riscv64, wasm32)\n"
         << "  -v                Verbose mode (print each phase)\n"
         << "  --help            Show this help message\n"
@@ -38,7 +40,17 @@ static void printUsage(const char* prog_name) {
         << "  " << prog_name << " --emit-ir hello.tth            # Emit LLVM IR to hello.ll\n"
         << "  " << prog_name << " --emit-asm -v hello.tth        # Emit assembly with verbose output\n"
         << "  " << prog_name << " --profile-generate hello.tth   # Generate PGO profile\n"
+        << "  " << prog_name << " --pgo-generate hello.tth       # Same as --profile-generate\n"
         << "  " << prog_name << " --target aarch64 hello.tth     # Cross-compile for AArch64\n"
+        << "  " << prog_name << " --pgo-use=profdata hello.tth   # Use PGO profile data\n"
+        << "\n"
+        << "PGO Quick Start:\n"
+        << "  1. ./scripts/pgo.sh hello.tth            # One-command PGO cycle\n"
+        << "  2. Or manually:\n"
+        << "     a) " << prog_name << " --pgo-generate hello.tth    # Instrument\n"
+        << "     b) LLVM_PROFILE_FILE=prof.raw ./hello   # Run workload\n"
+        << "     c) llvm-profdata merge -o prof.profdata prof.raw\n"
+        << "     d) " << prog_name << " --pgo-use=prof.profdata hello.tth  # Recompile\n"
         << std::endl;
 }
 
@@ -108,12 +120,32 @@ int main(int argc, char* argv[]) {
         else if (arg == "--profile-generate") {
             profile_generate = true;
         }
+        else if (arg == "--pgo-generate") {
+            // Alias for --profile-generate
+            profile_generate = true;
+        }
         else if (arg == "--profile-use") {
             if (i + 1 >= argc) {
                 std::cerr << "error: --profile-use requires an argument" << std::endl;
                 return 1;
             }
             profile_use = argv[++i];
+        }
+        else if (arg == "--pgo-use") {
+            // Alias for --profile-use
+            if (i + 1 >= argc) {
+                std::cerr << "error: --pgo-use requires an argument" << std::endl;
+                return 1;
+            }
+            profile_use = argv[++i];
+        }
+        else if (arg.rfind("--pgo-use=", 0) == 0) {
+            // --pgo-use=<path> form
+            profile_use = arg.substr(10);
+        }
+        else if (arg.rfind("--profile-use=", 0) == 0) {
+            // --profile-use=<path> form
+            profile_use = arg.substr(14);
         }
         else if (arg == "--target") {
             if (i + 1 >= argc) {

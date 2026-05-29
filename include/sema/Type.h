@@ -63,7 +63,8 @@ enum class TypeKind : uint8_t {
     Aligned,
     Shape,
     Stride,
-    Tensor
+    Tensor,
+    SimdVector
 };
 
 // ============================================================================
@@ -123,6 +124,7 @@ class AlignedType;
 class ShapeType;
 class StrideType;
 class TensorType;
+class SimdVectorType;
 
 // ============================================================================
 // Type base class
@@ -942,6 +944,52 @@ private:
 };
 
 // ============================================================================
+// SimdVectorType - represents a SIMD vector type simd<T, N>
+//
+// simd<f32, 4> (or f32x4), simd<i32, 8> (or i32x8), etc.
+// Maps directly to LLVM's vector type <N x T> for maximum performance.
+// Vector types are SSA-friendly (not aggregates) and use LLVM's native
+// vector instructions for arithmetic, comparison, and shuffles.
+//
+// Valid lane counts: 2, 4, 8, 16, 32 (must be power-of-2)
+// Element types: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64
+// ============================================================================
+class SimdVectorType : public Type {
+public:
+    static bool classof(const Type* t) {
+        return t->getKind() == TypeKind::SimdVector;
+    }
+
+    SimdVectorType(TypeId element, uint32_t count)
+        : Type(TypeKind::SimdVector)
+        , element_(element)
+        , count_(count)
+    {}
+
+    TypeId elementType() const { return element_; }
+    uint32_t count() const { return count_; }
+
+    std::string toString() const override {
+        return "simd<" + (element_ ? element_->toString() : "?") +
+               ", " + std::to_string(count_) + ">";
+    }
+
+    uint64_t bitWidth() const override {
+        return element_ ? element_->bitWidth() * count_ : 0;
+    }
+
+    bool isNumeric() const override { return element_ ? element_->isNumeric() : false; }
+    bool isFloat() const override { return element_ ? element_->isFloat() : false; }
+    bool isInteger() const override { return element_ ? element_->isInteger() : false; }
+    bool isSigned() const override { return element_ ? element_->isSigned() : false; }
+    bool isUnsigned() const override { return element_ ? element_->isUnsigned() : false; }
+
+private:
+    TypeId element_;
+    uint32_t count_;
+};
+
+// ============================================================================
 // Type casting helpers (LLVM-style RTTI)
 // ============================================================================
 template<typename T>
@@ -1287,6 +1335,23 @@ public:
             return TypeId(it->second.get());
         }
         auto type = std::make_unique<TensorType>(element_type, shape, stride);
+        Type* raw = type.get();
+        type_map_[std::move(key)] = std::move(type);
+        return TypeId(raw);
+    }
+
+    // -----------------------------------------------------------------------
+    // Intern a SIMD vector type: simd<T, N>
+    // T must be a numeric primitive, N must be a power-of-2 (2,4,8,16,32)
+    // -----------------------------------------------------------------------
+    TypeId getSimdVector(TypeId element, uint32_t count) {
+        SimdVectorType temp(element, count);
+        std::string key = temp.toString();
+        auto it = type_map_.find(key);
+        if (it != type_map_.end()) {
+            return TypeId(it->second.get());
+        }
+        auto type = std::make_unique<SimdVectorType>(element, count);
         Type* raw = type.get();
         type_map_[std::move(key)] = std::move(type);
         return TypeId(raw);

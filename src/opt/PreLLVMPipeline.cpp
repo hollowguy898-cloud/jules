@@ -4,11 +4,14 @@
 #include "opt/ErrorPathSeparator.h"
 #include "opt/AllocatorLowerer.h"
 #include "opt/DeferCoalescer.h"
+#include "opt/SROAPass.h"
 #include "opt/PrefetchInserter.h"
 #include "opt/YieldPointInserter.h"
 #include "opt/OpaqueBarrier.h"
 #include "opt/HotColdSplitter.h"
 #include "opt/EscapeAnalysis.h"
+#include "opt/NichedErrorPass.h"
+#include "opt/AllocFusionPass.h"
 
 #include <sstream>
 #include <iostream>
@@ -109,7 +112,20 @@ PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table)
     // Defer coalescing — merges consecutive defer statements
     addPass(std::make_unique<DeferCoalescerPass>());
 
+    // SROA — scalar replacement of aggregates for small structs
+    // Must run AFTER DeferCoalescer and BEFORE AllocatorLowerer
+    addPass(std::make_unique<SROAPass>());
+
+    // Niched error type optimization — use pointer/integer niche encoding
+    // instead of { T, i1 } for error types. Must run BEFORE codegen so
+    // the IRGenerator knows which representation to use.
+    addPass(std::make_unique<NichedErrorPass>());
+
     if (level_ == PreLLVMOptLevel::Aggressive) {
+        // Allocation fusion — batch consecutive Box allocations
+        // Must run BEFORE AllocatorLowerer (fusion takes priority over arena)
+        addPass(std::make_unique<AllocFusionPass>());
+
         // Allocator lowering — inlines arena bump allocation
         // Must run AFTER EscapeAnalysis (needs escape analysis results)
         addPass(std::make_unique<AllocatorLowererPass>());

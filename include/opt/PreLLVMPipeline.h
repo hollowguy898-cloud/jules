@@ -1,12 +1,10 @@
 #pragma once
 
-#include "ast/AST.h"
-#include "sema/Type.h"
+#include "opt/PreLLVMPassBase.h"
 #include "parser/Parser.h"
 
 #include <vector>
 #include <memory>
-#include "metadata/MetaTypes.h"
 #include "metadata/SemanticCollector.h"
 #include "metadata/ControlFlowSimplifier.h"
 #include "metadata/MemoryTopologyAnalyzer.h"
@@ -14,6 +12,7 @@
 #include "metadata/LLVMMetadataEmitter.h"
 #include "metadata/ProfileGuidedOptimizer.h"
 #include "opt/SpeculativeOptimizer.h"
+#include "opt/ComptimeEvaluator.h"
 
 #include <string>
 #include <unordered_map>
@@ -23,76 +22,37 @@
 namespace tether {
 
 // ============================================================================
-// Pre-LLVM Optimization Level
-// ============================================================================
-enum class PreLLVMOptLevel : uint8_t {
-    None = 0,       // No pre-LLVM optimizations
-    Basic = 1,      // Field reorder, defer coalesce, cold path annotation, opaque barrier
-    Aggressive = 2  // All passes including AoS->SoA, allocator lowering, prefetch, yield, hot/cold split
-};
-
-// ============================================================================
-// PassCategory — classifies passes into pipeline phases
+// ComptimeEvalPass — compile-time evaluation pass
 //
-// The unified pipeline runs passes in strict phase order:
-//   LayoutTransform  (Phase 3): Change data layout — hot/cold split, reorder, SoA
-//   TetherSpecific   (Phase 4): Tether semantics — error paths, barriers, defer, allocator
-//   IRHint           (Phase 5): LLVM IR hints — prefetch, yield points
-//
-// Within each phase, passes run in registration order.
+// Defined here because it inherits from PreLLVMPass (in PreLLVMPassBase.h)
+// and uses ComptimeEvaluator/ComptimeValue (in ComptimeEvaluator.h).
 // ============================================================================
-enum class PassCategory : uint8_t {
-    LayoutTransform,   // Phase 3: Data layout changes
-    TetherSpecific,    // Phase 4: Tether-specific semantic transforms
-    IRHint,            // Phase 5: LLVM IR annotation hints
-};
-
-// ============================================================================
-// PreLLVMPass - base class for all pre-LLVM optimization passes
-//
-// These passes run on the AST BEFORE LLVM IR emission. They perform
-// transformations that LLVM cannot do because they require semantic
-// knowledge that is lost once we lower to LLVM IR.
-//
-// UNIFIED PIPELINE: All passes write to MetadataMap only.
-// The old ASTAnnotationMap dual-channel has been eliminated.
-//
-// Each pass declares its category so the pipeline can route it to the
-// correct phase. This prevents ordering bugs like running allocator
-// lowering before escape analysis.
-// ============================================================================
-class PreLLVMPass {
+class ComptimeEvalPass : public PreLLVMPass {
 public:
-    virtual ~PreLLVMPass() = default;
+    std::string name() const override { return "ComptimeEval"; }
+    bool isRedundantWithLLVM() const override { return false; }
+    PassCategory category() const override { return PassCategory::TetherSpecific; }
+    bool run(Program& program, TypeTable& type_table) override;
 
-    // Human-readable name for logging
-    virtual std::string name() const = 0;
+    // Access the computed comptime values (for IRGenerator to use)
+    const std::unordered_map<const void*, ComptimeValue>& comptimeValues() const {
+        return comptime_values_;
+    }
 
-    // Run the pass on the program. Returns true if any transformation was made.
-    virtual bool run(Program& program, TypeTable& type_table) = 0;
+private:
+    std::unordered_map<const void*, ComptimeValue> comptime_values_;
+    ComptimeEvaluator evaluator_;
 
-    // Returns false by default - most pre-LLVM passes are explicitly NOT
-    // redundant with LLVM's own optimizations. Override and return true
-    // only if a pass does something LLVM already handles.
-    virtual bool isRedundantWithLLVM() const { return false; }
-
-    // Which phase this pass belongs to — determines execution order
-    virtual PassCategory category() const = 0;
-
-    // Set the metadata map for this pass to write typed metadata into
-    void setMetadataMap(MetadataMap* meta_map) { meta_map_ = meta_map; }
-
-protected:
-    MetadataMap* meta_map_ = nullptr;
-};
-
-// ============================================================================
-// PreLLVMPipelineResult - result of running the full pipeline
-// ============================================================================
-struct PreLLVMPipelineResult {
-    int passes_run = 0;
-    int transformations_made = 0;
-    std::vector<std::string> pass_log;
+    // Walk all top-level declarations
+    void processTopLevel(TopLevel* tl, TypeTable& tt, ComptimeEvalContext& ctx);
+    // Walk a function body for comptime expressions
+    void processFnBody(FnDecl* fn, TypeTable& tt, ComptimeEvalContext& ctx);
+    // Walk statements recursively
+    void processStmt(Stmt* stmt, TypeTable& tt, ComptimeEvalContext& ctx);
+    // Walk expressions recursively
+    void processExpr(Expr* expr, TypeTable& tt, ComptimeEvalContext& ctx);
+    // Store a comptime value in both the internal map and the MetadataMap
+    void storeComptimeValue(const void* node, const ComptimeValue& val);
 };
 
 // ============================================================================
@@ -156,6 +116,9 @@ private:
 
     // Speculative optimizer (nuclear option #8)
     SpeculativeOptimizerPass speculative_;
+
+    // Compile-time evaluation pass
+    std::unique_ptr<ComptimeEvalPass> comptime_eval_;
 
     // Pre-LLVM transform passes (the "Track 2" passes, now integrated)
     std::vector<std::unique_ptr<PreLLVMPass>> passes_;
