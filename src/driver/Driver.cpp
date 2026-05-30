@@ -276,7 +276,7 @@ bool Driver::runPreLLVMOptimizations() {
         return true;
     }
 
-    pipeline_ = std::make_unique<PreLLVMPipeline>(pre_level, type_table_);
+    pipeline_ = std::make_unique<PreLLVMPipeline>(pre_level, type_table_, opt_level_);
 
     // Load profile data if specified
     if (!profile_use_.empty()) {
@@ -448,7 +448,8 @@ bool Driver::runIRGeneration() {
     }
 
     IRGenerator generator(program_, type_table_,
-                           pipeline_ ? &pipeline_->metadata() : nullptr);
+                           pipeline_ ? &pipeline_->metadata() : nullptr,
+                           opt_level_);
     ir_text_ = generator.generate();
 
     if (ir_text_.empty()) {

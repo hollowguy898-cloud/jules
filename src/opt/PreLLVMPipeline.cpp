@@ -73,8 +73,8 @@ public:
 // correct interleaved order — they are NOT added as passes here because
 // they have a different calling convention (take MetadataMap& param).
 // ============================================================================
-PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table)
-    : level_(level), type_table_(type_table)
+PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table, int raw_opt_level)
+    : level_(level), raw_opt_level_(raw_opt_level), type_table_(type_table)
 {
     if (level_ == PreLLVMOptLevel::None) {
         return;
@@ -146,7 +146,13 @@ PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table)
 
         // Yield point insertion — for cooperative scheduling
         // Must be LAST transform — after all other transforms are complete
-        addPass(std::make_unique<YieldPointInserterPass>());
+        // At -O3 (raw_opt_level >= 3), skip yield points by default — they
+        // add 2-3x overhead from the counter load/store/and/cmp/branch.
+        // Users can opt in with @yield directive on specific functions.
+        // At -O2, yield points are still inserted for cooperative scheduling.
+        if (raw_opt_level_ < 3) {
+            addPass(std::make_unique<YieldPointInserterPass>());
+        }
     }
 }
 

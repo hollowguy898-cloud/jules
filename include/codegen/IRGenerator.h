@@ -57,7 +57,8 @@ public:
     // -----------------------------------------------------------------------
     IRGenerator(const std::vector<std::unique_ptr<TopLevel>>& program,
                 TypeTable& type_table,
-                MetadataMap* meta_map = nullptr);
+                MetadataMap* meta_map = nullptr,
+                int opt_level = 2);
 
     // -----------------------------------------------------------------------
     // Main entry point – returns the full LLVM IR module as a string
@@ -569,6 +570,7 @@ public:
     // =======================================================================
     // Current-function context
     // =======================================================================
+    int         opt_level_ = 2;          // LLVM optimization level (0-5) for codegen decisions
     TypeId      current_return_type_;
     TypeId      current_fn_error_type_;  // BUG FIX: stored for correct default terminator
     bool        current_can_error_   = false;

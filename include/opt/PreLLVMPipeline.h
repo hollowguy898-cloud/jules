@@ -79,7 +79,7 @@ private:
 // ============================================================================
 class PreLLVMPipeline {
 public:
-    PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table);
+    PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table, int raw_opt_level = 2);
 
     PreLLVMPipelineResult run(Program& program);
 
@@ -104,6 +104,7 @@ public:
 
 private:
     PreLLVMOptLevel level_;
+    int raw_opt_level_;  // Raw LLVM opt level (0-5) for fine-grained decisions
     TypeTable& type_table_;
     MetadataMap metadata_;
 
