@@ -116,7 +116,7 @@ private:
     // =======================================================================
     std::string emitExpr(Expr* expr);
     std::string emitLValue(Expr* expr);
-    void        emitBinaryOp(const std::string& result_reg,
+    std::string emitBinaryOp(const std::string& result_reg,
                              const std::string& ll_type,
                              const std::string& lhs,
                              BinaryOp op,
@@ -679,6 +679,11 @@ public:
     // a YieldPoint annotation. Uses a counter to only check every N iterations.
     // Assumes emitYieldCounterInitIfAnnotated was called earlier.
     void emitYieldCheckIfAnnotated(WhileStmt* loop);
+
+    // Look up a FnDecl by name in the program's top-level declarations.
+    // Returns nullptr if not found. Used to get parameter types for call
+    // argument type coercion (Bug 3 fix).
+    FnDecl* findFnDecl(const std::string& name) const;
 
     // Check if a FnDecl has an OpaqueBarrier annotation; if so, add
     // the appropriate function attributes and emit fences around calls.

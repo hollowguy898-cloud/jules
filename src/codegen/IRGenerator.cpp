@@ -2852,6 +2852,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             struct LoopPhiPatch {
                 std::string var_name;       // Variable name in SSA tracking
                 std::string placeholder;    // Unique token in body_ss_
+                std::string phi_reg;        // The phi result register (dominates exit block)
             };
             std::vector<LoopPhiPatch> phi_patches;
 
@@ -2873,7 +2874,7 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                          << " [ " << entry_val << ", %" << phi_entry_pred << " ]"
                          << ", [ " << placeholder << ", %" << body_l << " ]\n";
 
-                phi_patches.push_back({name, placeholder});
+                phi_patches.push_back({name, placeholder, phi_reg});
 
                 // Update the variable's SSA value to the phi result
                 updateVarValue(name, phi_reg);
@@ -3067,6 +3068,20 @@ void IRGenerator::emitStmt(Stmt* stmt) {
 
             emitBlockLabel(end_l);
             setTerminated(false);
+
+            // -----------------------------------------------------------------
+            // Bug Fix: After the loop, variables are accessed via the phi
+            // results (which dominate the exit block), NOT the body values.
+            // Without this, lookupVar returns a value from inside the loop
+            // body that doesn't dominate while.end — producing invalid IR.
+            // -----------------------------------------------------------------
+            for (auto& patch : phi_patches) {
+                SSAVarInfo* info = lookupVar(patch.var_name);
+                if (info) {
+                    info->current_value = patch.phi_reg;
+                }
+            }
+
             loop_stack_.pop_back();
             break;
         }
@@ -3633,8 +3648,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             std::string new_val;
             {
                 std::string reg = nextReg();
-                emitBinaryOp(reg, ll, lhs, base_op, rhs, target_type);
-                new_val = reg;
+                new_val = emitBinaryOp(reg, ll, lhs, base_op, rhs, target_type);
             }
 
             // Store the result
@@ -3767,8 +3781,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         }
 
         std::string reg = nextReg();
-        emitBinaryOp(reg, ll, lhs, op, rhs, operand_type);
-        return reg;
+        return emitBinaryOp(reg, ll, lhs, op, rhs, operand_type);
     }
 
     // ========================================================================
@@ -3862,6 +3875,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
         // Regular call
         std::string callee;
+        std::string mono_target;  // Monomorphized target name (accessible in outer scope for arg coercion)
         if (auto* ident = dyn_cast<IdentExpr>(callee_expr)) {
             // --- Built-in intrinsics ---
             // black_box(val) — optimization barrier for benchmarking
@@ -4169,7 +4183,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             // instead of the original name. The MonomorphizationPass records
             // concrete instantiations in the MetadataMap via the
             // monomorphized_target field on CallExpr nodes.
-            std::string mono_target;
+            mono_target.clear();
             if (meta_map_) {
                 const NodeMeta* nm = meta_map_->get(&call);
                 if (nm && !nm->monomorphized_target.empty()) {
@@ -4183,6 +4197,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             }
         } else {
             callee = emitExpr(callee_expr);
+            mono_target.clear();
         }
 
         // --- Pre-LLVM optimization: inline arena allocator lowering ---
@@ -4217,6 +4232,28 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             } else {
                 arg_vals.push_back(val);
                 arg_types.push_back(ll);
+            }
+        }
+
+        // Bug 3 Fix: Coerce argument types to match callee's parameter types.
+        // Integer literals default to i64 but the callee may expect i32, i16, etc.
+        // Without this, LLVM verification fails with "call argument type mismatch".
+        if (auto* ident = dyn_cast<IdentExpr>(callee_expr)) {
+            std::string callee_name = !mono_target.empty() ? mono_target : ident->name();
+            FnDecl* callee_fn = findFnDecl(callee_name);
+            if (callee_fn) {
+                const auto& fn_params = callee_fn->params();
+                for (size_t i = 0; i < arg_vals.size() && i < fn_params.size(); ++i) {
+                    TypeId param_type = fn_params[i].type;
+                    std::string param_ll = llvmType(param_type);
+                    if (param_ll != arg_types[i] && !param_ll.empty() && !arg_types[i].empty()) {
+                        // Type mismatch — insert a cast
+                        TypeId arg_type = call.args()[i]->getType();
+                        std::string cast_val = emitTypeCast(arg_vals[i], arg_type, param_type);
+                        arg_vals[i] = cast_val;
+                        arg_types[i] = param_ll;
+                    }
+                }
             }
         }
 
@@ -5270,7 +5307,7 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 // ============================================================================
 // emitBinaryOp – emit a single binary operation instruction
 // ============================================================================
-void IRGenerator::emitBinaryOp(const std::string& result_reg,
+std::string IRGenerator::emitBinaryOp(const std::string& result_reg,
                                const std::string& ll_type,
                                const std::string& lhs,
                                BinaryOp op,
@@ -5313,61 +5350,49 @@ void IRGenerator::emitBinaryOp(const std::string& result_reg,
             case BinaryOp::Add:
                 // x + 0 = x, 0 + x = x
                 if (rhs_lit && parseLiteral(rhs) == 0) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = " << lhs << " + 0\n";
-                    updateVarValue(result_reg, lhs);
-                    // Still need to emit a copy so the register is defined
-                    body_ss_ << "  " << result_reg << " = add " << ll_type << " " << lhs << ", 0\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => " << lhs << " (+ 0)\n";
+                    return lhs;  // No instruction needed — just use lhs directly
                 }
                 if (lhs_lit && parseLiteral(lhs) == 0) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = 0 + " << rhs << "\n";
-                    body_ss_ << "  " << result_reg << " = add " << ll_type << " 0, " << rhs << "\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => " << rhs << " (0 +)\n";
+                    return rhs;  // No instruction needed — just use rhs directly
                 }
                 break;
             case BinaryOp::Sub:
                 // x - 0 = x
                 if (rhs_lit && parseLiteral(rhs) == 0) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = " << lhs << " - 0\n";
-                    body_ss_ << "  " << result_reg << " = sub " << ll_type << " " << lhs << ", 0\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => " << lhs << " (- 0)\n";
+                    return lhs;
                 }
                 break;
             case BinaryOp::Mul:
                 // x * 1 = x, 1 * x = x, x * 0 = 0, 0 * x = 0
                 if (rhs_lit && parseLiteral(rhs) == 1) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = " << lhs << " * 1\n";
-                    body_ss_ << "  " << result_reg << " = mul " << ll_type << " " << lhs << ", 1\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => " << lhs << " (* 1)\n";
+                    return lhs;
                 }
                 if (lhs_lit && parseLiteral(lhs) == 1) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = 1 * " << rhs << "\n";
-                    body_ss_ << "  " << result_reg << " = mul " << ll_type << " 1, " << rhs << "\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => " << rhs << " (1 *)\n";
+                    return rhs;
                 }
                 if ((rhs_lit && parseLiteral(rhs) == 0) ||
                     (lhs_lit && parseLiteral(lhs) == 0)) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = 0 (mul by 0)\n";
-                    body_ss_ << "  " << result_reg << " = mul " << ll_type << " 0, 0\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => 0 (mul by 0)\n";
+                    return "0";
                 }
                 break;
             case BinaryOp::Div:
                 // x / 1 = x
                 if (rhs_lit && parseLiteral(rhs) == 1) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = " << lhs << " / 1\n";
-                    body_ss_ << "  " << result_reg << " = " << (is_signed ? "sdiv" : "udiv")
-                             << " " << ll_type << " " << lhs << ", 1\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => " << lhs << " (/ 1)\n";
+                    return lhs;
                 }
                 break;
             case BinaryOp::Mod:
                 // x % 1 = 0
                 if (rhs_lit && parseLiteral(rhs) == 1) {
-                    body_ss_ << "  ; constant-folded: " << result_reg << " = 0 (mod 1)\n";
-                    body_ss_ << "  " << result_reg << " = " << (is_signed ? "srem" : "urem")
-                             << " " << ll_type << " " << lhs << ", 1\n";
-                    return;
+                    body_ss_ << "  ; constant-folded: " << result_reg << " => 0 (mod 1)\n";
+                    return "0";
                 }
                 break;
             default: break;
@@ -5399,10 +5424,9 @@ void IRGenerator::emitBinaryOp(const std::string& result_reg,
                 default: folded = false; break;
             }
             if (folded) {
-                body_ss_ << "  ; constant-folded: " << result_reg << " = " << lhs
-                         << " op " << rhs << " = " << result << "\n";
-                body_ss_ << "  " << result_reg << " = add " << ll_type << " " << result << ", 0\n";
-                return;
+                body_ss_ << "  ; constant-folded: " << lhs << " op " << rhs
+                         << " => " << result << "\n";
+                return std::to_string(result);  // No instruction — return literal directly
             }
         }
     }
@@ -5493,6 +5517,7 @@ void IRGenerator::emitBinaryOp(const std::string& result_reg,
             body_ss_ << "  " << result_reg << " = add " << ll_type << " " << lhs << ", " << rhs << "\n";
             break;
     }
+    return result_reg;
 }
 
 // ============================================================================
@@ -6404,6 +6429,28 @@ void IRGenerator::emitYieldCounterInitIfAnnotated(WhileStmt* loop) {
 }
 
 // ============================================================================
+// findFnDecl – look up a FnDecl by name in the program
+//
+// Searches top-level declarations and impl blocks for a function with the
+// given name. Returns nullptr if not found. Used to get parameter types
+// for call argument type coercion.
+// ============================================================================
+FnDecl* IRGenerator::findFnDecl(const std::string& name) const {
+    for (const auto& tl : program_) {
+        if (auto* fn = dyn_cast<FnDecl>(tl.get())) {
+            if (fn->name() == name) return fn;
+        }
+        // Check impl blocks for method declarations
+        if (auto* impl = dyn_cast<ImplDecl>(tl.get())) {
+            for (const auto& fn : impl->methods()) {
+                if (fn->name() == name) return fn.get();
+            }
+        }
+    }
+    return nullptr;
+}
+
+// ============================================================================
 // emitYieldCheckIfAnnotated – emit cooperative yield checks in loops
 //
 // When a WhileStmt has yield_point = true in the MetadataMap
@@ -6443,12 +6490,12 @@ void IRGenerator::emitYieldCheckIfAnnotated(WhileStmt* loop) {
              << ", label %" << yield_skip_l << "\n";
     setTerminated(false);
 
-    body_ss_ << yield_check_l << ":\n";
+    emitBlockLabel(yield_check_l);
     body_ss_ << "  call void @tether_yield(i64 0)\n";
     body_ss_ << "  br label %" << yield_skip_l << "\n";
     setTerminated(false);
 
-    body_ss_ << yield_skip_l << ":\n";
+    emitBlockLabel(yield_skip_l);
     setTerminated(false);
 }
 
