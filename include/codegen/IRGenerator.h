@@ -671,8 +671,13 @@ public:
     // Emit a prefetch intrinsic if the WhileStmt has a PrefetchSite annotation.
     void emitPrefetchIfAnnotated(WhileStmt* loop);
 
+    // Emit yield counter initialization (alloca + store 0) in the pre-header
+    // block, BEFORE the branch to while.cond. Must be called before the loop.
+    void emitYieldCounterInitIfAnnotated(WhileStmt* loop);
+
     // Emit a yield check at the top of a loop body if the WhileStmt has
     // a YieldPoint annotation. Uses a counter to only check every N iterations.
+    // Assumes emitYieldCounterInitIfAnnotated was called earlier.
     void emitYieldCheckIfAnnotated(WhileStmt* loop);
 
     // Check if a FnDecl has an OpaqueBarrier annotation; if so, add
@@ -734,6 +739,15 @@ public:
 
     // Counter for unique deopt IDs within a function
     int deopt_counter_ = 0;
+
+    // =======================================================================
+    // Yield counter state (for split init/check emission)
+    //
+    // emitYieldCounterInitIfAnnotated sets these in the pre-header,
+    // and emitYieldCheckIfAnnotated reads them in the loop body.
+    // =======================================================================
+    std::string current_yield_counter_alloca_;  // alloca name for current loop's counter
+    int current_yield_interval_ = 256;          // yield interval for current loop
 };
 
 } // namespace tether

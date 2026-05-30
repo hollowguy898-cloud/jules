@@ -6,11 +6,23 @@
 CXX       = g++
 CC        = gcc
 CXXFLAGS  = -std=c++17 -Wall -Wextra -O3 -march=native -flto -I include
-# NOTE: The C runtime is compiled WITHOUT -flto because it gets linked into
-# user programs compiled by clang (LLVM). GCC LTO bytecode in the runtime .a
-# is incompatible with LLVM and causes link errors when the linker tries to
-# perform cross-language LTO. The compiler itself (C++) still benefits from LTO.
-CFLAGS    = -std=c11 -Wall -Wextra -O3 -march=native
+# NOTE: The C runtime is compiled WITHOUT -flto when using GCC because GCC
+# LTO bytecode in the runtime .a is incompatible with LLVM and causes link
+# errors when the linker tries to perform cross-language LTO.
+# However, if clang is available, we compile the runtime WITH -flto using
+# clang so that the runtime can participate in cross-language LTO with the
+# Tether-generated LLVM IR. This allows LLVM to inline runtime functions
+# (tether_yield, tether_box_new, etc.) and eliminate dead code.
+# To force clang for the runtime: make RUNTIME_CC=clang
+RUNTIME_CC ?= $(shell which clang 2>/dev/null)
+ifeq ($(RUNTIME_CC),)
+  # clang not found — use gcc without -flto (safe fallback)
+  RUNTIME_CC = $(CC)
+  CFLAGS    = -std=c11 -Wall -Wextra -O3 -march=native
+else
+  # clang available — compile runtime with -flto for cross-language optimization
+  CFLAGS    = -std=c11 -Wall -Wextra -O3 -march=native -flto
+endif
 
 # mimalloc — fast allocator (2-3x faster than glibc malloc)
 # Automatically detected: if libmimalloc is installed, use it.
@@ -78,7 +90,7 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 
 $(BUILDDIR)/runtime/%.o: $(RUNTIMEDIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(RUNTIME_CC) $(CFLAGS) -c -o $@ $<
 
 # ============================================================================
 # Build runtime static library
@@ -142,8 +154,8 @@ clean:
 test: $(TARGET)
 	@echo "=== Testing compiler on examples ==="
 	@for f in examples/*.tth; do \
-	        echo "  Compiling $$f ..."; \
-	        ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
+		echo "  Compiling $$f ..."; \
+                ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
 	done
 	@echo "=== Tests complete ==="
 
@@ -211,10 +223,10 @@ bench: $(BENCH_SPEED) $(BENCH_REAL) $(BENCH_ECS) $(TARGET)
 	@echo ""
 	@echo "--- 4. End-to-End Compilation ---"
 	@for f in benchmarks/real_workload/*.tth; do \
-	        echo "  Compiling $$f (-O3) ..."; \
-	        ./$(TARGET) -O3 --emit-ir -v "$$f" -o /tmp/bench_out.ll 2>&1 | head -5; \
-	        echo "  IR size: $$(wc -c < /tmp/bench_out.ll) bytes"; \
-	        echo ""; \
+		echo "  Compiling $$f (-O3) ..."; \
+                ./$(TARGET) -O3 --emit-ir -v "$$f" -o /tmp/bench_out.ll 2>&1 | head -5; \
+		echo "  IR size: $$(wc -c < /tmp/bench_out.ll) bytes"; \
+		echo ""; \
 	done
 	@echo "=============================================="
 	@echo "  Benchmark Suite Complete"
