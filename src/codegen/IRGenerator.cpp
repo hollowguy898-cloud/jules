@@ -842,6 +842,19 @@ void IRGenerator::emitRuntimeDecls() {
     if (needed_runtime_.count("tether_black_box_ptr")) {
         module_out_ << "declare void @tether_black_box_ptr(ptr) nounwind\n"; any = true;
     }
+    // Volatile memory access intrinsics — for MMIO and hardware register access
+    if (needed_runtime_.count("tether_volatile_read_i64")) {
+        module_out_ << "declare i64 @tether_volatile_read_i64(ptr) nounwind\n"; any = true;
+    }
+    if (needed_runtime_.count("tether_volatile_read_f64")) {
+        module_out_ << "declare double @tether_volatile_read_f64(ptr) nounwind\n"; any = true;
+    }
+    if (needed_runtime_.count("tether_volatile_write_i64")) {
+        module_out_ << "declare void @tether_volatile_write_i64(ptr, i64) nounwind\n"; any = true;
+    }
+    if (needed_runtime_.count("tether_volatile_write_f64")) {
+        module_out_ << "declare void @tether_volatile_write_f64(ptr, double) nounwind\n"; any = true;
+    }
     // Optimized string equality — checks length first, then pointer
     // equality (for interned strings), then falls back to memcmp.
     // Returns i1 (bool).
@@ -1128,7 +1141,47 @@ void IRGenerator::emitTetherFnMetadata(FnDecl* fn) {
             pflags |= 4u;  // kParamNonNull
         }
 
+        // Add nocapture for reference parameters (they don't escape the
+        // function in the common case — the borrow checker ensures they
+        // don't outlive the call)
+        if (p.type && (isa<MutReferenceType>(p.type) || isa<ReferenceType>(p.type))) {
+            pflags |= 32u;  // kParamNoCapture = bit5
+        }
+
+        // Add writeonly for &mut T params that are only written to
+        // (from semantic analysis — for now, conservatively skip this;
+        //  a future analysis pass can set this when the param is never read)
+
         meta.param_flags.push_back(pflags);
+    }
+
+    // --- Compute dereferenceable metadata for reference parameters ---
+    // For &T and &mut T parameters where the referent has a known size,
+    // record the (param_index, dereferenceable_bytes) pair so that
+    // emitTetherMetadata() can emit !tether.dereferenceable metadata.
+    for (size_t i = 0; i < fn->paramCount(); ++i) {
+        const auto& p = fn->params()[i];
+        if (!p.type) continue;
+
+        // Check if this is a reference type (&T or &mut T)
+        TypeId inner_type;
+        if (isa<MutReferenceType>(p.type)) {
+            inner_type = cast<MutReferenceType>(p.type).referent();
+        } else if (isa<ReferenceType>(p.type)) {
+            inner_type = cast<ReferenceType>(p.type).referent();
+        } else {
+            continue;
+        }
+
+        // Get the size of the inner type
+        uint64_t type_size = 0;
+        if (inner_type) {
+            type_size = typeSizeBytes(inner_type);
+        }
+
+        if (type_size > 0) {
+            meta.deref_params.push_back({i, type_size});
+        }
     }
 
     // Only record if there's something to emit
@@ -1149,6 +1202,7 @@ void IRGenerator::emitTetherFnMetadata(FnDecl* fn) {
 //   !tether.fns = !{!N, !M, ...}     — function name + flags
 //   !tether.params = !{!P, !Q, ...}   — function name + param idx + param flags
 //   !tether.loops = !{!R, !S, ...}    — function name + loop flags
+//   !tether.dereferenceable = !{!D, ...} — function name + param idx + deref bytes
 // ============================================================================
 void IRGenerator::emitTetherMetadata() {
     if (tether_fn_metas_.empty()) return;
@@ -1229,6 +1283,33 @@ void IRGenerator::emitTetherMetadata() {
             module_out_ << "!" << loop_meta_ids[i];
         }
         module_out_ << "}\n";
+    }
+
+    // --- Emit !tether.dereferenceable metadata ---
+    // For &mut T and &T parameters where T has a known size, emit
+    // dereferenceable(N) metadata so LLVM knows the pointer is valid.
+    {
+        std::vector<int> deref_meta_ids;
+        for (const auto& meta : tether_fn_metas_) {
+            for (const auto& [param_idx, type_size] : meta.deref_params) {
+                int deref_id = metadata_counter_++;
+                deref_meta_ids.push_back(deref_id);
+                // Emit the metadata node directly
+                module_out_ << "!" << deref_id << " = !{!\""
+                    << meta.fn_name << "\", i32 " << std::to_string(param_idx)
+                    << ", i64 " << std::to_string(type_size) << "}\n";
+            }
+        }
+
+        // Emit the named metadata
+        if (!deref_meta_ids.empty()) {
+            module_out_ << "!tether.dereferenceable = !{";
+            for (size_t i = 0; i < deref_meta_ids.size(); ++i) {
+                if (i > 0) module_out_ << ", ";
+                module_out_ << "!" << deref_meta_ids[i];
+            }
+            module_out_ << "}\n";
+        }
     }
 
     // !tether.tbaa = !{!T, !U, ...} — TBAA field access metadata
@@ -2798,7 +2879,42 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             auto& rs = cast<ReturnStmt>(*stmt);
             emitDeferBlocks();
 
-            if (current_can_error_) {
+            // Check if this is a tail call opportunity: the return value is
+            // directly a CallExpr with matching return type. If so, we can
+            // emit the call with `musttail` to guarantee LLVM eliminates the
+            // stack frame (TCO). This applies even without the @tailcall
+            // directive — any CallExpr in direct tail position qualifies.
+            bool is_tail_call = false;
+            if (rs.hasValue() && rs.value()->getKind() == NodeKind::CallExpr) {
+                TypeId ret_type = current_return_type_;
+                // Only for non-aggregate, non-error returns (musttail requires
+                // the call result to be directly returned with matching types)
+                if (ret_type && !isAggregateType(ret_type) && !current_can_error_) {
+                    // The return type of the call must match the function's return type
+                    TypeId call_type = rs.value()->getType();
+                    // For non-error types, the call's type must match the return type
+                    if (call_type && call_type == ret_type) {
+                        is_tail_call = true;
+                    }
+                    // Also allow void-to-void tail calls
+                    if (ret_type->isVoid() && call_type && call_type->isVoid()) {
+                        is_tail_call = true;
+                    }
+                }
+            }
+
+            if (is_tail_call) {
+                // Set the musttail flag so the CallExpr emitter prefixes the
+                // call with `musttail`. The flag is consumed by the emitter.
+                is_musttail_call_ = true;
+                std::string val = emitExpr(rs.value());
+                std::string ll = llvmType(current_return_type_);
+                if (ll == "void") {
+                    body_ss_ << "  ret void\n";
+                } else {
+                    body_ss_ << "  ret " << ll << " " << val << "\n";
+                }
+            } else if (current_can_error_) {
                 std::string vt = llvmType(current_return_type_);
                 if (rs.hasValue()) {
                     std::string val = emitExpr(rs.value());
@@ -3559,6 +3675,40 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 return "0";
             }
 
+            // volatile_read(ptr) — read a value from memory with volatile semantics
+            if (ident->name() == "volatile_read" || ident->name() == "@volatile_read") {
+                if (call.argCount() >= 1) {
+                    std::string ptr_val = emitExpr(call.args()[0].get());
+                    // Determine the type being read
+                    TypeId read_type = expr->getType();
+                    std::string ll = "i64"; // default
+                    if (read_type) {
+                        ll = llvmType(read_type);
+                    }
+                    std::string result = nextReg();
+                    body_ss_ << "  " << result << " = load volatile " << ll << ", ptr " << ptr_val << "\n";
+                    return result;
+                }
+                return "0";
+            }
+
+            // volatile_write(ptr, value) — write a value to memory with volatile semantics
+            if (ident->name() == "volatile_write" || ident->name() == "@volatile_write") {
+                if (call.argCount() >= 2) {
+                    std::string ptr_val = emitExpr(call.args()[0].get());
+                    std::string val = emitExpr(call.args()[1].get());
+                    // Determine the type being written
+                    TypeId write_type = call.args()[1]->getType();
+                    std::string ll = "i64";
+                    if (write_type) {
+                        ll = llvmType(write_type);
+                    }
+                    body_ss_ << "  store volatile " << ll << " " << val << ", ptr " << ptr_val << "\n";
+                    return "";
+                }
+                return "";
+            }
+
             callee = "@" + sanitizeName(ident->name());
         } else {
             callee = emitExpr(callee_expr);
@@ -3638,6 +3788,11 @@ std::string IRGenerator::emitExpr(Expr* expr) {
         std::string call_keyword;
         if (is_self_recursive_tailcall) {
             call_keyword = "musttail call";
+        } else if (is_musttail_call_) {
+            // Tail call from ReturnStmt: the return value is directly this
+            // call expression, so we can use musttail to guarantee TCO.
+            call_keyword = "musttail call";
+            is_musttail_call_ = false;  // consume the flag
         } else {
             call_keyword = "call";
         }
@@ -5592,8 +5747,11 @@ std::string IRGenerator::emitDeoptGuardForBranch(const ASTNode* node,
              << ", label %" << deopt_label << "\n";
     setTerminated(false);
 
-    // Emit the deoptimization block
-    emitDeoptBlock(deopt_id);
+    // Emit the deoptimization block — PASS the same label we just branched to.
+    // Without this, emitDeoptBlock would call nextLabel() again, generating a
+    // different label and leaving the branch above pointing at a non-existent
+    // block (the "empty label bug").
+    emitDeoptBlock(deopt_id, deopt_label);
 
     // Return the likely label (caller should emit fast-path code there)
     return likely_label;
@@ -5604,9 +5762,15 @@ std::string IRGenerator::emitDeoptGuardForBranch(const ASTNode* node,
 //
 // Emits a basic block that calls the runtime deopt handler and is marked
 // unreachable. LLVM will place this block out-of-line (cold section).
+//
+// If `label` is provided (non-empty), uses that label instead of generating
+// a new one. This is critical: callers may have already emitted a branch
+// instruction targeting a specific label, so we must reuse that exact label
+// rather than calling nextLabel() again (which would produce a different label
+// and leave the branch pointing at a non-existent block — the empty label bug).
 // ============================================================================
-void IRGenerator::emitDeoptBlock(int deopt_id) {
-    std::string deopt_label = nextLabel("deopt");
+void IRGenerator::emitDeoptBlock(int deopt_id, const std::string& label) {
+    std::string deopt_label = label.empty() ? nextLabel("deopt") : label;
     emitBlockLabel(deopt_label);
 
     // Declare the deopt runtime function

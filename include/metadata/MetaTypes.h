@@ -241,6 +241,14 @@ struct NodeMeta {
     bool niched_error = false;              // This ErrorType uses niche encoding
     NichedErrorKind niched_error_kind = NichedErrorKind::StructFallback;
 
+    // Niche optimization info (from NichedErrorPass::checkNiche)
+    // Detailed bit-pattern and size information for the IRGenerator to
+    // emit compact error representations without consulting type sizes.
+    bool has_niche = false;                 // True if the success type has a usable niche
+    uint64_t niche_bit_pattern = 0;         // The bit pattern that encodes "error"
+    uint64_t niched_size = 0;               // Size after niche optimization (bytes)
+    std::string niche_description;          // Human-readable niche description
+
     // Allocation fusion (from AllocFusionPass)
     bool alloc_fused = false;            // This Box allocation is part of a fused batch
     int64_t alloc_batch_size = 0;        // Total batch size (only set on the first allocation in a batch)

@@ -574,6 +574,7 @@ public:
     bool        current_can_error_   = false;
     bool        current_fn_has_simd_ = false;
     bool        current_fn_has_tailcall_ = false;  // @tailcall directive for current function
+    bool        is_musttail_call_ = false;         // Next CallExpr should be emitted as musttail
     std::string current_fn_name_;
     std::string current_ret_alloca_; // alloca for the aggregate return value
     std::string current_err_slot_;   // callee-side: name of the ptr %err_slot parameter
@@ -647,6 +648,9 @@ public:
         uint32_t fn_flags = 0;       // function-level flags bitmask
         std::vector<uint32_t> param_flags;  // per-parameter flags bitmask
         uint32_t loop_flags = 0;     // loop-level flags (vectorize/unroll)
+        // Dereferenceable metadata: (param_index, dereferenceable_bytes)
+        // For &T and &mut T parameters where the referent has a known size.
+        std::vector<std::pair<size_t, uint64_t>> deref_params;
     };
     std::vector<TetherFnMeta> tether_fn_metas_;
 
@@ -722,7 +726,10 @@ public:
                                          const std::string& unlikely_label);
 
     // Emit a deoptimization block that calls the runtime deopt handler.
-    void emitDeoptBlock(int deopt_id);
+    // If `label` is provided, reuse it instead of generating a new one
+    // (fixes the empty-label bug when the caller already emitted a branch
+    // to a specific deopt label).
+    void emitDeoptBlock(int deopt_id, const std::string& label = "");
 
     // Counter for unique deopt IDs within a function
     int deopt_counter_ = 0;

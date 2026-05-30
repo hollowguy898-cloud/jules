@@ -296,7 +296,10 @@ void BorrowChecker::checkBorrowRules(CFG& cfg) {
             }
         }
 
-        // Check each variable definition (mutation) in this node
+        // Check each variable definition (mutation) in this node.
+        // When a variable is reassigned, any existing borrows of that variable
+        // are invalidated (killed). This is critical for swap patterns where
+        // reassignment happens within the same block.
         for (const auto& var : node.definedVars()) {
             SourceLocation mut_loc = node.stmts().empty()
                 ? SourceLocation() : node.stmts().front()->sourceLoc();
@@ -323,6 +326,18 @@ void BorrowChecker::checkBorrowRules(CFG& cfg) {
 
             PathExpr mut_path = pathFromVarName(var);
             checkMutation(node, var, mut_path, mut_loc, current_live);
+
+            // Kill borrows of this variable: reassignment invalidates all
+            // borrows that reference the redefined variable's path.
+            // This is the same logic as in checkMoves — after mutation,
+            // borrows of the old value are dead.
+            LiveBorrowSet surviving;
+            for (const auto& lb : current_live) {
+                if (!pathsConflict(mut_path, lb.path)) {
+                    surviving.insert(lb);
+                }
+            }
+            current_live = std::move(surviving);
         }
     }
 }
@@ -541,18 +556,26 @@ void BorrowChecker::invalidateReborrows(const PathExpr& parent_path,
 // Swap/temp pattern fix: When a variable is reassigned (e.g., a = b),
 // the old value of `a` is discarded but `a` itself becomes valid again
 // with a new value. So we "un-move" `a` when it appears as the LHS of
-// an assignment. This allows patterns like:
+// an assignment. We also kill any borrows of the LHS variable, since
+// reassignment invalidates all outstanding borrows (the old value they
+// referenced is gone). This allows patterns like:
 //   temp = a; a = b; b = temp;  (swap)
 //   a = a + 1;                  (self-update, not a move)
 //   val x = compute(); y = x;   (move into y, x is now moved)
 //   x = compute2();             (x is valid again — reinitialized)
+//   var r = &a; a = 42;         (r is invalidated by the reassignment)
 // ============================================================================
 void BorrowChecker::checkMoves(CFG& cfg) {
     for (const auto& node_ptr : cfg.nodes()) {
         CFGNode& node = *node_ptr;
 
-        // Process statements in order so that reassignment "un-moves" take
-        // effect before subsequent use-after-move checks.
+        // Track local borrow state that changes as we process statements.
+        // This is essential for swap patterns where borrows are invalidated
+        // mid-block by reassignment.
+        LiveBorrowSet local_live = live_in_[node.id()];
+
+        // Process statements in order so that reassignment "un-moves" and
+        // borrow kills take effect before subsequent checks.
         for (auto* stmt : node.stmts()) {
             if (stmt->getKind() == NodeKind::AssignStmt) {
                 auto& as = static_cast<AssignStmt&>(*stmt);
@@ -566,6 +589,20 @@ void BorrowChecker::checkMoves(CFG& cfg) {
                     const std::string& lhs_name = lhs.name();
                     // Un-move: the variable is being reinitialized
                     moved_out_vars_.erase(lhs_name);
+
+                    // Kill borrows: reassignment invalidates all borrows of
+                    // the LHS variable. This is key for the swap pattern:
+                    //   temp = a;   // borrows of 'a' are created
+                    //   a = b;      // borrows of 'a' are killed here
+                    //   b = temp;   // no conflict because 'a' borrows are dead
+                    PathExpr killed_path = pathFromVarName(lhs_name);
+                    LiveBorrowSet surviving;
+                    for (const auto& lb : local_live) {
+                        if (!pathsConflict(killed_path, lb.path)) {
+                            surviving.insert(lb);
+                        }
+                    }
+                    local_live = std::move(surviving);
                 }
 
                 // --- RHS handling: moving a value out ---
@@ -582,9 +619,9 @@ void BorrowChecker::checkMoves(CFG& cfg) {
                         }
                     }
 
-                    // Check if the variable is borrowed
-                    const auto& live = live_in_[node.id()];
-                    for (const auto& lb : live) {
+                    // Check if the variable is borrowed (using local_live, which
+                    // accounts for borrows killed by prior reassignments in this block)
+                    for (const auto& lb : local_live) {
                         PathExpr used_path = pathFromVarName(ie.name());
                         if (pathsConflict(used_path, lb.path)) {
                             // Rule: Cannot move a variable while any borrow is live

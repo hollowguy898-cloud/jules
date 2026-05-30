@@ -43,6 +43,9 @@ constexpr uint32_t kParamNoAlias       = 1u << 0;  // 1
 constexpr uint32_t kParamReadOnly      = 1u << 1;  // 2
 constexpr uint32_t kParamNonNull       = 1u << 2;  // 4
 constexpr uint32_t kParamInvariantLoad = 1u << 3;  // 8
+constexpr uint32_t kParamDereferenceable = 1u << 4;  // 16
+constexpr uint32_t kParamNoCapture      = 1u << 5;  // 32
+constexpr uint32_t kParamWriteOnly      = 1u << 6;  // 64
 
 // ============================================================================
 // TetherAttrPass — LLVM module pass that reads Tether metadata and applies

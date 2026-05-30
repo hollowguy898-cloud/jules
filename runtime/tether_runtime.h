@@ -126,32 +126,31 @@ TETHER_SLICE(double);    /* TetherSlice_double  */
  * ============================================================================ */
 
 typedef struct TetherBox {
-    void*    ptr;      /* Heap-allocated data */
-    int64_t  size;     /* Size of the allocation in bytes */
+    void*    ptr;      /* Heap-allocated data pointer (like Rust's Box — size known at compile time) */
 } TetherBox;
 
 /* ============================================================================
  * Rc<T> - reference-counted pointer (non-atomic)
  *
- * Layout:  { i64 refcount, T data }
+ * Layout:  { i32 refcount, T data }
  * The Rc struct holds a pointer to this layout.  When the refcount drops to
  * zero, the data is freed.
  * ============================================================================ */
 
 typedef struct TetherRc {
-    void*    ptr;      /* Points to: { int64_t refcount; char data[]; } */
+    void*    ptr;      /* Points to: { int32_t refcount; char data[]; } */
     int64_t  data_size; /* Size of the data portion in bytes */
 } TetherRc;
 
 /* ============================================================================
  * Arc<T> - atomically reference-counted pointer
  *
- * Layout:  { _Atomic int64_t refcount, T data }
+ * Layout:  { _Atomic int32_t refcount, T data }
  * Same as Rc but uses atomic operations for the refcount.
  * ============================================================================ */
 
 typedef struct TetherArc {
-    void*    ptr;      /* Points to: { _Atomic int64_t refcount; char data[]; } */
+    void*    ptr;      /* Points to: { _Atomic int32_t refcount; char data[]; } */
     int64_t  data_size; /* Size of the data portion in bytes */
 } TetherArc;
 
@@ -180,10 +179,15 @@ typedef struct TetherArena {
     char*    buffer;       /* Start of the arena buffer */
     int64_t  capacity;     /* Total buffer size in bytes */
     int64_t  offset;       /* Current bump offset */
+    int64_t  alignment;    /* Alignment for allocations (default: 16, was 8) */
 } TetherArena;
 
-/* Initialize an arena with the given buffer and capacity */
-void tether_arena_init(TetherArena* arena, void* buffer, int64_t capacity);
+/* Initialize an arena with the given buffer, capacity, and alignment */
+void tether_arena_init(TetherArena* arena, void* buffer, int64_t capacity, int64_t alignment);
+
+/* Convenience macro: init arena with default 16-byte alignment */
+#define tether_arena_init_default(arena, buffer, capacity) \
+    tether_arena_init((arena), (buffer), (capacity), 16)
 
 /* Allocate `size` bytes from the arena. Returns NULL if exhausted. */
 void* tether_arena_alloc(TetherArena* arena, int64_t size);
@@ -299,11 +303,17 @@ void tether_batch_free(TetherAllocBatch* batch);
  * Box operations
  * ============================================================================ */
 
-/* Create a new Box by copying `size` bytes from `data` */
+/* Create a new Box by copying `size` bytes from `data` (backward compat, default size=0) */
 TetherBox tether_box_new(const void* data, int64_t size);
 
-/* Free a Box */
+/* Free a Box (backward compat, uses default size=0 for cache) */
 void tether_box_drop(TetherBox* box);
+
+/* Create a new Box with explicit size (IR generator emits size as immediate) */
+TetherBox tether_box_new_sized(const void* data, int64_t size);
+
+/* Free a Box with explicit size (IR generator emits size as immediate to drop) */
+void tether_box_drop_sized(TetherBox* box, int64_t size);
 
 /* Get a pointer to the Box's data */
 void* tether_box_deref(TetherBox* box);
@@ -325,7 +335,7 @@ void tether_rc_drop(TetherRc* rc);
 void* tether_rc_deref(TetherRc* rc);
 
 /* Get the current reference count (for debugging) */
-int64_t tether_rc_count(TetherRc* rc);
+int32_t tether_rc_count(TetherRc* rc);
 
 /* ============================================================================
  * Arc operations (atomic reference counting)
@@ -344,7 +354,7 @@ void tether_arc_drop(TetherArc* arc);
 void* tether_arc_deref(TetherArc* arc);
 
 /* Get the current reference count (for debugging) */
-int64_t tether_arc_count(TetherArc* arc);
+int32_t tether_arc_count(TetherArc* arc);
 
 /* ============================================================================
  * Print functions

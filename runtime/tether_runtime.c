@@ -11,6 +11,7 @@
  *   - Print functions
  */
 
+#define _GNU_SOURCE
 #include "tether_runtime.h"
 
 #include <stdio.h>
@@ -18,8 +19,13 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <assert.h>
-#include <sched.h>
+#include <stdint.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#endif
 
 /* ============================================================================
  * Helper: align up to 8-byte boundary (for arena/buffer allocators)
@@ -33,17 +39,18 @@ static int64_t align_up(int64_t value, int64_t alignment) {
  * Arena allocator implementation
  * ============================================================================ */
 
-void tether_arena_init(TetherArena* arena, void* buffer, int64_t capacity) {
-    arena->buffer   = (char*)buffer;
-    arena->capacity = capacity;
-    arena->offset   = 0;
+void tether_arena_init(TetherArena* arena, void* buffer, int64_t capacity, int64_t alignment) {
+    arena->buffer    = (char*)buffer;
+    arena->capacity  = capacity;
+    arena->offset    = 0;
+    arena->alignment = alignment > 0 ? alignment : 16;
 }
 
 void* tether_arena_alloc(TetherArena* arena, int64_t size) {
     if (!arena || !arena->buffer || size <= 0) return NULL;
 
-    /* Align the offset to 8 bytes */
-    int64_t aligned_offset = align_up(arena->offset, 8);
+    /* Align the offset using the arena's configured alignment */
+    int64_t aligned_offset = align_up(arena->offset, arena->alignment);
 
     if (aligned_offset + size > arena->capacity) {
         return NULL;  /* Arena exhausted */
@@ -273,10 +280,14 @@ void tether_batch_free(TetherAllocBatch* batch) {
  * ============================================================================ */
 
 TetherBox tether_box_new(const void* data, int64_t size) {
+    /* Backward compat: delegates to tether_box_new_sized with the given size */
+    return tether_box_new_sized(data, size);
+}
+
+TetherBox tether_box_new_sized(const void* data, int64_t size) {
     TetherBox box;
+    box.ptr = NULL;
     if (size <= 0 || !data) {
-        box.ptr  = NULL;
-        box.size = 0;
         return box;
     }
 
@@ -284,19 +295,20 @@ TetherBox tether_box_new(const void* data, int64_t size) {
     box.ptr = (char*)tether_box_cache_alloc(cache, size);
     if (box.ptr) {
         memcpy(box.ptr, data, (size_t)size);
-        box.size = size;
-    } else {
-        box.size = 0;
     }
     return box;
 }
 
 void tether_box_drop(TetherBox* box) {
+    /* Backward compat: uses default size=0 (cache will free via tether_free) */
+    tether_box_drop_sized(box, 0);
+}
+
+void tether_box_drop_sized(TetherBox* box, int64_t size) {
     if (box && box->ptr) {
         TetherBoxCache* cache = tether_box_cache_get();
-        tether_box_cache_free(cache, box->ptr, box->size);
-        box->ptr  = NULL;
-        box->size = 0;
+        tether_box_cache_free(cache, box->ptr, size);
+        box->ptr = NULL;
     }
 }
 
@@ -308,7 +320,7 @@ void* tether_box_deref(TetherBox* box) {
 /* ============================================================================
  * Rc operations (non-atomic reference counting)
  *
- * Memory layout:  { int64_t refcount; char data[data_size]; }
+ * Memory layout:  { int32_t refcount; char data[data_size]; }
  * ============================================================================ */
 
 TetherRc tether_rc_new(const void* data, int64_t size) {
@@ -319,8 +331,8 @@ TetherRc tether_rc_new(const void* data, int64_t size) {
         return rc;
     }
 
-    /* Allocate: refcount (8 bytes) + data */
-    int64_t total = sizeof(int64_t) + size;
+    /* Allocate: refcount (4 bytes) + data */
+    int64_t total = sizeof(int32_t) + size;
     void* block = tether_malloc((size_t)total);
     if (!block) {
         rc.ptr       = NULL;
@@ -329,11 +341,11 @@ TetherRc tether_rc_new(const void* data, int64_t size) {
     }
 
     /* Set refcount to 1 */
-    int64_t* refcount_ptr = (int64_t*)block;
+    int32_t* refcount_ptr = (int32_t*)block;
     *refcount_ptr = 1;
 
     /* Copy data after the refcount */
-    char* data_ptr = (char*)block + sizeof(int64_t);
+    char* data_ptr = (char*)block + sizeof(int32_t);
     memcpy(data_ptr, data, (size_t)size);
 
     rc.ptr       = block;
@@ -349,7 +361,7 @@ TetherRc tether_rc_clone(TetherRc* rc) {
     if (!rc || !rc->ptr) return result;
 
     /* Increment the refcount (non-atomic) */
-    int64_t* refcount_ptr = (int64_t*)rc->ptr;
+    int32_t* refcount_ptr = (int32_t*)rc->ptr;
     (*refcount_ptr)++;
 
     result.ptr       = rc->ptr;
@@ -360,7 +372,7 @@ TetherRc tether_rc_clone(TetherRc* rc) {
 void tether_rc_drop(TetherRc* rc) {
     if (!rc || !rc->ptr) return;
 
-    int64_t* refcount_ptr = (int64_t*)rc->ptr;
+    int32_t* refcount_ptr = (int32_t*)rc->ptr;
     (*refcount_ptr)--;
 
     if (*refcount_ptr <= 0) {
@@ -373,18 +385,18 @@ void tether_rc_drop(TetherRc* rc) {
 
 void* tether_rc_deref(TetherRc* rc) {
     if (!rc || !rc->ptr) return NULL;
-    return (char*)rc->ptr + sizeof(int64_t);
+    return (char*)rc->ptr + sizeof(int32_t);
 }
 
-int64_t tether_rc_count(TetherRc* rc) {
+int32_t tether_rc_count(TetherRc* rc) {
     if (!rc || !rc->ptr) return 0;
-    return *(int64_t*)rc->ptr;
+    return *(int32_t*)rc->ptr;
 }
 
 /* ============================================================================
  * Arc operations (atomic reference counting)
  *
- * Memory layout:  { _Atomic int64_t refcount; char data[data_size]; }
+ * Memory layout:  { _Atomic int32_t refcount; char data[data_size]; }
  *
  * Memory ordering choices (following Rust's std::sync::Arc):
  *
@@ -412,7 +424,7 @@ TetherArc tether_arc_new(const void* data, int64_t size) {
         return arc;
     }
 
-    int64_t total = sizeof(_Atomic int64_t) + size;
+    int64_t total = sizeof(_Atomic int32_t) + size;
     void* block = tether_malloc((size_t)total);
     if (!block) {
         arc.ptr       = NULL;
@@ -421,11 +433,11 @@ TetherArc tether_arc_new(const void* data, int64_t size) {
     }
 
     /* Set refcount to 1 — Relaxed: sole owner, no other thread can observe */
-    _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)block;
+    _Atomic int32_t* refcount_ptr = (_Atomic int32_t*)block;
     __atomic_store_n(refcount_ptr, 1, __ATOMIC_RELAXED);
 
     /* Copy data after the refcount */
-    char* data_ptr = (char*)block + sizeof(_Atomic int64_t);
+    char* data_ptr = (char*)block + sizeof(_Atomic int32_t);
     memcpy(data_ptr, data, (size_t)size);
 
     arc.ptr       = block;
@@ -441,7 +453,7 @@ TetherArc tether_arc_clone(TetherArc* arc) {
     if (!arc || !arc->ptr) return result;
 
     /* Atomically increment the refcount — Relaxed: only atomicity needed */
-    _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)arc->ptr;
+    _Atomic int32_t* refcount_ptr = (_Atomic int32_t*)arc->ptr;
     __atomic_fetch_add(refcount_ptr, 1, __ATOMIC_RELAXED);
 
     result.ptr       = arc->ptr;
@@ -453,8 +465,8 @@ void tether_arc_drop(TetherArc* arc) {
     if (!arc || !arc->ptr) return;
 
     /* Atomically decrement the refcount — AcqRel: must synchronise with last dropper */
-    _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)arc->ptr;
-    int64_t old_count = __atomic_fetch_sub(refcount_ptr, 1, __ATOMIC_ACQ_REL);
+    _Atomic int32_t* refcount_ptr = (_Atomic int32_t*)arc->ptr;
+    int32_t old_count = __atomic_fetch_sub(refcount_ptr, 1, __ATOMIC_ACQ_REL);
 
     if (old_count <= 1) {
         /* This was the last reference; free the block */
@@ -467,12 +479,12 @@ void tether_arc_drop(TetherArc* arc) {
 
 void* tether_arc_deref(TetherArc* arc) {
     if (!arc || !arc->ptr) return NULL;
-    return (char*)arc->ptr + sizeof(_Atomic int64_t);
+    return (char*)arc->ptr + sizeof(_Atomic int32_t);
 }
 
-int64_t tether_arc_count(TetherArc* arc) {
+int32_t tether_arc_count(TetherArc* arc) {
     if (!arc || !arc->ptr) return 0;
-    _Atomic int64_t* refcount_ptr = (_Atomic int64_t*)arc->ptr;
+    _Atomic int32_t* refcount_ptr = (_Atomic int32_t*)arc->ptr;
     return __atomic_load_n(refcount_ptr, __ATOMIC_RELAXED);
 }
 
@@ -572,6 +584,78 @@ struct TetherTask {
     atomic_int     refcount;    // Reference count for handle lifetime
 };
 
+// --- Chase-Lev deque for per-thread work stealing ---
+#define CL_DEQUE_CAPACITY 8192
+
+struct ChaseLevDeque {
+    // Circular array of task pointers
+    TetherTask** buffer;
+    int capacity;
+    // Bottom is only accessed by the owner thread
+    _Atomic int bottom;
+    // Top is accessed by thieves via atomic CAS
+    _Atomic int top;
+};
+
+static void cl_deque_init(struct ChaseLevDeque* dq) {
+    dq->capacity = CL_DEQUE_CAPACITY;
+    dq->buffer = (TetherTask**)calloc(dq->capacity, sizeof(TetherTask*));
+    atomic_store(&dq->bottom, 0);
+    atomic_store(&dq->top, 0);
+}
+
+static void cl_deque_destroy(struct ChaseLevDeque* dq) {
+    free(dq->buffer);
+    dq->buffer = NULL;
+}
+
+// Push to bottom (owner thread only)
+static bool cl_deque_push(struct ChaseLevDeque* dq, TetherTask* task) {
+    int b = atomic_load(&dq->bottom);
+    int t = atomic_load(&dq->top);
+    if (b - t >= dq->capacity) return false; // Full
+    dq->buffer[b % dq->capacity] = task;
+    atomic_store_explicit(&dq->bottom, b + 1, __ATOMIC_RELEASE);
+    return true;
+}
+
+// Pop from bottom (owner thread only) — returns NULL if empty
+static TetherTask* cl_deque_pop(struct ChaseLevDeque* dq) {
+    int b = atomic_load(&dq->bottom) - 1;
+    atomic_store(&dq->bottom, b);
+    __asm__ __volatile__("" ::: "memory"); // Compiler barrier
+    int t = atomic_load(&dq->top);
+    if (t > b) {
+        // Deque was empty, restore
+        atomic_store(&dq->bottom, b + 1);
+        return NULL;
+    }
+    TetherTask* task = dq->buffer[b % dq->capacity];
+    if (t == b) {
+        // Last element — race with steal
+        if (!atomic_compare_exchange_strong(&dq->top, &t, t + 1)) {
+            // Steal won the race
+            atomic_store(&dq->bottom, b + 1);
+            return NULL;
+        }
+        atomic_store(&dq->bottom, b + 1);
+    }
+    return task;
+}
+
+// Steal from top (thief thread) — returns NULL if empty
+static TetherTask* cl_deque_steal(struct ChaseLevDeque* dq) {
+    int t = atomic_load(&dq->top);
+    __asm__ __volatile__("" ::: "memory"); // Compiler barrier
+    int b = atomic_load(&dq->bottom);
+    if (t >= b) return NULL; // Empty
+    TetherTask* task = dq->buffer[t % dq->capacity];
+    if (!atomic_compare_exchange_strong(&dq->top, &t, t + 1)) {
+        return NULL; // CAS failed, another thief got it
+    }
+    return task;
+}
+
 // --- Global work queue (simple locked deque) ---
 #define TETHER_MAX_QUEUED_TASKS 65536
 
@@ -592,45 +676,66 @@ static struct {
     // Adaptive spin parameters for tether_task_await()
     uint32_t        spin_count;    // Phase 1: pure CPU spin iterations
     uint32_t        yield_count;   // Phase 2: sched_yield iterations
+    // Per-thread Chase-Lev deques for work stealing
+    struct ChaseLevDeque* local_deques;
 } g_taskpool;
 
 // --- Worker thread function ---
 static void* tether_worker_thread(void* arg) {
-    (void)arg;
+    int worker_idx = (int)(intptr_t)arg;
     while (1) {
         TetherTask* task = NULL;
 
-        pthread_mutex_lock(&g_taskpool.lock);
+        // Pop from local deque first
+        task = cl_deque_pop(&g_taskpool.local_deques[worker_idx]);
 
-        // Wait for tasks
-        while (atomic_load(&g_taskpool.head) >= atomic_load(&g_taskpool.tail)
-               && !g_taskpool.shutdown) {
-            pthread_cond_wait(&g_taskpool.not_empty, &g_taskpool.lock);
+        // Try to steal from other workers
+        if (!task) {
+            for (int i = 0; i < (int)g_taskpool.num_threads; i++) {
+                if (i == worker_idx) continue;
+                task = cl_deque_steal(&g_taskpool.local_deques[i]);
+                if (task) break;
+            }
         }
 
-        if (g_taskpool.shutdown &&
-            atomic_load(&g_taskpool.head) >= atomic_load(&g_taskpool.tail)) {
+        // If still no task, fall back to global queue
+        if (!task) {
+            pthread_mutex_lock(&g_taskpool.lock);
+
+            // Wait for tasks
+            while (atomic_load(&g_taskpool.head) >= atomic_load(&g_taskpool.tail)
+                   && !g_taskpool.shutdown) {
+                pthread_cond_wait(&g_taskpool.not_empty, &g_taskpool.lock);
+            }
+
+            if (g_taskpool.shutdown &&
+                atomic_load(&g_taskpool.head) >= atomic_load(&g_taskpool.tail)) {
+                pthread_mutex_unlock(&g_taskpool.lock);
+                break;
+            }
+
+            // Dequeue a task from global queue
+            int head = atomic_load(&g_taskpool.head);
+            int tail = atomic_load(&g_taskpool.tail);
+            if (head < tail) {
+                task = g_taskpool.tasks[head % TETHER_MAX_QUEUED_TASKS];
+                atomic_store(&g_taskpool.head, head + 1);
+            }
+
             pthread_mutex_unlock(&g_taskpool.lock);
-            break;
         }
-
-        // Dequeue a task
-        int head = atomic_load(&g_taskpool.head);
-        int tail = atomic_load(&g_taskpool.tail);
-        if (head < tail) {
-            task = g_taskpool.tasks[head % TETHER_MAX_QUEUED_TASKS];
-            atomic_store(&g_taskpool.head, head + 1);
-        }
-
-        pthread_mutex_unlock(&g_taskpool.lock);
 
         // Execute the task
         if (task) {
             atomic_store(&task->state, TETHER_TASK_RUNNING);
             task->result = task->fn(task->ctx);
             atomic_store(&task->state, TETHER_TASK_DONE);
+            // Futex wake on Linux — much more efficient than cond var broadcast
+#if defined(__linux__)
+            syscall(SYS_futex, &task->state, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+#endif
             // Signal any threads that might be waiting in tether_task_await
-            // (Phase 3 of adaptive spinning blocks on this cond var)
+            // (Fallback for non-Linux Phase 3 blocking on cond var)
             pthread_cond_broadcast(&g_taskpool.not_empty);
         }
     }
@@ -655,9 +760,15 @@ void tether_taskpool_init(uint32_t num_threads) {
     pthread_mutex_init(&g_taskpool.lock, NULL);
     pthread_cond_init(&g_taskpool.not_empty, NULL);
 
+    // Allocate and init per-thread Chase-Lev deques
+    g_taskpool.local_deques = (struct ChaseLevDeque*)calloc(num_threads, sizeof(struct ChaseLevDeque));
+    for (uint32_t i = 0; i < num_threads; i++) {
+        cl_deque_init(&g_taskpool.local_deques[i]);
+    }
+
     g_taskpool.threads = (pthread_t*)malloc(sizeof(pthread_t) * num_threads);
     for (uint32_t i = 0; i < num_threads; i++) {
-        pthread_create(&g_taskpool.threads[i], NULL, tether_worker_thread, NULL);
+        pthread_create(&g_taskpool.threads[i], NULL, tether_worker_thread, (void*)(intptr_t)i);
     }
 
     g_taskpool.initialized = 1;
@@ -673,6 +784,15 @@ void tether_taskpool_shutdown(void) {
 
     for (uint32_t i = 0; i < g_taskpool.num_threads; i++) {
         pthread_join(g_taskpool.threads[i], NULL);
+    }
+
+    // Destroy per-thread Chase-Lev deques
+    if (g_taskpool.local_deques) {
+        for (uint32_t i = 0; i < g_taskpool.num_threads; i++) {
+            cl_deque_destroy(&g_taskpool.local_deques[i]);
+        }
+        free(g_taskpool.local_deques);
+        g_taskpool.local_deques = NULL;
     }
 
     free(g_taskpool.threads);
@@ -705,13 +825,18 @@ TetherTaskHandle tether_spawn(TetherTaskFn fn, void* ctx, uint64_t ctx_size) {
         task->ctx_size = 0;
     }
 
-    // Enqueue
-    pthread_mutex_lock(&g_taskpool.lock);
-    int tail = atomic_load(&g_taskpool.tail);
-    g_taskpool.tasks[tail % TETHER_MAX_QUEUED_TASKS] = task;
-    atomic_store(&g_taskpool.tail, tail + 1);
-    pthread_cond_signal(&g_taskpool.not_empty);
-    pthread_mutex_unlock(&g_taskpool.lock);
+    // Round-robin assignment to worker deques
+    static _Atomic int next_worker = 0;
+    int worker_idx = atomic_fetch_add(&next_worker, 1) % (int)g_taskpool.num_threads;
+    if (!cl_deque_push(&g_taskpool.local_deques[worker_idx], task)) {
+        // Deque full — fall back to global queue
+        pthread_mutex_lock(&g_taskpool.lock);
+        int tail = atomic_load(&g_taskpool.tail);
+        g_taskpool.tasks[tail % TETHER_MAX_QUEUED_TASKS] = task;
+        atomic_store(&g_taskpool.tail, tail + 1);
+        pthread_cond_signal(&g_taskpool.not_empty);
+        pthread_mutex_unlock(&g_taskpool.lock);
+    }
 
     TetherTaskHandle handle;
     handle.task = task;
@@ -723,14 +848,12 @@ void* tether_task_await(TetherTaskHandle handle) {
 
     // Adaptive spin strategy:
     // Phase 1: Spin for spin_count iterations (low latency for short tasks)
-    // Phase 2: sched_yield for yield_count iterations (medium latency)
-    // Phase 3: pthread_cond_wait (for long waits, saves CPU)
+    // Phase 2: futex wait on Linux / pthread_cond_wait on other platforms
     //
     // This gives nanosecond latency for HFT (short tasks done in Phase 1)
-    // while not burning CPU for general workloads (long tasks block in Phase 3).
+    // while not burning CPU for general workloads (long tasks block in Phase 2).
 
     uint32_t spin_count = g_taskpool.spin_count;
-    uint32_t yield_count = g_taskpool.yield_count;
 
     // Phase 1: Pure spin (for very short tasks — nanosecond latency)
     for (uint32_t i = 0; i < spin_count; i++) {
@@ -751,20 +874,19 @@ void* tether_task_await(TetherTaskHandle handle) {
 #endif
     }
 
-    // Phase 2: sched_yield (for medium-duration tasks)
-    for (uint32_t i = 0; i < yield_count; i++) {
-        if (atomic_load(&handle.task->state) == TETHER_TASK_DONE) {
-            goto done;
+    // Phase 2: futex wait (Linux) — much more efficient than spin+yield
+#if defined(__linux__)
+    {
+        // Wait on the task's state field using futex
+        // The worker thread will do a FUTEX_WAKE when the task completes
+        while (atomic_load(&handle.task->state) != TETHER_TASK_DONE) {
+            // futex(FUTEX_WAIT_PRIVATE) — waits until woken or spuriously
+            syscall(SYS_futex, &handle.task->state, FUTEX_WAIT_PRIVATE,
+                    TETHER_TASK_RUNNING, NULL, NULL, 0);
         }
-#ifdef _WIN32
-        SwitchToThread();
-#else
-        sched_yield();
-#endif
     }
-
-    // Phase 3: Block on condition variable (for long tasks — saves CPU)
-    // The worker thread signals g_taskpool.not_empty after completing a task.
+#else
+    // Fallback: pthread_cond_wait for non-Linux
     {
         pthread_mutex_lock(&g_taskpool.lock);
         while (atomic_load(&handle.task->state) != TETHER_TASK_DONE) {
@@ -772,6 +894,7 @@ void* tether_task_await(TetherTaskHandle handle) {
         }
         pthread_mutex_unlock(&g_taskpool.lock);
     }
+#endif
 
 done:
     {

@@ -23,6 +23,7 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -39,6 +40,9 @@ struct TBAACache {
     std::unordered_map<std::string, MDNode*> type_descriptors;
     // Map from "struct.field" → MDNode for the TBAA access tag
     std::unordered_map<std::string, MDNode*> access_tags;
+    // Map from "struct_name.field_index" → MDNode for the TBAA access tag
+    // e.g., "struct.Matrix.0" → access tag for field 0
+    std::unordered_map<std::string, MDNode*> field_index_tags;
     // Root TBAA node (the "tether" root for all Tether TBAA types)
     MDNode* root_node = nullptr;
 };
@@ -69,6 +73,9 @@ public:
         //    LLVM must assume all pointer accesses may alias, which prevents
         //    vectorization, LICM, and many other optimizations.
         changed |= processTBAAMetadata(M);
+
+        // 5. Process dereferenceable metadata from !tether.dereferenceable
+        changed |= processDereferenceableMetadata(M);
 
         return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
@@ -384,9 +391,72 @@ private:
             }
         }
 
+        // nocapture — parameter pointer is not captured by the function
+        if (flags & kParamNoCapture) {
+            if (!F->hasParamAttribute(param_idx, Attribute::NoCapture)) {
+                builder.addAttribute(Attribute::NoCapture);
+            }
+        }
+
+        // writeonly — parameter pointer is only written through
+        if (flags & kParamWriteOnly) {
+            if (!F->hasParamAttribute(param_idx, Attribute::WriteOnly)) {
+                builder.addAttribute(Attribute::WriteOnly);
+            }
+        }
+
         if (builder.hasAttributes()) {
             F->addParamAttrs(param_idx, builder);
             changed = true;
+        }
+
+        return changed;
+    }
+
+    // =======================================================================
+    // processDereferenceableMetadata — read !tether.dereferenceable and apply
+    // dereferenceable(N) parameter attributes.
+    //
+    // Named metadata format:
+    //   !tether.dereferenceable = !{!0, !1, ...}
+    //   !0 = !{!"function_name", i32 param_index, i64 byte_count}
+    //
+    // Applies dereferenceable(N) to the parameter, telling LLVM that the
+    // pointer argument is valid for at least N bytes.
+    // =======================================================================
+    bool processDereferenceableMetadata(Module &M) {
+        NamedMDNode *deref_md = M.getNamedMetadata("tether.dereferenceable");
+        if (!deref_md) return false;
+
+        bool changed = false;
+
+        for (unsigned i = 0; i < deref_md->getNumOperands(); ++i) {
+            MDNode *entry = deref_md->getOperand(i);
+            if (!entry || entry->getNumOperands() < 3) continue;
+
+            auto *name_md = dyn_cast<MDString>(entry->getOperand(0));
+            if (!name_md) continue;
+            std::string fn_name = name_md->getString().str();
+
+            auto *idx_md = dyn_cast<ConstantAsMetadata>(entry->getOperand(1));
+            if (!idx_md) continue;
+            unsigned param_idx = static_cast<unsigned>(
+                cast<ConstantInt>(idx_md->getValue())->getZExtValue());
+
+            auto *bytes_md = dyn_cast<ConstantAsMetadata>(entry->getOperand(2));
+            if (!bytes_md) continue;
+            uint64_t byte_count = cast<ConstantInt>(bytes_md->getValue())->getZExtValue();
+
+            Function *F = M.getFunction(fn_name);
+            if (!F) continue;
+            if (param_idx >= F->arg_size()) continue;
+
+            if (!F->hasParamAttribute(param_idx, Attribute::Dereferenceable)) {
+                AttrBuilder builder(F->getContext());
+                builder.addDereferenceableAttr(byte_count);
+                F->addParamAttrs(param_idx, builder);
+                changed = true;
+            }
         }
 
         return changed;
@@ -517,6 +587,35 @@ private:
             }
         }
 
+        // Build struct field index mapping: struct_name → [(field_name, offset)] sorted by offset
+        std::unordered_map<std::string, std::vector<std::pair<std::string, uint64_t>>> struct_fields;
+        for (unsigned i = 0; i < tbaa_md->getNumOperands(); ++i) {
+            MDNode *entry = tbaa_md->getOperand(i);
+            if (!entry || entry->getNumOperands() < 4) continue;
+            auto *struct_name_md = dyn_cast<MDString>(entry->getOperand(0));
+            auto *field_name_md = dyn_cast<MDString>(entry->getOperand(1));
+            auto *offset_md = dyn_cast<ConstantAsMetadata>(entry->getOperand(2));
+            if (!struct_name_md || !field_name_md || !offset_md) continue;
+            std::string sname = struct_name_md->getString().str();
+            std::string fname = field_name_md->getString().str();
+            uint64_t off = cast<ConstantInt>(offset_md->getValue())->getZExtValue();
+            struct_fields[sname].push_back({fname, off});
+        }
+        // Sort each struct's fields by offset to get field indices
+        for (auto& [sname, fields] : struct_fields) {
+            std::sort(fields.begin(), fields.end(),
+                      [](const auto& a, const auto& b) { return a.second < b.second; });
+            // Now populate field_index_tags
+            for (unsigned idx = 0; idx < fields.size(); ++idx) {
+                std::string field_key = sname + "." + fields[idx].first;
+                auto tag_it = cache.access_tags.find(field_key);
+                if (tag_it != cache.access_tags.end()) {
+                    std::string idx_key = sname + "." + std::to_string(idx);
+                    cache.field_index_tags[idx_key] = tag_it->second;
+                }
+            }
+        }
+
         // Second pass: walk all load/store instructions and attach TBAA tags.
         // We look for GEP patterns that match the struct+field combinations
         // and attach the corresponding access tag.
@@ -589,19 +688,11 @@ private:
             auto type_it = cache.type_descriptors.find(type_name);
             if (type_it == cache.type_descriptors.end()) return false;
 
-            // Try to find a matching field access tag
-            // We look for field_key = "struct.Matrix.FIELD_IDX"
-            // We try all known access tags for this struct
-            for (const auto& [key, tag] : cache.access_tags) {
-                // Check if this key belongs to our struct type
-                if (key.find(type_name + ".") != 0) continue;
-
-                // The key format is "struct.Matrix.field_name"
-                // We can't directly map field_idx → field_name here
-                // without more info, so we use the field_idx as a heuristic
-                // by checking the offset in the access tag
-                // For now, attach the first matching tag for this struct
-                I->setMetadata(LLVMContext::MD_tbaa, tag);
+            // Look up the access tag by struct name + field index
+            std::string idx_key = type_name + "." + std::to_string(field_idx);
+            auto tag_it = cache.field_index_tags.find(idx_key);
+            if (tag_it != cache.field_index_tags.end()) {
+                I->setMetadata(LLVMContext::MD_tbaa, tag_it->second);
                 return true;
             }
         }

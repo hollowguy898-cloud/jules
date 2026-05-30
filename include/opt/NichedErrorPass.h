@@ -1,6 +1,8 @@
 #pragma once
 
 #include "opt/PreLLVMPipeline.h"
+#include <cstdint>
+#include <string>
 
 namespace tether {
 
@@ -46,6 +48,25 @@ private:
     int pointer_niches_ = 0;
     int integer_niches_ = 0;
     int struct_fallbacks_ = 0;
+
+    // =======================================================================
+    // NicheInfo — detailed niche analysis result for a success type
+    //
+    // Contains not just the niche kind but the specific bit pattern used
+    // to encode the error state, the original and niched sizes, and a
+    // human-readable description. The IRGenerator reads these fields to
+    // emit the compact error representation.
+    // =======================================================================
+    struct NicheInfo {
+        bool has_niche = false;
+        uint64_t niche_bit_pattern = 0;  // The bit pattern that encodes "error"
+        uint64_t original_size = 0;      // Size of the success type (without niche)
+        uint64_t niched_size = 0;        // Size after niche optimization
+        std::string description;         // Human-readable niche description
+    };
+
+    // Check if a type has a niche (unused bit patterns) and return details
+    NicheInfo checkNiche(TypeId type) const;
 
     // Classify the niche kind for an ErrorType's success type
     NodeMeta::NichedErrorKind classifyNiche(TypeId success_type) const;

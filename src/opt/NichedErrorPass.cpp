@@ -6,6 +6,87 @@
 namespace tether {
 
 // ============================================================================
+// checkNiche — detailed niche analysis for a success type
+//
+// Returns a NicheInfo struct describing whether the success type has unused
+// bit patterns that can encode the error discriminant, what bit pattern to
+// use, and the resulting niched size.
+// ============================================================================
+NichedErrorPass::NicheInfo NichedErrorPass::checkNiche(TypeId type) const {
+    NicheInfo info;
+    if (!type) return info;
+
+    // Pointer types: null pointer is the niche
+    if (isa<PointerType>(type)) {
+        info.has_niche = true;
+        info.niche_bit_pattern = 0;  // null pointer = error
+        info.original_size = 8;      // pointer is 8 bytes
+        info.niched_size = 8;        // no extra byte needed
+        info.description = "null pointer niche";
+        return info;
+    }
+
+    // Reference types: references are non-null, so null is a niche
+    if (isa<ReferenceType>(type) || isa<MutReferenceType>(type)) {
+        info.has_niche = true;
+        info.niche_bit_pattern = 0;
+        info.original_size = 8;
+        info.niched_size = 8;
+        info.description = "null reference niche";
+        return info;
+    }
+
+    // Rc/Arc smart pointers: these are aggregate structs (no pointer niche)
+    if (isa<SmartPointerType>(type)) {
+        auto& sp = cast<SmartPointerType>(type);
+        if (sp.smartPointerKind() == SmartPointerKind::Box) {
+            info.has_niche = true;
+            info.niche_bit_pattern = 0;  // null pointer = error
+            info.original_size = 8;
+            info.niched_size = 8;
+            info.description = "null Box pointer niche";
+            return info;
+        }
+        // Rc/Arc are aggregate structs — no niche available
+        return info;
+    }
+
+    // Bool: i8 has 254 unused bit patterns (only 0 and 1 are valid)
+    if (type->isBool()) {
+        info.has_niche = true;
+        info.niche_bit_pattern = 2;  // 0b00000010 = error
+        info.original_size = 1;
+        info.niched_size = 1;
+        info.description = "bool niche (bit pattern 2)";
+        return info;
+    }
+
+    // Small integer types: use wider integer with high bit as error flag
+    if (isa<PrimitiveType>(type)) {
+        auto& prim = cast<PrimitiveType>(type);
+        if (prim.isInteger() && prim.bitWidth() <= 32) {
+            info.has_niche = true;
+            info.niche_bit_pattern = 1ULL << 63;  // high bit of i64 = error
+            info.original_size = prim.bitWidth() / 8;
+            info.niched_size = 8;  // i64
+            info.description = "integer niche (high bit of i64)";
+            return info;
+        }
+    }
+
+    // AlignedType delegates to its inner type
+    if (isa<AlignedType>(type)) {
+        auto& at = cast<AlignedType>(type);
+        return checkNiche(at.inner());
+    }
+
+    // Option types: if the inner type has a niche, the outer Option can use it too
+    // (Future: handle Option<T> when added to the type system)
+
+    return info;
+}
+
+// ============================================================================
 // classifyNiche — determine which niche strategy applies to a success type
 // ============================================================================
 NodeMeta::NichedErrorKind NichedErrorPass::classifyNiche(TypeId success_type) const {
@@ -64,12 +145,21 @@ void NichedErrorPass::annotateErrorType(TypeId error_type) {
     TypeId succ = err.successType();
     auto kind = classifyNiche(succ);
 
+    // Perform detailed niche analysis via checkNiche
+    NicheInfo niche = checkNiche(succ);
+
     // Write to metadata map keyed by the TypeId's raw pointer
     // (types are interned, so the same TypeId always has the same pointer)
     if (meta_map_) {
         auto& nm = meta_map_->getOrCreate(succ.raw());
         nm.niched_error = (kind != NodeMeta::NichedErrorKind::StructFallback);
         nm.niched_error_kind = kind;
+
+        // Store detailed niche info for the IRGenerator
+        nm.has_niche = niche.has_niche;
+        nm.niche_bit_pattern = niche.niche_bit_pattern;
+        nm.niched_size = niche.niched_size;
+        nm.niche_description = niche.description;
     }
 
     switch (kind) {
