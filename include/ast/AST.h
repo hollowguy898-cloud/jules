@@ -1531,7 +1531,9 @@ public:
            std::unique_ptr<BlockStmt> body,
            bool is_pure = false,
            TypeId error_type = TypeId(),
-           std::vector<CompilerDirective> directives = {})
+           std::vector<CompilerDirective> directives = {},
+           std::vector<std::string> type_params = {},
+           std::vector<TypeId> type_param_bounds = {})
         : TopLevel(NodeKind::FnDecl, std::move(loc))
         , name_(std::move(name))
         , params_(std::move(params))
@@ -1543,6 +1545,8 @@ public:
         , is_async_(false)
         , error_type_(error_type)
         , directives_(std::move(directives))
+        , type_params_(std::move(type_params))
+        , type_param_bounds_(std::move(type_param_bounds))
     {}
 
     const std::string& name() const { return name_; }
@@ -1575,6 +1579,12 @@ public:
         return false;
     }
 
+    // Type parameters for generic functions (e.g., ["T"] for fn max<T>(a: T, b: T) -> T)
+    const std::vector<std::string>& typeParams() const { return type_params_; }
+    const std::vector<TypeId>& typeParamBounds() const { return type_param_bounds_; }
+    bool isGeneric() const { return !type_params_.empty(); }
+    size_t typeParamCount() const { return type_params_.size(); }
+
     // Check if any parameter is an allocator parameter
     bool hasAllocatorParam() const {
         for (const auto& p : params_) {
@@ -1605,6 +1615,8 @@ private:
     bool is_async_ = false;
     TypeId error_type_;
     std::vector<CompilerDirective> directives_;
+    std::vector<std::string> type_params_;       // e.g., ["T"] for fn max<T>
+    std::vector<TypeId> type_param_bounds_;      // e.g., [Ord] for fn max<T: Ord>
 };
 
 // ---- StructDecl ----

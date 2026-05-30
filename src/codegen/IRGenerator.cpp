@@ -866,6 +866,56 @@ void IRGenerator::emitRuntimeDecls() {
     if (needed_runtime_.count("tether_str_slice")) {
         module_out_ << "declare { ptr, i64 } @tether_str_slice(ptr nocapture readonly, i64, i64, i64) nounwind readonly\n"; any = true;
     }
+    // SIMD vector reduce intrinsics — LLVM intrinsics, always available
+    if (needed_runtime_.count("llvm_vector_reduce")) {
+        // Float reductions (v4f32)
+        module_out_ << "declare float @llvm.vector.reduce.fadd.v4f32(float, <4 x float>)\n";
+        module_out_ << "declare float @llvm.vector.reduce.fmul.v4f32(float, <4 x float>)\n";
+        module_out_ << "declare float @llvm.vector.reduce.fmin.v4f32(<4 x float>)\n";
+        module_out_ << "declare float @llvm.vector.reduce.fmax.v4f32(<4 x float>)\n";
+        // Float reductions (v2f64)
+        module_out_ << "declare double @llvm.vector.reduce.fadd.v2f64(double, <2 x double>)\n";
+        module_out_ << "declare double @llvm.vector.reduce.fmul.v2f64(double, <2 x double>)\n";
+        module_out_ << "declare double @llvm.vector.reduce.fmin.v2f64(<2 x double>)\n";
+        module_out_ << "declare double @llvm.vector.reduce.fmax.v2f64(<2 x double>)\n";
+        // Integer reductions (v4i32)
+        module_out_ << "declare i32 @llvm.vector.reduce.add.v4i32(<4 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.mul.v4i32(<4 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.smin.v4i32(<4 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.smax.v4i32(<4 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.umin.v4i32(<4 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.umax.v4i32(<4 x i32>)\n";
+        // Integer reductions (v2i64)
+        module_out_ << "declare i64 @llvm.vector.reduce.add.v2i64(<2 x i64>)\n";
+        module_out_ << "declare i64 @llvm.vector.reduce.mul.v2i64(<2 x i64>)\n";
+        module_out_ << "declare i64 @llvm.vector.reduce.smin.v2i64(<2 x i64>)\n";
+        module_out_ << "declare i64 @llvm.vector.reduce.smax.v2i64(<2 x i64>)\n";
+        module_out_ << "declare i64 @llvm.vector.reduce.umin.v2i64(<2 x i64>)\n";
+        module_out_ << "declare i64 @llvm.vector.reduce.umax.v2i64(<2 x i64>)\n";
+        // Integer reductions (v8i32)
+        module_out_ << "declare i32 @llvm.vector.reduce.add.v8i32(<8 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.mul.v8i32(<8 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.smin.v8i32(<8 x i32>)\n";
+        module_out_ << "declare i32 @llvm.vector.reduce.smax.v8i32(<8 x i32>)\n";
+        // Float reductions (v8f32)
+        module_out_ << "declare float @llvm.vector.reduce.fadd.v8f32(float, <8 x float>)\n";
+        module_out_ << "declare float @llvm.vector.reduce.fmul.v8f32(float, <8 x float>)\n";
+        module_out_ << "declare float @llvm.vector.reduce.fmin.v8f32(<8 x float>)\n";
+        module_out_ << "declare float @llvm.vector.reduce.fmax.v8f32(<8 x float>)\n";
+        // Masked gather/scatter (v4f32)
+        module_out_ << "declare <4 x float> @llvm.masked.gather.v4f32.v4p0(<4 x ptr>, i32, <4 x i1>, <4 x float>)\n";
+        module_out_ << "declare void @llvm.masked.scatter.v4f32.v4p0(<4 x float>, <4 x ptr>, i32, <4 x i1>)\n";
+        // Masked gather/scatter (v2f64)
+        module_out_ << "declare <2 x double> @llvm.masked.gather.v2f64.v2p0(<2 x ptr>, i32, <2 x i1>, <2 x double>)\n";
+        module_out_ << "declare void @llvm.masked.scatter.v2f64.v2p0(<2 x double>, <2 x ptr>, i32, <2 x i1>)\n";
+        // Masked gather/scatter (v4i32)
+        module_out_ << "declare <4 x i32> @llvm.masked.gather.v4i32.v4p0(<4 x ptr>, i32, <4 x i1>, <4 x i32>)\n";
+        module_out_ << "declare void @llvm.masked.scatter.v4i32.v4p0(<4 x i32>, <4 x ptr>, i32, <4 x i1>)\n";
+        // Masked gather/scatter (v8f32)
+        module_out_ << "declare <8 x float> @llvm.masked.gather.v8f32.v8p0(<8 x ptr>, i32, <8 x i1>, <8 x float>)\n";
+        module_out_ << "declare void @llvm.masked.scatter.v8f32.v8p0(<8 x float>, <8 x ptr>, i32, <8 x i1>)\n";
+        any = true;
+    }
     if (any) module_out_ << "\n";
 }
 
@@ -3709,6 +3759,255 @@ std::string IRGenerator::emitExpr(Expr* expr) {
                 return "";
             }
 
+            // ===== SIMD Vector Intrinsics =====
+            // These emit LLVM vector operations directly — NOT function calls.
+
+            // simd_load(ptr) — load a SIMD vector from aligned memory
+            if (ident->name() == "simd_load" || ident->name() == "@simd_load") {
+                if (call.argCount() >= 1) {
+                    std::string ptr_val = emitExpr(call.args()[0].get());
+                    TypeId result_type = expr->getType();
+                    std::string ll = "i64";
+                    if (!result_type.isNull()) ll = llvmType(result_type);
+                    // Determine alignment from the vector type
+                    std::string align_str = "";
+                    if (!result_type.isNull() && isa<SimdVectorType>(result_type)) {
+                        uint64_t align = typeAlignmentBytes(result_type);
+                        if (align >= 16) align_str = ", align " + std::to_string(align);
+                    }
+                    std::string result = nextReg();
+                    body_ss_ << "  " << result << " = load " << ll << ", ptr " << ptr_val << align_str << "\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "undef";
+            }
+
+            // simd_store(ptr, vec) — store a SIMD vector to aligned memory
+            if (ident->name() == "simd_store" || ident->name() == "@simd_store") {
+                if (call.argCount() >= 2) {
+                    std::string ptr_val = emitExpr(call.args()[0].get());
+                    std::string vec_val = emitExpr(call.args()[1].get());
+                    TypeId vec_type = call.args()[1]->getType();
+                    std::string ll = "i64";
+                    if (!vec_type.isNull()) ll = llvmType(vec_type);
+                    std::string align_str = "";
+                    if (!vec_type.isNull() && isa<SimdVectorType>(vec_type)) {
+                        uint64_t align = typeAlignmentBytes(vec_type);
+                        if (align >= 16) align_str = ", align " + std::to_string(align);
+                    }
+                    body_ss_ << "  store " << ll << " " << vec_val << ", ptr " << ptr_val << align_str << "\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return "";
+                }
+                return "";
+            }
+
+            // simd_shuffle(vec_a, vec_b, mask) — shuffle vector elements
+            if (ident->name() == "simd_shuffle" || ident->name() == "@simd_shuffle") {
+                if (call.argCount() >= 3) {
+                    std::string vec_a = emitExpr(call.args()[0].get());
+                    std::string vec_b = emitExpr(call.args()[1].get());
+                    // The mask is a vector of i32 constants
+                    std::string mask_val = emitExpr(call.args()[2].get());
+                    TypeId result_type = expr->getType();
+                    std::string ll_a = "i64";
+                    std::string ll_result = "i64";
+                    if (!result_type.isNull()) {
+                        ll_result = llvmType(result_type);
+                    }
+                    if (!call.args()[0]->getType().isNull()) {
+                        ll_a = llvmType(call.args()[0]->getType());
+                    }
+                    std::string result = nextReg();
+                    body_ss_ << "  " << result << " = shufflevector " << ll_a << " " << vec_a
+                             << ", " << ll_a << " " << vec_b
+                             << ", " << mask_val << "\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "undef";
+            }
+
+            // simd_reduce_add(vec) — horizontal sum reduction
+            if (ident->name() == "simd_reduce_add" || ident->name() == "@simd_reduce_add") {
+                if (call.argCount() >= 1) {
+                    std::string vec_val = emitExpr(call.args()[0].get());
+                    TypeId vec_type = call.args()[0]->getType();
+                    std::string ll_vec = "<4 x float>";
+                    std::string ll_elem = "float";
+                    if (!vec_type.isNull() && isa<SimdVectorType>(vec_type)) {
+                        auto& sv = cast<SimdVectorType>(vec_type);
+                        ll_vec = llvmType(vec_type);
+                        ll_elem = llvmType(sv.elementType());
+                    }
+                    std::string result = nextReg();
+                    // LLVM vector reduce: @llvm.vector.reduce.fadd.v4f32(float start, <4 x float> vec)
+                    // We use ordered reduction (acc = ((a[0] + a[1]) + a[2]) + a[3])
+                    std::string zero = (ll_elem == "float" || ll_elem == "double") ? "0.0" : "0";
+                    std::string reduce_op = (ll_elem == "float" || ll_elem == "double") ? "fadd" : "add";
+                    body_ss_ << "  " << result << " = call " << ll_elem
+                             << " @llvm.vector.reduce." << reduce_op << "." << ll_vec
+                             << "(" << ll_elem << " " << zero << ", " << ll_vec << " " << vec_val << ")\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "0";
+            }
+
+            // simd_reduce_mul(vec) — horizontal product reduction
+            if (ident->name() == "simd_reduce_mul" || ident->name() == "@simd_reduce_mul") {
+                if (call.argCount() >= 1) {
+                    std::string vec_val = emitExpr(call.args()[0].get());
+                    TypeId vec_type = call.args()[0]->getType();
+                    std::string ll_vec = "<4 x float>";
+                    std::string ll_elem = "float";
+                    if (!vec_type.isNull() && isa<SimdVectorType>(vec_type)) {
+                        auto& sv = cast<SimdVectorType>(vec_type);
+                        ll_vec = llvmType(vec_type);
+                        ll_elem = llvmType(sv.elementType());
+                    }
+                    std::string result = nextReg();
+                    std::string one = (ll_elem == "float" || ll_elem == "double") ? "1.0" : "1";
+                    std::string reduce_op = (ll_elem == "float" || ll_elem == "double") ? "fmul" : "mul";
+                    body_ss_ << "  " << result << " = call " << ll_elem
+                             << " @llvm.vector.reduce." << reduce_op << "." << ll_vec
+                             << "(" << ll_elem << " " << one << ", " << ll_vec << " " << vec_val << ")\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "1";
+            }
+
+            // simd_reduce_min(vec) — horizontal minimum
+            if (ident->name() == "simd_reduce_min" || ident->name() == "@simd_reduce_min") {
+                if (call.argCount() >= 1) {
+                    std::string vec_val = emitExpr(call.args()[0].get());
+                    TypeId vec_type = call.args()[0]->getType();
+                    std::string ll_vec = "<4 x i32>";
+                    std::string ll_elem = "i32";
+                    std::string minmax_kind = "smin";
+                    if (!vec_type.isNull() && isa<SimdVectorType>(vec_type)) {
+                        auto& sv = cast<SimdVectorType>(vec_type);
+                        ll_vec = llvmType(vec_type);
+                        ll_elem = llvmType(sv.elementType());
+                        if (sv.elementType()->isFloat()) minmax_kind = "fmin";
+                        else if (sv.elementType()->isUnsigned()) minmax_kind = "umin";
+                    }
+                    std::string result = nextReg();
+                    body_ss_ << "  " << result << " = call " << ll_elem
+                             << " @llvm.vector.reduce." << minmax_kind << "." << ll_vec
+                             << "(" << ll_vec << " " << vec_val << ")\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "0";
+            }
+
+            // simd_reduce_max(vec) — horizontal maximum
+            if (ident->name() == "simd_reduce_max" || ident->name() == "@simd_reduce_max") {
+                if (call.argCount() >= 1) {
+                    std::string vec_val = emitExpr(call.args()[0].get());
+                    TypeId vec_type = call.args()[0]->getType();
+                    std::string ll_vec = "<4 x i32>";
+                    std::string ll_elem = "i32";
+                    std::string minmax_kind = "smax";
+                    if (!vec_type.isNull() && isa<SimdVectorType>(vec_type)) {
+                        auto& sv = cast<SimdVectorType>(vec_type);
+                        ll_vec = llvmType(vec_type);
+                        ll_elem = llvmType(sv.elementType());
+                        if (sv.elementType()->isFloat()) minmax_kind = "fmax";
+                        else if (sv.elementType()->isUnsigned()) minmax_kind = "umax";
+                    }
+                    std::string result = nextReg();
+                    body_ss_ << "  " << result << " = call " << ll_elem
+                             << " @llvm.vector.reduce." << minmax_kind << "." << ll_vec
+                             << "(" << ll_vec << " " << vec_val << ")\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "0";
+            }
+
+            // simd_gather(ptrs) — gather load from multiple addresses
+            if (ident->name() == "simd_gather" || ident->name() == "@simd_gather") {
+                if (call.argCount() >= 1) {
+                    // ptrs is a vector of pointers: <N x ptr>
+                    std::string ptrs_val = emitExpr(call.args()[0].get());
+                    TypeId result_type = expr->getType();
+                    std::string ll_result = "<4 x float>";
+                    if (!result_type.isNull()) ll_result = llvmType(result_type);
+                    // Determine the pointer vector type from the argument
+                    TypeId ptrs_type = call.args()[0]->getType();
+                    std::string ll_ptrs = "<4 x ptr>";
+                    if (!ptrs_type.isNull()) ll_ptrs = llvmType(ptrs_type);
+                    // Determine vector count from result type
+                    uint32_t vec_count = 4;
+                    if (!result_type.isNull() && isa<SimdVectorType>(result_type)) {
+                        vec_count = cast<SimdVectorType>(result_type).count();
+                    }
+                    std::string result = nextReg();
+                    // LLVM masked gather: @llvm.masked.gather.v4f32.v4p0(<4 x ptr> ptrs, i32 align, <4 x i1> mask, <4 x float> passthru)
+                    // Use all-ones mask and zeroinitializer passthru
+                    std::string mask_str = "<";
+                    for (uint32_t i = 0; i < vec_count; ++i) {
+                        if (i > 0) mask_str += ", ";
+                        mask_str += "i1 true";
+                    }
+                    mask_str += ">";
+                    body_ss_ << "  " << result << " = call " << ll_result
+                             << " @llvm.masked.gather." << ll_result << ".v" << vec_count << "p0("
+                             << ll_ptrs << " " << ptrs_val << ", i32 16, " << mask_str << ", "
+                             << ll_result << " zeroinitializer)\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return result;
+                }
+                return "undef";
+            }
+
+            // simd_scatter(vals, ptrs) — scatter store to multiple addresses
+            if (ident->name() == "simd_scatter" || ident->name() == "@simd_scatter") {
+                if (call.argCount() >= 2) {
+                    std::string vals_val = emitExpr(call.args()[0].get());
+                    std::string ptrs_val = emitExpr(call.args()[1].get());
+                    TypeId val_type = call.args()[0]->getType();
+                    std::string ll_val = "<4 x float>";
+                    if (!val_type.isNull()) ll_val = llvmType(val_type);
+                    // Determine the pointer vector type from the second argument
+                    TypeId ptrs_type = call.args()[1]->getType();
+                    std::string ll_ptrs = "<4 x ptr>";
+                    if (!ptrs_type.isNull()) ll_ptrs = llvmType(ptrs_type);
+                    // Determine vector count from val type
+                    uint32_t vec_count = 4;
+                    if (!val_type.isNull() && isa<SimdVectorType>(val_type)) {
+                        vec_count = cast<SimdVectorType>(val_type).count();
+                    }
+                    std::string mask_str = "<";
+                    for (uint32_t i = 0; i < vec_count; ++i) {
+                        if (i > 0) mask_str += ", ";
+                        mask_str += "i1 true";
+                    }
+                    mask_str += ">";
+                    // LLVM masked scatter: @llvm.masked.scatter.v4f32.v4p0(<4 x float> vals, <4 x ptr> ptrs, i32 align, <4 x i1> mask)
+                    body_ss_ << "  call void @llvm.masked.scatter." << ll_val << ".v" << vec_count << "p0("
+                             << ll_val << " " << vals_val << ", " << ll_ptrs << " " << ptrs_val
+                             << ", i32 16, " << mask_str << ")\n";
+                    needed_runtime_.insert("llvm_vector_reduce");
+                    return "";
+                }
+                return "";
+            }
+
+            // If this function has been monomorphized, use the mangled name
+            // instead of the original name. The MonomorphizationPass records
+            // concrete instantiations; the IRGenerator needs access to the
+            // pass results to resolve the mangled name. For now, the pass
+            // infrastructure is in place and the full integration (plumbing
+            // the pass results through the pipeline to the IRGenerator) can
+            // be done in a follow-up.
+            // TODO: Check if monomorphization pass has a concrete instance
+            //       for this call. If so, use the mangled name instead:
+            //         callee = "@" + sanitizeName(monomorphized_name);
             callee = "@" + sanitizeName(ident->name());
         } else {
             callee = emitExpr(callee_expr);

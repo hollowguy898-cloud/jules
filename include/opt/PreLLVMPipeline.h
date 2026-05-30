@@ -13,6 +13,7 @@
 #include "metadata/ProfileGuidedOptimizer.h"
 #include "opt/SpeculativeOptimizer.h"
 #include "opt/ComptimeEvaluator.h"
+#include "opt/MonomorphizationPass.h"
 
 #include <string>
 #include <unordered_map>

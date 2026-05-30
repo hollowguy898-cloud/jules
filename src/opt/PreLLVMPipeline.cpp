@@ -12,6 +12,7 @@
 #include "opt/EscapeAnalysis.h"
 #include "opt/NichedErrorPass.h"
 #include "opt/AllocFusionPass.h"
+#include "opt/MonomorphizationPass.h"
 
 #include <sstream>
 #include <iostream>
@@ -120,6 +121,12 @@ PreLLVMPipeline::PreLLVMPipeline(PreLLVMOptLevel level, TypeTable& type_table)
     // instead of { T, i1 } for error types. Must run BEFORE codegen so
     // the IRGenerator knows which representation to use.
     addPass(std::make_unique<NichedErrorPass>());
+
+    // Monomorphization — replaces generic function calls with concrete
+    // instantiations. Must run before code generation so the IRGenerator
+    // can emit calls to the concrete instantiations instead of using
+    // runtime dispatch (vtable) or boxing.
+    addPass(std::make_unique<MonomorphizationPass>());
 
     if (level_ == PreLLVMOptLevel::Aggressive) {
         // Allocation fusion — batch consecutive Box allocations
