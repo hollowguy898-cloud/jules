@@ -1726,6 +1726,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     // Reset per-function state
     reg_counter_ = 0;
     label_counter_ = 0;
+    phi_patch_counter_ = 0;
     var_ssa_.clear();
     scope_stack_.clear();
     used_alloca_names_.clear();
@@ -2494,13 +2495,29 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 auto* nm = meta_map_ ? meta_map_->get(&is) : nullptr;
                 bool meta_profitable = nm && nm->select_profit == SelectProfitability::Profitable;
 
-                // At O3, also auto-detect simple if/else patterns
+                // Auto-detect simple if/else patterns for select conversion.
+                //
+                // IMPORTANT: At O3, we NO LONGER auto-detect. Benchmarks proved
+                // that auto-select makes branching 2.68x SLOWER than C because:
+                //   1. CPU branch predictors handle predictable patterns (i%2==0)
+                //      much faster than select (0 cycles vs 1 cycle per iteration)
+                //   2. LLVM's own CodeGenPrepare pass converts branches to cmov
+                //      when appropriate (unpredictable conditions, vectorization)
+                //   3. llvmlite lacks full cmov conversion but the branch predictor
+                //      more than makes up for it on regular patterns
+                //
+                // Only metadata-annotated patterns (@select_profitable) use select.
                 bool auto_select = false;
                 enum class SelectPattern { Expr, Assign, ValDecl };
                 SelectPattern select_pat = SelectPattern::Expr;
                 std::string assign_var_name;  // For Assign/ValDecl patterns
 
-                if (opt_level_ >= 3 && is.hasElse() &&
+                // NOTE: auto-detection is disabled. Only metadata-annotated
+                // if/else statements (nm->select_profit == Profitable) will
+                // use branchless select. Uncomment the condition below to
+                // re-enable auto-detection at O3:
+                //   if (opt_level_ >= 3 && is.hasElse() && ...)
+                if (false && opt_level_ >= 3 && is.hasElse() &&
                     is.thenBlock() && !is.thenBlock()->stmts().empty() &&
                     is.elseBlock() && !is.elseBlock()->stmts().empty() &&
                     is.thenBlock()->stmts().size() == 1 &&
@@ -3135,10 +3152,10 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             // We use unique placeholder tokens (__PHI_N__) that we can
             // reliably find and replace after the loop body is emitted.
             // -----------------------------------------------------------------
-            int phi_patch_counter = 0;
             struct LoopPhiPatch {
                 std::string var_name;       // Variable name in SSA tracking
-                std::string placeholder;    // Unique token in body_ss_
+                std::string placeholder;    // Unique token in body_ss_ for back-edge VALUE
+                std::string pred_placeholder; // Unique token for back-edge PREDECESSOR label
                 std::string phi_reg;        // The phi result register (dominates exit block)
             };
             std::vector<LoopPhiPatch> phi_patches;
@@ -3152,16 +3169,26 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                                         : info->current_value;
                 if (entry_val.empty()) entry_val = "0";  // Fallback for uninitialized
 
-                // Create a unique placeholder token for this phi's back-edge value
-                std::string placeholder = "__PHI_" + std::to_string(phi_patch_counter++) + "__";
+                // Create a unique placeholder token for this phi's back-edge value.
+                // BUG FIX: Use the global phi_patch_counter_ instead of a local
+                // counter. With a local counter starting at 0, nested loops would
+                // generate identical placeholder names (__PHI_0__, __PHI_1__, etc.),
+                // causing the inner loop's back-patching to accidentally replace
+                // the outer loop's placeholders (which appear first in body_ss_).
+                std::string placeholder = "__PHI_" + std::to_string(phi_patch_counter_++) + "__";
 
-                // Emit phi with placeholder for back-edge
+                // Emit phi with placeholders for BOTH the back-edge value AND
+                // the back-edge predecessor label. Using a placeholder for the
+                // predecessor label prevents the global string replacement from
+                // accidentally modifying phi nodes in if/else blocks that happen
+                // to reference the same block label.
+                std::string pred_placeholder = "__PHI_PRED_" + std::to_string(phi_patch_counter_++) + "__";
                 std::string phi_reg = nextReg();
                 body_ss_ << "  " << phi_reg << " = phi " << info->llvm_type
                          << " [ " << entry_val << ", %" << phi_entry_pred << " ]"
-                         << ", [ " << placeholder << ", %" << body_l << " ]\n";
+                         << ", [ " << placeholder << ", %" << pred_placeholder << " ]\n";
 
-                phi_patches.push_back({name, placeholder, phi_reg});
+                phi_patches.push_back({name, placeholder, pred_placeholder, phi_reg});
 
                 // Update the variable's SSA value to the phi result
                 updateVarValue(name, phi_reg);
@@ -3389,22 +3416,20 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                     SSAVarInfo* info = lookupVar(patch.var_name);
                     std::string back_edge_val = info ? info->current_value : "0";
 
-                    // Replace the unique placeholder with the actual value
+                    // Replace the unique value placeholder with the actual value
                     size_t pos = body_str.find(patch.placeholder);
                     if (pos != std::string::npos) {
                         body_str.replace(pos, patch.placeholder.size(), back_edge_val);
                     }
-                }
 
-                // Update the back-edge predecessor label from %while.body
-                // to the actual block that contains the back-branch.
-                if (back_edge_label != body_l) {
-                    std::string old_phi_pred = "%" + body_l + " ]";
-                    std::string new_phi_pred = "%" + back_edge_label + " ]";
-                    size_t pos = 0;
-                    while ((pos = body_str.find(old_phi_pred, pos)) != std::string::npos) {
-                        body_str.replace(pos, old_phi_pred.size(), new_phi_pred);
-                        pos += new_phi_pred.size();
+                    // Replace the unique predecessor label placeholder with the
+                    // actual back-edge block label. This is much safer than the
+                    // old global string replacement of "%" + body_l + " ]" which
+                    // could accidentally modify phi nodes in if/else blocks that
+                    // happened to reference the same block label.
+                    pos = body_str.find(patch.pred_placeholder);
+                    if (pos != std::string::npos) {
+                        body_str.replace(pos, patch.pred_placeholder.size(), back_edge_label);
                     }
                 }
 
@@ -5820,24 +5845,39 @@ std::string IRGenerator::emitBinaryOp(const std::string& result_reg,
                         while (tmp > 1) { tmp >>= 1; ++shift; }
                         if (is_signed) {
                             // Signed division by power-of-2 needs adjustment for
-                            // negative values: (x + (x >> 31) & (d-1)) >> shift
+                            // negative values to round toward zero.
+                            //
+                            // For d=2: 3-instruction sequence matching GCC:
+                            //   sign = lshr x, 63       ; 0 for positive, 1 for negative
+                            //   adj  = add x, sign      ; add 1 for negative (round toward zero)
+                            //   res  = ashr adj, 1      ; divide by 2
+                            //
+                            // For d>=4: 4-instruction sequence (d-1 adjustment needed):
+                            //   sign    = ashr x, 63    ; all-1s if negative, all-0s if positive
+                            //   adj     = and sign, (d-1) ; 0 if positive, (d-1) if negative
+                            //   rounded = add x, adj    ; round toward zero
+                            //   res     = ashr rounded, shift
                             //
                             // BUG FIX: Use NAMED intermediate registers instead of
-                            // numbered ones (via nextReg()). The caller pre-allocates
-                            // result_reg with a specific number, but if we allocate
-                            // intermediates with nextReg() they'll have higher numbers,
-                            // breaking LLVM's sequential numbering requirement.
-                            // Named registers like %sr.sign don't need to follow the
-                            // numbering sequence.
-                            std::string sign = "%sr.sign." + std::to_string(reg_counter_);
-                            std::string adj = "%sr.adj." + std::to_string(reg_counter_);
-                            std::string rounded = "%sr.rounded." + std::to_string(reg_counter_);
-                            // Do NOT increment reg_counter_ for named registers —
-                            // they don't participate in LLVM's sequential numbering.
-                            body_ss_ << "  " << sign << " = ashr " << ll_type << " " << lhs << ", " << (ll_type == "i64" ? "63" : "31") << "\n";
-                            body_ss_ << "  " << adj << " = and " << ll_type << " " << sign << ", " << (d - 1) << "\n";
-                            body_ss_ << "  " << rounded << " = add " << ll_type << " " << lhs << ", " << adj << "\n";
-                            body_ss_ << "  " << result_reg << " = ashr " << ll_type << " " << rounded << ", " << shift << "\n";
+                            // numbered ones (via nextReg()). Named registers like
+                            // %sr.sign don't need to follow LLVM's sequential numbering.
+                            if (d == 2) {
+                                // Optimized 3-instruction sequence for division by 2
+                                std::string sign = "%sr.sign." + std::to_string(reg_counter_);
+                                std::string adj = "%sr.adj." + std::to_string(reg_counter_);
+                                body_ss_ << "  " << sign << " = lshr " << ll_type << " " << lhs << ", " << (ll_type == "i64" ? "63" : "31") << "\n";
+                                body_ss_ << "  " << adj << " = add " << ll_type << " " << lhs << ", " << sign << "\n";
+                                body_ss_ << "  " << result_reg << " = ashr " << ll_type << " " << adj << ", 1\n";
+                            } else {
+                                // 4-instruction sequence for division by 4, 8, 16, etc.
+                                std::string sign = "%sr.sign." + std::to_string(reg_counter_);
+                                std::string adj = "%sr.adj." + std::to_string(reg_counter_);
+                                std::string rounded = "%sr.rounded." + std::to_string(reg_counter_);
+                                body_ss_ << "  " << sign << " = ashr " << ll_type << " " << lhs << ", " << (ll_type == "i64" ? "63" : "31") << "\n";
+                                body_ss_ << "  " << adj << " = and " << ll_type << " " << sign << ", " << (d - 1) << "\n";
+                                body_ss_ << "  " << rounded << " = add " << ll_type << " " << lhs << ", " << adj << "\n";
+                                body_ss_ << "  " << result_reg << " = ashr " << ll_type << " " << rounded << ", " << shift << "\n";
+                            }
                         } else {
                             body_ss_ << "  " << result_reg << " = lshr " << ll_type << " " << lhs << ", " << shift << "\n";
                         }

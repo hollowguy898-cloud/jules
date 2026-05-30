@@ -186,6 +186,8 @@ private:
     // =======================================================================
     int reg_counter_   = 0;
     int label_counter_ = 0;
+    int phi_patch_counter_ = 0;  // Global counter for unique phi placeholder names
+                                  // (prevents collision in nested loops)
 
     // =======================================================================
     // SSA Variable Tracking
