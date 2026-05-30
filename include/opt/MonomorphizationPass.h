@@ -35,20 +35,18 @@ struct GenericInstance {
 // boxing — both are 10-100x slower than generating specialized code for each
 // concrete type.
 //
-// The pass operates in three phases:
-//   1. Identify all generic function definitions (those with type_params_)
-//   2. Walk all call sites and infer concrete type arguments from argument types
-//   3. For each (generic_fn, concrete_types) pair, record a GenericInstance
-//      and store the mangled name in the MetadataMap for the IRGenerator to use
+// The pass operates in six phases:
+//   Phase 1: Identify all generic function definitions (those with type_params_)
+//   Phase 2: Walk all call sites and infer concrete type arguments from arg types
+//   Phase 3: For each (generic_fn, concrete_types) pair, record a GenericInstance
+//   Phase 4: Clone the generic function body with type parameter substitution
+//   Phase 5: Add monomorphized functions to the Program
+//   Phase 6: Rewrite call sites to call the monomorphized function
 //
-// LLVM CANNOT do this: it has no concept of type-parameterized functions.
-// Monomorphization must happen at the AST level before LLVM IR emission.
-//
-// Future work:
-//   - Clone the generic function body and substitute type parameters
-//   - Add the monomorphized function to the Program
-//   - Replace the original call with a call to the monomorphized version
-//   - Support explicit type arguments at call sites (e.g., max<i32>(3, 5))
+// Phases 4-6 are the "keystone" optimization: they unlock ALL other
+// optimizations (inlining, SROA, TBAA, auto-vectorization, escape analysis,
+// AoS→SoA, etc.) for generic code, which was previously type-erased and
+// opaque to LLVM.
 // ============================================================================
 class MonomorphizationPass : public PreLLVMPass {
 public:
@@ -68,6 +66,17 @@ public:
     std::string getMangledName(const std::string& fn_name,
                                 const std::vector<TypeId>& types) const;
 
+    // Get the monomorphization map: original_name -> mangled_name
+    // Used by the IRGenerator to resolve call targets
+    const std::unordered_map<std::string, std::string>& instanceMap() const {
+        return instance_map_;
+    }
+
+    // Look up the monomorphized name for a call to fn_name with the given
+    // argument types. Returns empty string if no monomorphized version exists.
+    std::string resolveCall(const std::string& fn_name,
+                            const std::vector<TypeId>& arg_types) const;
+
 private:
     // Collected instantiations
     std::vector<GenericInstance> instances_;
@@ -84,6 +93,10 @@ private:
 
     // Sanitize a type name for use in mangled identifiers
     std::string sanitizeTypeName(const std::string& type_name) const;
+
+    // Make the lookup key for instance_map_: fn_name;type1;type2;...
+    std::string makeKey(const std::string& fn_name,
+                        const std::vector<TypeId>& types) const;
 
     // Collect all call sites that need monomorphization
     void collectCallSites(Program& program, TypeTable& type_table);
@@ -102,6 +115,30 @@ private:
     void walkBlock(BlockStmt* block,
                    const std::vector<FnDecl*>& generic_fns,
                    TypeTable& type_table);
+
+    // Phase 4: Clone generic function bodies with type substitution
+    void cloneInstances(Program& program, TypeTable& type_table);
+
+    // Phase 6: Rewrite call sites to call monomorphized functions
+    void rewriteCallSites(Program& program, TypeTable& type_table);
+
+    // Rewrite calls in an expression tree
+    void rewriteExpr(Expr* expr);
+
+    // Rewrite calls in a statement tree
+    void rewriteStmt(Stmt* stmt);
+
+    // Rewrite calls in a block
+    void rewriteBlock(BlockStmt* block);
+
+    // Find the GenericInstance matching a call to fn_name with the given arg types
+    const GenericInstance* findInstanceForCall(
+        const std::string& fn_name,
+        const std::vector<TypeId>& arg_types) const;
+
+    // Track the set of generic functions that are still referenced
+    // (to decide whether we can remove the original generic fn later)
+    std::unordered_set<std::string> referenced_generics_;
 };
 
 } // namespace tether

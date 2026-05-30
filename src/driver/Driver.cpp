@@ -579,6 +579,15 @@ bool Driver::runBackend() {
             cmd << " -fprofile-use=" << profile_use_;
         }
 
+        // LTO: enable ThinLTO for user code at -O2 and above.
+        // ThinLTO provides most of the cross-function optimization benefits
+        // of full LTO with much lower compile time. This is critical for
+        // monomorphized generic code where inlining across call sites
+        // determines whether LLVM can auto-vectorize.
+        if (opt_level_ >= 2) {
+            cmd << " -flto=thin";
+        }
+
         cmd << " -c " << ir_file_path_;
 
         if (emit_type_ == EmitType::Assembly) {
@@ -752,6 +761,13 @@ bool Driver::runLinker() {
         default: cmd << " -O2"; break;
     }
 
+    // LTO: match the backend compilation LTO mode for the link step.
+    // When we compiled with -flto=thin, we must link with the same flag
+    // so the linker plugin can perform cross-module optimization.
+    if (opt_level_ >= 2) {
+        cmd << " -flto=thin";
+    }
+
     // PGO: profile-generate / profile-use flags
     if (profile_generate_) {
         cmd << " -fprofile-generate";
@@ -838,7 +854,7 @@ std::string Driver::findExecutable(const std::string& name) {
 std::string Driver::findClang() const {
     // Try versioned names first (common on Linux)
     static const char* clang_names[] = {
-        "clang-18", "clang-17", "clang-16", "clang-15",
+        "clang-19", "clang-18", "clang-17", "clang-16", "clang-15",
         "clang-14", "clang-13", "clang-12",
         "clang"
     };

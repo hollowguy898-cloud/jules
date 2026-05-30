@@ -253,6 +253,13 @@ struct NodeMeta {
     bool alloc_fused = false;            // This Box allocation is part of a fused batch
     int64_t alloc_batch_size = 0;        // Total batch size (only set on the first allocation in a batch)
     int64_t alloc_batch_offset = 0;      // Offset within the batch for this allocation
+
+    // Monomorphization (from MonomorphizationPass)
+    // When set on a CallExpr, indicates that the call should be emitted
+    // using the mangled monomorphized function name instead of the generic name.
+    // This is the Phase 6 bridge: the pass records which calls should use
+    // which concrete instantiation, and the IRGenerator reads this field.
+    std::string monomorphized_target;    // e.g., "max_i32" (empty = not monomorphized)
 };
 
 // ============================================================================

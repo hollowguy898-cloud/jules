@@ -1938,6 +1938,7 @@ public:
     virtual void visitParallelForStmt(ParallelForStmt&) {}
     virtual void visitStaticAssertStmt(StaticAssertStmt&) {}
     virtual void visitSpawnStmt(SpawnStmt&) {}
+    virtual void visitUnsafeBlockStmt(UnsafeBlockStmt&) {}
 
     // Top-level visitors
     virtual void visitFnDecl(FnDecl&) {}
@@ -2002,6 +2003,7 @@ public:
     virtual void visitParallelForStmt(const ParallelForStmt&) {}
     virtual void visitStaticAssertStmt(const StaticAssertStmt&) {}
     virtual void visitSpawnStmt(const SpawnStmt&) {}
+    virtual void visitUnsafeBlockStmt(const UnsafeBlockStmt&) {}
 
     // Top-level visitors
     virtual void visitFnDecl(const FnDecl&) {}
@@ -2175,5 +2177,7 @@ inline void TraitDecl::accept(ConstASTVisitor& v) const { v.visitTraitDecl(*this
 
 inline void ImplDecl::accept(ASTVisitor& v) { v.visitImplDecl(*this); }
 inline void ImplDecl::accept(ConstASTVisitor& v) const { v.visitImplDecl(*this); }
+inline void UnsafeBlockStmt::accept(ASTVisitor& v) { v.visitUnsafeBlockStmt(*this); }
+inline void UnsafeBlockStmt::accept(ConstASTVisitor& v) const { v.visitUnsafeBlockStmt(*this); }
 
 } // namespace tether

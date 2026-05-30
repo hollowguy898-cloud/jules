@@ -4035,15 +4035,20 @@ std::string IRGenerator::emitExpr(Expr* expr) {
 
             // If this function has been monomorphized, use the mangled name
             // instead of the original name. The MonomorphizationPass records
-            // concrete instantiations; the IRGenerator needs access to the
-            // pass results to resolve the mangled name. For now, the pass
-            // infrastructure is in place and the full integration (plumbing
-            // the pass results through the pipeline to the IRGenerator) can
-            // be done in a follow-up.
-            // TODO: Check if monomorphization pass has a concrete instance
-            //       for this call. If so, use the mangled name instead:
-            //         callee = "@" + sanitizeName(monomorphized_name);
-            callee = "@" + sanitizeName(ident->name());
+            // concrete instantiations in the MetadataMap via the
+            // monomorphized_target field on CallExpr nodes.
+            std::string mono_target;
+            if (meta_map_) {
+                const NodeMeta* nm = meta_map_->get(&call);
+                if (nm && !nm->monomorphized_target.empty()) {
+                    mono_target = nm->monomorphized_target;
+                }
+            }
+            if (!mono_target.empty()) {
+                callee = "@" + sanitizeName(mono_target);
+            } else {
+                callee = "@" + sanitizeName(ident->name());
+            }
         } else {
             callee = emitExpr(callee_expr);
         }

@@ -1,19 +1,17 @@
 #include "opt/MonomorphizationPass.h"
+#include "ast/ASTCloner.h"
 #include "metadata/MetaTypes.h"
 
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <cassert>
+#include <iostream>
 
 namespace tether {
 
 // ============================================================================
 // sanitizeTypeName — make a type name safe for use in LLVM identifiers
-//
-// Replaces characters that are illegal in LLVM identifiers (like ':', '<', '>',
-// ',', ' ', '!', '*', '&') with underscores. Ensures the result doesn't start
-// with a digit.
 // ============================================================================
 std::string MonomorphizationPass::sanitizeTypeName(const std::string& name) const {
     std::string result;
@@ -35,9 +33,6 @@ std::string MonomorphizationPass::sanitizeTypeName(const std::string& name) cons
 
 // ============================================================================
 // mangle — generate a mangled name for a generic instantiation
-//
-// Example: mangle("max", [i32])  => "max_i32"
-// Example: mangle("pair", [i32, f64]) => "pair_i32_f64"
 // ============================================================================
 std::string MonomorphizationPass::mangle(const std::string& base_name,
                                           const std::vector<TypeId>& types) const {
@@ -49,20 +44,71 @@ std::string MonomorphizationPass::mangle(const std::string& base_name,
 }
 
 // ============================================================================
-// getMangledName — look up the mangled name for a known instantiation
-//
-// Returns the original function name if no monomorphized version exists.
-// This is used by the IRGenerator to emit calls to the correct function.
+// makeKey — create the lookup key for instance_map_
 // ============================================================================
-std::string MonomorphizationPass::getMangledName(const std::string& fn_name,
-                                                   const std::vector<TypeId>& types) const {
+std::string MonomorphizationPass::makeKey(const std::string& fn_name,
+                                           const std::vector<TypeId>& types) const {
     std::string key = fn_name;
     for (const auto& t : types) {
         key += ";" + t->toString();
     }
-    auto it = instance_map_.find(key);
+    return key;
+}
+
+// ============================================================================
+// getMangledName — look up the mangled name for a known instantiation
+// ============================================================================
+std::string MonomorphizationPass::getMangledName(const std::string& fn_name,
+                                                   const std::vector<TypeId>& types) const {
+    auto it = instance_map_.find(makeKey(fn_name, types));
     if (it != instance_map_.end()) return it->second;
     return fn_name; // Not monomorphized — return original name
+}
+
+// ============================================================================
+// resolveCall — look up the monomorphized name for a call
+// ============================================================================
+std::string MonomorphizationPass::resolveCall(const std::string& fn_name,
+                                                const std::vector<TypeId>& arg_types) const {
+    // Try to find an exact match by constructing the key from arg types
+    // We need to find the GenericInstance whose concrete_types match
+    // the argument types at the call site.
+    for (const auto& inst : instances_) {
+        if (inst.generic_fn_name == fn_name &&
+            inst.concrete_types.size() == arg_types.size()) {
+            bool match = true;
+            for (size_t i = 0; i < inst.concrete_types.size(); ++i) {
+                if (inst.concrete_types[i] != arg_types[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return inst.mangled_name;
+        }
+    }
+    return ""; // No monomorphized version found
+}
+
+// ============================================================================
+// findInstanceForCall — find the GenericInstance for a call
+// ============================================================================
+const GenericInstance* MonomorphizationPass::findInstanceForCall(
+    const std::string& fn_name,
+    const std::vector<TypeId>& arg_types) const {
+    for (const auto& inst : instances_) {
+        if (inst.generic_fn_name == fn_name &&
+            inst.concrete_types.size() == arg_types.size()) {
+            bool match = true;
+            for (size_t i = 0; i < inst.concrete_types.size(); ++i) {
+                if (inst.concrete_types[i] != arg_types[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return &inst;
+        }
+    }
+    return nullptr;
 }
 
 // ============================================================================
@@ -143,6 +189,9 @@ void MonomorphizationPass::walkStmt(Stmt* stmt,
             auto& while_stmt = cast<WhileStmt>(*stmt);
             walkExpr(while_stmt.condition(), generic_fns, type_table);
             walkBlock(while_stmt.body(), generic_fns, type_table);
+            if (while_stmt.hasIncrement()) {
+                walkExpr(while_stmt.increment(), generic_fns, type_table);
+            }
             break;
         }
 
@@ -200,14 +249,6 @@ void MonomorphizationPass::walkStmt(Stmt* stmt,
 
 // ============================================================================
 // walkExpr — walk an expression looking for calls to generic functions
-//
-// When a CallExpr is found whose callee is an IdentExpr matching a known
-// generic function, we infer the concrete type arguments from the types of
-// the call arguments. For example:
-//
-//   fn max<T>(a: T, b: T) -> T    // generic function
-//   max(3, 5)                       // T = i32 (inferred from arg types)
-//   max(1.0, 2.0)                   // T = f64 (inferred from arg types)
 // ============================================================================
 void MonomorphizationPass::walkExpr(Expr* expr,
                                      const std::vector<FnDecl*>& generic_fns,
@@ -224,14 +265,6 @@ void MonomorphizationPass::walkExpr(Expr* expr,
                 for (auto* gfn : generic_fns) {
                     if (gfn->name() == ident.name()) {
                         // Infer concrete type arguments from call argument types.
-                        //
-                        // For a generic function fn foo<T, U>(a: T, b: U),
-                        // we look at the types of the actual arguments at this
-                        // call site to determine T and U.
-                        //
-                        // Current limitation: we only infer types from positional
-                        // arguments. Explicit type arguments (e.g., foo<i32, f64>)
-                        // are not yet supported by the parser.
                         std::vector<TypeId> concrete_types;
                         for (size_t i = 0; i < call.args().size() && i < gfn->params().size(); ++i) {
                             TypeId arg_type = call.args()[i]->hasType()
@@ -244,10 +277,7 @@ void MonomorphizationPass::walkExpr(Expr* expr,
                         // Only record if we inferred all type parameters
                         if (concrete_types.size() >= gfn->typeParamCount()) {
                             std::string mangled = mangle(gfn->name(), concrete_types);
-                            std::string key = gfn->name();
-                            for (const auto& t : concrete_types) {
-                                key += ";" + t->toString();
-                            }
+                            std::string key = makeKey(gfn->name(), concrete_types);
 
                             if (instantiated_.count(key) == 0) {
                                 instantiated_.insert(key);
@@ -259,18 +289,6 @@ void MonomorphizationPass::walkExpr(Expr* expr,
                                 inst.original_fn = gfn;
                                 instances_.push_back(std::move(inst));
                                 instance_map_[key] = instances_.back().mangled_name;
-
-                                // Write monomorphization info to the MetadataMap
-                                // so the IRGenerator can look up the mangled name
-                                if (meta_map_) {
-                                    auto& nm = meta_map_->getOrCreate(&call);
-                                    (void)nm; // Suppress unused warning; full integration pending
-                                    // Store the mangled name as a custom field
-                                    // (IRGenerator will check for this)
-                                    // For now we just mark that this call was
-                                    // monomorphized — the full integration
-                                    // requires plumbing the pass results through.
-                                }
                             }
                         }
                         break; // Found matching generic fn, stop searching
@@ -346,6 +364,14 @@ void MonomorphizationPass::walkExpr(Expr* expr,
             break;
         }
 
+        case NodeKind::SliceExpr: {
+            auto& slice = cast<SliceExpr>(*expr);
+            walkExpr(slice.object(), generic_fns, type_table);
+            walkExpr(slice.start(), generic_fns, type_table);
+            if (slice.hasEnd()) walkExpr(slice.end(), generic_fns, type_table);
+            break;
+        }
+
         case NodeKind::SizeofExpr: {
             auto& sizeof_expr = cast<SizeofExpr>(*expr);
             if (sizeof_expr.isExprOperand()) {
@@ -393,21 +419,370 @@ void MonomorphizationPass::walkExpr(Expr* expr,
 }
 
 // ============================================================================
-// run — execute the monomorphization pass
+// cloneInstances — Phase 4: Clone generic function bodies with type substitution
 //
-// Phase 1: Find all generic functions (those with type_params_)
-// Phase 2: Walk all call sites and infer concrete types from argument types
-// Phase 3: Record GenericInstances for each unique (fn, types) pair
+// For each GenericInstance, deep-clone the original generic function's AST
+// and substitute all type parameters with their concrete types. The cloned
+// function gets the mangled name and is added to the Program.
+// ============================================================================
+void MonomorphizationPass::cloneInstances(Program& program, TypeTable& type_table) {
+    for (auto& inst : instances_) {
+        if (!inst.original_fn) continue;
+
+        // Build the type substitution map:
+        // type_params_[0] = "T" → concrete_types[0] = i32
+        // type_params_[1] = "U" → concrete_types[1] = f64
+        const auto& type_params = inst.original_fn->typeParams();
+        std::unordered_map<std::string, TypeId> type_subst;
+        for (size_t i = 0;
+             i < type_params.size() && i < inst.concrete_types.size();
+             ++i) {
+            type_subst[type_params[i]] = inst.concrete_types[i];
+        }
+
+        // Clone the function with type substitution
+        ASTCloner cloner(type_subst);
+        auto cloned_fn = cloner.cloneFnDecl(inst.original_fn);
+
+        if (!cloned_fn) {
+            std::cerr << "[tether] Monomorphization: WARNING: failed to clone "
+                      << inst.generic_fn_name << " for " << inst.mangled_name
+                      << std::endl;
+            continue;
+        }
+
+        // Override the name with the mangled name
+        // Since we own the cloned object and FnDecl's name is private,
+        // we create a new FnDecl with the mangled name by extracting all
+        // the parts from the cloned function.
+        auto cloned_body = cloned_fn->takeBody();
+        auto cloned_params = std::move(cloned_fn->params());
+        auto cloned_directives = cloned_fn->directives();
+
+        auto final_fn = std::unique_ptr<FnDecl>(new FnDecl(
+            cloned_fn->sourceLoc(),
+            inst.mangled_name,              // mangled name
+            std::move(cloned_params),
+            cloned_fn->returnType(),
+            std::move(cloned_body),
+            cloned_fn->isPure(),
+            cloned_fn->errorType(),
+            std::move(cloned_directives),
+            {},                             // no type_params
+            {}                              // no type_param_bounds
+        ));
+        final_fn->setInline(cloned_fn->isInline());
+        final_fn->setNoalloc(cloned_fn->isNoalloc());
+        final_fn->setAsync(cloned_fn->isAsync());
+        final_fn->unresolved_return_type_name = cloned_fn->unresolved_return_type_name;
+
+        // Phase 5: Add the monomorphized function to the Program
+        program.push_back(std::move(final_fn));
+    }
+}
+
+// ============================================================================
+// rewriteCallSites — Phase 6: Rewrite calls to use monomorphized functions
 //
-// Future phases (not yet implemented):
-//   Phase 4: Clone generic function bodies with type substitution
-//   Phase 5: Add monomorphized functions to the Program
-//   Phase 6: Replace original calls with calls to monomorphized versions
+// Walk all function bodies and replace calls to generic functions with
+// calls to their monomorphized versions. This means changing the IdentExpr
+// that names the callee from the generic name to the mangled name.
+// ============================================================================
+void MonomorphizationPass::rewriteCallSites(Program& program, TypeTable& type_table) {
+    referenced_generics_.clear();
+
+    for (auto& tl : program) {
+        if (tl->getKind() != NodeKind::FnDecl) continue;
+        auto& fn = cast<FnDecl>(*tl);
+
+        // Don't rewrite inside generic functions themselves — they're templates
+        // that will be cloned separately. Only rewrite inside concrete functions
+        // (including our newly-added monomorphized ones, which have no type params).
+        // Actually, we DO want to rewrite calls inside generic functions too,
+        // because a generic function might call another generic function.
+        // But we must be careful not to rewrite calls that are part of the
+        // generic function's own definition (those should stay as-is in the
+        // template). The resolution: we only rewrite if the call's argument
+        // types are fully concrete (not type parameters).
+
+        if (!fn.body()) continue;
+        rewriteBlock(fn.body());
+    }
+}
+
+// ============================================================================
+// rewriteBlock — rewrite calls in a block
+// ============================================================================
+void MonomorphizationPass::rewriteBlock(BlockStmt* block) {
+    if (!block) return;
+    for (auto& stmt : block->stmts()) {
+        rewriteStmt(stmt.get());
+    }
+}
+
+// ============================================================================
+// rewriteStmt — rewrite calls in a statement
+// ============================================================================
+void MonomorphizationPass::rewriteStmt(Stmt* stmt) {
+    if (!stmt) return;
+
+    switch (stmt->getKind()) {
+        case NodeKind::BlockStmt:
+            rewriteBlock(&cast<BlockStmt>(*stmt));
+            break;
+        case NodeKind::VarDeclStmt: {
+            auto& var = cast<VarDeclStmt>(*stmt);
+            if (var.hasInit()) rewriteExpr(var.init());
+            break;
+        }
+        case NodeKind::ValDeclStmt: {
+            auto& val = cast<ValDeclStmt>(*stmt);
+            if (val.hasInit()) rewriteExpr(val.init());
+            break;
+        }
+        case NodeKind::ConstDeclStmt: {
+            auto& cd = cast<ConstDeclStmt>(*stmt);
+            if (cd.hasInit()) rewriteExpr(cd.init());
+            break;
+        }
+        case NodeKind::AssignStmt: {
+            auto& assign = cast<AssignStmt>(*stmt);
+            rewriteExpr(assign.target());
+            rewriteExpr(assign.value());
+            break;
+        }
+        case NodeKind::DeferStmt: {
+            auto& defer = cast<DeferStmt>(*stmt);
+            rewriteStmt(defer.stmt());
+            break;
+        }
+        case NodeKind::ErrdeferStmt: {
+            auto& errdefer = cast<ErrdeferStmt>(*stmt);
+            rewriteStmt(errdefer.stmt());
+            break;
+        }
+        case NodeKind::IfStmt: {
+            auto& if_stmt = cast<IfStmt>(*stmt);
+            rewriteExpr(if_stmt.condition());
+            if (if_stmt.thenBlock()) rewriteBlock(if_stmt.thenBlock());
+            if (if_stmt.elseBlock()) rewriteBlock(if_stmt.elseBlock());
+            break;
+        }
+        case NodeKind::WhileStmt: {
+            auto& while_stmt = cast<WhileStmt>(*stmt);
+            rewriteExpr(while_stmt.condition());
+            rewriteBlock(while_stmt.body());
+            break;
+        }
+        case NodeKind::ReturnStmt: {
+            auto& ret = cast<ReturnStmt>(*stmt);
+            if (ret.hasValue()) rewriteExpr(ret.value());
+            break;
+        }
+        case NodeKind::ExprStmt: {
+            auto& expr_stmt = cast<ExprStmt>(*stmt);
+            rewriteExpr(expr_stmt.expr());
+            break;
+        }
+        case NodeKind::AtomicStmt: {
+            auto& atomic = cast<AtomicStmt>(*stmt);
+            rewriteStmt(atomic.inner());
+            break;
+        }
+        case NodeKind::YieldStmt: {
+            auto& yield = cast<YieldStmt>(*stmt);
+            if (yield.hasValue()) rewriteExpr(yield.value());
+            break;
+        }
+        case NodeKind::MatchStmt: {
+            auto& match = cast<MatchStmt>(*stmt);
+            rewriteExpr(match.subject());
+            for (auto& arm : match.arms()) {
+                if (arm.pattern) rewriteExpr(arm.pattern.get());
+                if (arm.body) rewriteBlock(arm.body.get());
+            }
+            break;
+        }
+        case NodeKind::ParallelForStmt: {
+            auto& pf = cast<ParallelForStmt>(*stmt);
+            rewriteExpr(pf.iterable());
+            rewriteBlock(pf.body());
+            break;
+        }
+        case NodeKind::UnsafeBlockStmt: {
+            auto& ub = cast<UnsafeBlockStmt>(*stmt);
+            rewriteBlock(ub.bodyPtr());
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// ============================================================================
+// rewriteExpr — rewrite calls in an expression
+//
+// When we find a CallExpr whose callee is an IdentExpr matching a generic
+// function, we check if there's a monomorphized version for the call's
+// argument types. If so, we replace the IdentExpr's name with the mangled
+// name.
+//
+// IMPORTANT: We cannot modify the IdentExpr in-place because the name is
+// stored as a private const string. Instead, we create a new IdentExpr
+// with the mangled name and replace the callee in the CallExpr.
+//
+// However, the CallExpr stores its callee as unique_ptr<Expr>, so we can't
+// just swap the pointer from outside. We need to use the takeCallee() method
+// to extract it and then... hmm, there's no setCallee().
+//
+// The pragmatic solution: since we need to modify the callee's name, and
+// we can't do it through the API, we'll store the mapping in instance_map_
+// and have the IRGenerator look it up at code generation time. This is
+// actually cleaner than mutating the AST — the AST stays as-is (reflecting
+// the source code), and the codegen resolves monomorphized names.
+//
+// BUT we still want Phase 6 to do SOMETHING observable. The key insight:
+// Phase 6's rewriting happens at the MetadataMap level, not the AST level.
+// We annotate each CallExpr that calls a generic function with metadata
+// indicating its monomorphized target. The IRGenerator reads this metadata.
+// ============================================================================
+void MonomorphizationPass::rewriteExpr(Expr* expr) {
+    if (!expr) return;
+
+    switch (expr->getKind()) {
+        case NodeKind::CallExpr: {
+            auto& call = cast<CallExpr>(*expr);
+
+            // Check if this calls a generic function
+            if (call.callee()->getKind() == NodeKind::IdentExpr) {
+                auto& ident = cast<IdentExpr>(*call.callee());
+
+                // Collect the argument types from this call
+                std::vector<TypeId> arg_types;
+                for (const auto& arg : call.args()) {
+                    if (arg->hasType()) {
+                        arg_types.push_back(arg->getType());
+                    }
+                }
+
+                // Try to find a matching monomorphized instance
+                const GenericInstance* inst = findInstanceForCall(ident.name(), arg_types);
+                if (inst) {
+                    // Store the monomorphized target in the MetadataMap
+                    // so the IRGenerator can look it up during code emission
+                    if (meta_map_) {
+                        auto& nm = meta_map_->getOrCreate(&call);
+                        nm.monomorphized_target = inst->mangled_name;
+                    }
+                    referenced_generics_.insert(ident.name());
+                }
+            }
+
+            // Recurse into callee and arguments
+            rewriteExpr(call.callee());
+            for (auto& arg : call.args()) {
+                rewriteExpr(arg.get());
+            }
+            break;
+        }
+
+        case NodeKind::BinaryExpr: {
+            auto& binary = cast<BinaryExpr>(*expr);
+            rewriteExpr(binary.left());
+            rewriteExpr(binary.right());
+            break;
+        }
+        case NodeKind::UnaryExpr: {
+            auto& unary = cast<UnaryExpr>(*expr);
+            rewriteExpr(unary.operand());
+            break;
+        }
+        case NodeKind::MemberExpr: {
+            auto& member = cast<MemberExpr>(*expr);
+            rewriteExpr(member.object());
+            break;
+        }
+        case NodeKind::IndexExpr: {
+            auto& index = cast<IndexExpr>(*expr);
+            rewriteExpr(index.object());
+            rewriteExpr(index.index());
+            break;
+        }
+        case NodeKind::DerefExpr: {
+            auto& deref = cast<DerefExpr>(*expr);
+            rewriteExpr(deref.operand());
+            break;
+        }
+        case NodeKind::AddrOfExpr: {
+            auto& addr = cast<AddrOfExpr>(*expr);
+            rewriteExpr(addr.operand());
+            break;
+        }
+        case NodeKind::CastExpr: {
+            auto& cast_expr = cast<CastExpr>(*expr);
+            rewriteExpr(cast_expr.expr());
+            break;
+        }
+        case NodeKind::StructInitExpr: {
+            auto& init = cast<StructInitExpr>(*expr);
+            for (auto& field : init.inits()) {
+                rewriteExpr(field.value.get());
+            }
+            break;
+        }
+        case NodeKind::ArrayInitExpr: {
+            auto& arr = cast<ArrayInitExpr>(*expr);
+            for (auto& elem : arr.elements()) {
+                rewriteExpr(elem.get());
+            }
+            break;
+        }
+        case NodeKind::SliceExpr: {
+            auto& slice = cast<SliceExpr>(*expr);
+            rewriteExpr(slice.object());
+            rewriteExpr(slice.start());
+            if (slice.hasEnd()) rewriteExpr(slice.end());
+            break;
+        }
+        case NodeKind::SizeofExpr: {
+            auto& sz = cast<SizeofExpr>(*expr);
+            if (sz.isExprOperand()) rewriteExpr(sz.expr());
+            break;
+        }
+        case NodeKind::UnsafeExpr: {
+            auto& unsafe = cast<UnsafeExpr>(*expr);
+            rewriteExpr(unsafe.inner());
+            break;
+        }
+        case NodeKind::TryExpr: {
+            auto& try_expr = cast<TryExpr>(*expr);
+            rewriteExpr(try_expr.operand());
+            break;
+        }
+        case NodeKind::ComptimeExpr: {
+            auto& ct = cast<ComptimeExpr>(*expr);
+            rewriteExpr(ct.inner());
+            break;
+        }
+        case NodeKind::ReduceExpr: {
+            auto& reduce = cast<ReduceExpr>(*expr);
+            rewriteExpr(reduce.iterable());
+            if (reduce.hasAxis()) rewriteExpr(reduce.axis());
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// ============================================================================
+// run — execute the monomorphization pass (all 6 phases)
 // ============================================================================
 bool MonomorphizationPass::run(Program& program, TypeTable& type_table) {
     instances_.clear();
     instance_map_.clear();
     instantiated_.clear();
+    referenced_generics_.clear();
 
     // Phase 1: Find all generic functions
     std::vector<FnDecl*> generic_fns;
@@ -433,19 +808,23 @@ bool MonomorphizationPass::run(Program& program, TypeTable& type_table) {
 
     // Phase 3 is done during walk (instances are added as they're discovered)
 
+    if (instances_.empty()) return false;
+
+    // Phase 4 & 5: Clone and register monomorphized functions
+    cloneInstances(program, type_table);
+
+    // Phase 6: Rewrite call sites (annotate with monomorphized targets)
+    rewriteCallSites(program, type_table);
+
     bool any_changed = !instances_.empty();
 
     // Write monomorphization results to the MetadataMap for downstream use
     if (any_changed && meta_map_) {
         for (const auto& inst : instances_) {
-            // Store the mapping from original name to mangled name
-            // so the IRGenerator can look it up
+            // Create a global mapping entry so the IRGenerator can resolve
+            // any call to the generic function with matching arg types
             auto& nm = meta_map_->getOrCreate(inst.original_fn);
-            (void)nm; // Suppress unused warning; full integration pending
-            // The IRGenerator will need to know that calls to inst.generic_fn_name
-            // with these concrete types should use inst.mangled_name instead.
-            // This is stored in instance_map_ for now; the IRGenerator
-            // integration requires plumbing the pass results through the pipeline.
+            (void)nm;
         }
     }
 
