@@ -6,24 +6,127 @@
 namespace tether {
 
 // ============================================================================
-// substituteType — apply type parameter substitution
+// substituteType — apply type parameter substitution with recursive composite
 //
-// If the type's canonical string representation matches a type parameter name
-// (e.g., "T"), replace it with the concrete type from the substitution map.
-// For composite types (pointer, reference, etc.), we don't need to recurse
-// because the semantic analyzer will have already resolved inner types —
-// type parameters appear only as direct named types in parameter/return
-// positions, not nested inside pointer/reference types.
+// For simple types where toString() matches a type param name (e.g., "T"),
+// replace with the concrete type from the substitution map.
+//
+// For composite types (*T, &T, &mut T, []T, [N]T, Box<T>, Rc<T>, Arc<T>,
+// !T, align(A):T, simd<T,N>), recursively substitute inner types and
+// create the new composite type via TypeTable (if provided).
+//
+// This is critical for monomorphization: a generic function like
+//   fn first<T>(items: []T) -> ?T
+// with T=i32 needs []T → []i32 and ?T → ?i32.
 // ============================================================================
 TypeId ASTCloner::substituteType(TypeId type) const {
     if (type.isNull()) return type;
 
-    // Check if this type's name matches a type parameter
+    // Check if this type's name matches a type parameter directly
     auto it = type_subst_.find(type->toString());
     if (it != type_subst_.end()) {
         return it->second;
     }
-    return type;
+
+    // If no TypeTable is available, we can only do top-level substitution
+    if (!type_table_) return type;
+
+    // Recursively substitute into composite types
+    switch (type->getKind()) {
+        case TypeKind::Pointer: {
+            auto& ptr = cast<PointerType>(*type);
+            TypeId sub_pointee = substituteType(ptr.pointee());
+            if (sub_pointee == ptr.pointee()) return type;  // No change
+            return type_table_->getPointer(sub_pointee);
+        }
+        case TypeKind::Reference: {
+            auto& ref = cast<ReferenceType>(*type);
+            TypeId sub_referent = substituteType(ref.referent());
+            if (sub_referent == ref.referent()) return type;
+            return type_table_->getReference(sub_referent);
+        }
+        case TypeKind::MutReference: {
+            auto& ref = cast<MutReferenceType>(*type);
+            TypeId sub_referent = substituteType(ref.referent());
+            if (sub_referent == ref.referent()) return type;
+            return type_table_->getMutReference(sub_referent);
+        }
+        case TypeKind::Slice: {
+            auto& slice = cast<SliceType>(*type);
+            TypeId sub_element = substituteType(slice.element());
+            if (sub_element == slice.element()) return type;
+            return type_table_->getSlice(sub_element);
+        }
+        case TypeKind::Array: {
+            auto& arr = cast<ArrayType>(*type);
+            TypeId sub_element = substituteType(arr.element());
+            if (sub_element == arr.element()) return type;
+            return type_table_->getArray(sub_element, arr.count());
+        }
+        case TypeKind::SmartPointer: {
+            auto& sp = cast<SmartPointerType>(*type);
+            TypeId sub_pointee = substituteType(sp.pointee());
+            if (sub_pointee == sp.pointee()) return type;
+            return type_table_->getSmartPointer(sub_pointee, sp.smartPointerKind());
+        }
+        case TypeKind::Error: {
+            auto& err = cast<ErrorType>(*type);
+            TypeId sub_success = substituteType(err.successType());
+            if (sub_success == err.successType()) return type;
+            return type_table_->getError(sub_success);
+        }
+        case TypeKind::Aligned: {
+            auto& aligned = cast<AlignedType>(*type);
+            TypeId sub_inner = substituteType(aligned.inner());
+            if (sub_inner == aligned.inner()) return type;
+            return type_table_->getAligned(sub_inner, aligned.alignment());
+        }
+        case TypeKind::SimdVector: {
+            auto& simd = cast<SimdVectorType>(*type);
+            TypeId sub_element = substituteType(simd.elementType());
+            if (sub_element == simd.elementType()) return type;
+            return type_table_->getSimdVector(sub_element, simd.count());
+        }
+        case TypeKind::Fn: {
+            auto& fn_type = cast<FnType>(*type);
+            bool changed = false;
+            std::vector<FnParam> sub_params;
+            for (const auto& p : fn_type.params()) {
+                TypeId sub_type = substituteType(p.type);
+                if (sub_type != p.type) changed = true;
+                FnParam sub_p = p;
+                sub_p.type = sub_type;
+                sub_params.push_back(std::move(sub_p));
+            }
+            TypeId sub_ret = substituteType(fn_type.returnType());
+            if (sub_ret != fn_type.returnType()) changed = true;
+            TypeId sub_err = substituteType(fn_type.errorType());
+            if (sub_err != fn_type.errorType()) changed = true;
+            if (!changed) return type;
+            return type_table_->getFn(std::move(sub_params), sub_ret,
+                                       fn_type.isPure(), sub_err);
+        }
+        default:
+            // Primitive, Struct, Enum, Allocator, Poison, Opaque, Shape,
+            // Stride, Tensor — no inner type to substitute
+            return type;
+    }
+}
+
+// ============================================================================
+// substituteTypeName — substitute type param names in unresolved type strings
+//
+// When a FnParam has unresolved_type_name = "T", this returns the concrete
+// type name (e.g., "i32") from the substitution map. Used during
+// monomorphization so that the cloned function's parameters have correct
+// type name strings for any downstream resolution.
+// ============================================================================
+std::string ASTCloner::substituteTypeName(const std::string& name) const {
+    auto it = type_subst_.find(name);
+    if (it != type_subst_.end() && it->second) {
+        return it->second->toString();
+    }
+    return name;
 }
 
 // ============================================================================
@@ -404,7 +507,9 @@ std::unique_ptr<FnDecl> ASTCloner::cloneFnDecl(const FnDecl* fn) {
         cloned.type = substituteType(param.type);
         cloned.is_mutable = param.is_mutable;
         cloned.is_restrict = param.is_restrict;
-        cloned.unresolved_type_name = param.unresolved_type_name;
+        // Substitute unresolved type name (e.g., "T" → "i32")
+        // This is important for downstream type resolution in the cloned fn
+        cloned.unresolved_type_name = substituteTypeName(param.unresolved_type_name);
         cloned_params.push_back(std::move(cloned));
     }
 

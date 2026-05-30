@@ -119,6 +119,9 @@ private:
     // Phase 4: Clone generic function bodies with type substitution
     void cloneInstances(Program& program, TypeTable& type_table);
 
+    // Clone only instances added after start_index (for recursive monomorphization)
+    void cloneNewInstances(Program& program, TypeTable& type_table, size_t start_index);
+
     // Phase 6: Rewrite call sites to call monomorphized functions
     void rewriteCallSites(Program& program, TypeTable& type_table);
 

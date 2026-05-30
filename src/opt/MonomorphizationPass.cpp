@@ -440,8 +440,9 @@ void MonomorphizationPass::cloneInstances(Program& program, TypeTable& type_tabl
             type_subst[type_params[i]] = inst.concrete_types[i];
         }
 
-        // Clone the function with type substitution
-        ASTCloner cloner(type_subst);
+        // Clone the function with type substitution (pass TypeTable for
+        // recursive composite type substitution: *T → *i32, []T → []i32, etc.)
+        ASTCloner cloner(type_subst, &type_table);
         auto cloned_fn = cloner.cloneFnDecl(inst.original_fn);
 
         if (!cloned_fn) {
@@ -474,7 +475,17 @@ void MonomorphizationPass::cloneInstances(Program& program, TypeTable& type_tabl
         final_fn->setInline(cloned_fn->isInline());
         final_fn->setNoalloc(cloned_fn->isNoalloc());
         final_fn->setAsync(cloned_fn->isAsync());
-        final_fn->unresolved_return_type_name = cloned_fn->unresolved_return_type_name;
+        // Substitute unresolved type name in return type (e.g., "T" → "i32")
+        // The ASTCloner already substituted the TypeId, but the string name
+        // needs updating too for any downstream resolution.
+        if (!cloned_fn->unresolved_return_type_name.empty()) {
+            auto it = type_subst.find(cloned_fn->unresolved_return_type_name);
+            if (it != type_subst.end() && it->second) {
+                final_fn->unresolved_return_type_name = it->second->toString();
+            } else {
+                final_fn->unresolved_return_type_name = cloned_fn->unresolved_return_type_name;
+            }
+        }
 
         // Phase 5: Add the monomorphized function to the Program
         program.push_back(std::move(final_fn));
@@ -777,6 +788,11 @@ void MonomorphizationPass::rewriteExpr(Expr* expr) {
 
 // ============================================================================
 // run — execute the monomorphization pass (all 6 phases)
+//
+// Iterates until fixpoint: a generic function may call another generic
+// function, and the cloned body of the first may introduce new call sites
+// that need monomorphization. We keep discovering and cloning until no
+// new instances are found.
 // ============================================================================
 bool MonomorphizationPass::run(Program& program, TypeTable& type_table) {
     instances_.clear();
@@ -797,26 +813,41 @@ bool MonomorphizationPass::run(Program& program, TypeTable& type_table) {
 
     if (generic_fns.empty()) return false;
 
-    // Phase 2: Walk all function bodies looking for calls to generic functions
-    for (auto& tl : program) {
-        if (tl->getKind() != NodeKind::FnDecl) continue;
-        auto& fn = cast<FnDecl>(*tl);
-        if (!fn.body()) continue;
+    // Recursive monomorphization: iterate until fixpoint.
+    // Each iteration may discover new generic calls in the bodies of
+    // newly-cloned monomorphized functions.
+    const int MAX_ITERATIONS = 16;  // Safety bound
+    bool any_changed = false;
+    
+    for (int iteration = 0; iteration < MAX_ITERATIONS; ++iteration) {
+        size_t prev_instance_count = instances_.size();
 
-        walkBlock(fn.body(), generic_fns, type_table);
+        // Phase 2: Walk all function bodies looking for calls to generic functions
+        // (This includes newly-added monomorphized functions from previous iterations)
+        for (auto& tl : program) {
+            if (tl->getKind() != NodeKind::FnDecl) continue;
+            auto& fn = cast<FnDecl>(*tl);
+            if (!fn.body()) continue;
+
+            walkBlock(fn.body(), generic_fns, type_table);
+        }
+
+        // Phase 3 is done during walk (instances are added as they're discovered)
+
+        // If no new instances were found, we've reached fixpoint
+        if (instances_.size() == prev_instance_count) break;
+
+        // Phase 4 & 5: Clone ONLY the newly discovered instances
+        // (instances added since prev_instance_count)
+        cloneNewInstances(program, type_table, prev_instance_count);
     }
 
-    // Phase 3 is done during walk (instances are added as they're discovered)
-
     if (instances_.empty()) return false;
-
-    // Phase 4 & 5: Clone and register monomorphized functions
-    cloneInstances(program, type_table);
 
     // Phase 6: Rewrite call sites (annotate with monomorphized targets)
     rewriteCallSites(program, type_table);
 
-    bool any_changed = !instances_.empty();
+    any_changed = !instances_.empty();
 
     // Write monomorphization results to the MetadataMap for downstream use
     if (any_changed && meta_map_) {
@@ -829,6 +860,75 @@ bool MonomorphizationPass::run(Program& program, TypeTable& type_table) {
     }
 
     return any_changed;
+}
+
+// ============================================================================
+// cloneNewInstances — Clone only instances added after start_index
+//
+// This is called iteratively during recursive monomorphization, so we only
+// clone the newly discovered instances each iteration (not the ones that
+// were already cloned in previous iterations).
+// ============================================================================
+void MonomorphizationPass::cloneNewInstances(Program& program,
+                                              TypeTable& type_table,
+                                              size_t start_index) {
+    for (size_t idx = start_index; idx < instances_.size(); ++idx) {
+        auto& inst = instances_[idx];
+        if (!inst.original_fn) continue;
+
+        // Build the type substitution map
+        const auto& type_params = inst.original_fn->typeParams();
+        std::unordered_map<std::string, TypeId> type_subst;
+        for (size_t i = 0;
+             i < type_params.size() && i < inst.concrete_types.size();
+             ++i) {
+            type_subst[type_params[i]] = inst.concrete_types[i];
+        }
+
+        // Clone the function with type substitution
+        ASTCloner cloner(type_subst, &type_table);
+        auto cloned_fn = cloner.cloneFnDecl(inst.original_fn);
+
+        if (!cloned_fn) {
+            std::cerr << "[tether] Monomorphization: WARNING: failed to clone "
+                      << inst.generic_fn_name << " for " << inst.mangled_name
+                      << std::endl;
+            continue;
+        }
+
+        // Override the name with the mangled name
+        auto cloned_body = cloned_fn->takeBody();
+        auto cloned_params = std::move(cloned_fn->params());
+        auto cloned_directives = cloned_fn->directives();
+
+        auto final_fn = std::unique_ptr<FnDecl>(new FnDecl(
+            cloned_fn->sourceLoc(),
+            inst.mangled_name,
+            std::move(cloned_params),
+            cloned_fn->returnType(),
+            std::move(cloned_body),
+            cloned_fn->isPure(),
+            cloned_fn->errorType(),
+            std::move(cloned_directives),
+            {},
+            {}
+        ));
+        final_fn->setInline(cloned_fn->isInline());
+        final_fn->setNoalloc(cloned_fn->isNoalloc());
+        final_fn->setAsync(cloned_fn->isAsync());
+        // Substitute unresolved type name in return type
+        if (!cloned_fn->unresolved_return_type_name.empty()) {
+            auto it = type_subst.find(cloned_fn->unresolved_return_type_name);
+            if (it != type_subst.end() && it->second) {
+                final_fn->unresolved_return_type_name = it->second->toString();
+            } else {
+                final_fn->unresolved_return_type_name = cloned_fn->unresolved_return_type_name;
+            }
+        }
+
+        // Phase 5: Add the monomorphized function to the Program
+        program.push_back(std::move(final_fn));
+    }
 }
 
 } // namespace tether
