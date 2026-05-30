@@ -1,0 +1,12 @@
+fn main() i32 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while (i < 100000000) : (i += 1) {
+        if (i % 2 == 0) {
+            sum = sum + 1;
+        } else {
+            sum = sum - 1;
+        }
+    }
+    return 0;
+}

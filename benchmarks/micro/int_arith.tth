@@ -1,0 +1,8 @@
+fn main() i32 {
+    var sum: i64 = 0;
+    var i: i64 = 0;
+    while (i < 100000000) : (i += 1) {
+        sum = sum + i * 3 + i - i / 2 + (i & 0xFF);
+    }
+    return 0;
+}

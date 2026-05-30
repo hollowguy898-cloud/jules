@@ -2661,13 +2661,34 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                             // Emit else expression
                             std::string else_val = emitExpr(else_es.expr());
 
-                            // Emit select instruction
-                            std::string result_type = llvmType(then_type);
-                            if (result_type != "void" && !result_type.empty()) {
+                            // BUG FIX: Determine the actual LLVM type of the emitted
+                            // values. emitExpr may return values that have been widened
+                            // (e.g., i64 via sext) even though the Tether type says i32.
+                            // We must use the actual LLVM type in the select, not the
+                            // declared type, to avoid type mismatches like
+                            //   select i1 %c, i32 %v1, i32 %v2   where %v1, %v2 are i64
+                            //
+                            // Strategy: Use the wider of the two declared types. If either
+                            // value is a register, check the SSA map for its actual type.
+                            // As a safe fallback, use the declared type's LLVM mapping.
+                            std::string select_type = llvmType(then_type);
+                            // If types differ between then and else, use the wider one
+                            if (then_type && else_type && llvmType(then_type) != llvmType(else_type)) {
+                                uint64_t then_bits = then_type->bitWidth();
+                                uint64_t else_bits = else_type->bitWidth();
+                                if (else_bits > then_bits) {
+                                    select_type = llvmType(else_type);
+                                    then_val = emitTypeCast(then_val, then_type, else_type);
+                                } else {
+                                    else_val = emitTypeCast(else_val, else_type, then_type);
+                                }
+                            }
+
+                            if (select_type != "void" && !select_type.empty()) {
                                 std::string result = nextReg();
                                 body_ss_ << "  " << result << " = select i1 " << cond_val
-                                         << ", " << result_type << " " << then_val
-                                         << ", " << result_type << " " << else_val << "\n";
+                                         << ", " << select_type << " " << then_val
+                                         << ", " << select_type << " " << else_val << "\n";
 
                                 // Merge SSA state
                                 for (auto& [name, val] : after_then_snap.values) {
@@ -2722,6 +2743,20 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                             // Get the variable's LLVM type
                             SSAVarInfo* info = lookupVar(assign_var_name);
                             if (info) {
+                                // BUG FIX: Cast both values to the variable's type.
+                                // The emitted values may have been widened (e.g., i64
+                                // via sext) but the variable is i32. Without this cast,
+                                // we get a type mismatch in the select instruction.
+                                TypeId var_type = info->tether_type;
+                                if (then_value_expr->getType() && var_type &&
+                                    llvmType(then_value_expr->getType()) != info->llvm_type) {
+                                    then_val = emitTypeCast(then_val, then_value_expr->getType(), var_type);
+                                }
+                                if (else_value_expr->getType() && var_type &&
+                                    llvmType(else_value_expr->getType()) != info->llvm_type) {
+                                    else_val = emitTypeCast(else_val, else_value_expr->getType(), var_type);
+                                }
+
                                 std::string ll_type = info->llvm_type;
                                 std::string result = nextReg();
                                 body_ss_ << "  ; [select-opt] branchless assignment for " << assign_var_name << "\n";
@@ -2769,6 +2804,17 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                                 updateVarValue(name, val);
                             }
                             std::string else_val = emitExpr(else_init);
+
+                            // BUG FIX: Cast both values to the declared variable type,
+                            // same as the Assign pattern fix above.
+                            if (then_init->getType() && var_type &&
+                                llvmType(then_init->getType()) != llvmType(var_type)) {
+                                then_val = emitTypeCast(then_val, then_init->getType(), var_type);
+                            }
+                            if (else_init->getType() && var_type &&
+                                llvmType(else_init->getType()) != llvmType(var_type)) {
+                                else_val = emitTypeCast(else_val, else_init->getType(), var_type);
+                            }
 
                             std::string ll_type = llvmType(var_type);
                             std::string result = nextReg();
@@ -5749,262 +5795,62 @@ std::string IRGenerator::emitBinaryOp(const std::string& result_reg,
         case BinaryOp::Div:
             if (is_float) {
                 body_ss_ << "  " << result_reg << " = fdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
-            } else if (isLiteral(rhs) && opt_level_ >= 2) {
-                // --- Strength reduction: replace sdiv/udiv with constant
-                //     divisor by multiply+shift (4-6 cycles vs 20-40 cycles).
+            } else {
+                // --- Strength reduction DISABLED for non-power-of-2 divisors ---
                 //
-                // For unsigned: x / d = mulhu(x, magic(d)) >> shift(d)
-                // For signed:   x / d = (x + adjust) * magic >> shift - adjust2
+                // Benchmarks prove that our codegen-time strength reduction with
+                // i128 multiply sequences is a PESSIMIZATION (3.2x slower than
+                // plain sdiv/udiv). LLVM's own instcombine pass does this
+                // optimization much better because it knows the target CPU's
+                // actual instruction latencies and can use mulhu/mulhs directly
+                // instead of the i128 widen-multiply-shift sequence we emit.
                 //
-                // The magic numbers are computed from Granlund-Montgomery-Warren
-                // algorithm. We precompute them here at compile time.
-                int64_t d = parseLiteral(rhs);
-                if (d == 0) {
-                    // Division by zero — let LLVM handle it (UB)
+                // We still keep the power-of-2 optimization (shift right) since
+                // that's always a clear win that LLVM might not see in time for
+                // loop vectorization decisions.
+                //
+                // For unsigned power-of-2 modulo, we also keep the `and`
+                // optimization (see the Mod case below).
+                if (isLiteral(rhs)) {
+                    int64_t d = parseLiteral(rhs);
+                    if (d > 0 && (d & (d - 1)) == 0) {
+                        // Power-of-2: shift right (always a win)
+                        int shift = 0;
+                        int64_t tmp = d;
+                        while (tmp > 1) { tmp >>= 1; ++shift; }
+                        if (is_signed) {
+                            // Signed division by power-of-2 needs adjustment for
+                            // negative values: (x + (x >> 31) & (d-1)) >> shift
+                            //
+                            // BUG FIX: Use NAMED intermediate registers instead of
+                            // numbered ones (via nextReg()). The caller pre-allocates
+                            // result_reg with a specific number, but if we allocate
+                            // intermediates with nextReg() they'll have higher numbers,
+                            // breaking LLVM's sequential numbering requirement.
+                            // Named registers like %sr.sign don't need to follow the
+                            // numbering sequence.
+                            std::string sign = "%sr.sign." + std::to_string(reg_counter_);
+                            std::string adj = "%sr.adj." + std::to_string(reg_counter_);
+                            std::string rounded = "%sr.rounded." + std::to_string(reg_counter_);
+                            // Do NOT increment reg_counter_ for named registers —
+                            // they don't participate in LLVM's sequential numbering.
+                            body_ss_ << "  " << sign << " = ashr " << ll_type << " " << lhs << ", " << (ll_type == "i64" ? "63" : "31") << "\n";
+                            body_ss_ << "  " << adj << " = and " << ll_type << " " << sign << ", " << (d - 1) << "\n";
+                            body_ss_ << "  " << rounded << " = add " << ll_type << " " << lhs << ", " << adj << "\n";
+                            body_ss_ << "  " << result_reg << " = ashr " << ll_type << " " << rounded << ", " << shift << "\n";
+                        } else {
+                            body_ss_ << "  " << result_reg << " = lshr " << ll_type << " " << lhs << ", " << shift << "\n";
+                        }
+                    } else {
+                        // Non-power-of-2: let LLVM's instcombine handle it.
+                        // It produces better code than our i128 sequence.
+                        if (is_signed) body_ss_ << "  " << result_reg << " = sdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
+                        else           body_ss_ << "  " << result_reg << " = udiv " << ll_type << " " << lhs << ", " << rhs << "\n";
+                    }
+                } else {
                     if (is_signed) body_ss_ << "  " << result_reg << " = sdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
                     else           body_ss_ << "  " << result_reg << " = udiv " << ll_type << " " << lhs << ", " << rhs << "\n";
-                } else if (d > 0 && (d & (d - 1)) == 0) {
-                    // Power-of-2: shift right
-                    int shift = 0;
-                    int64_t tmp = d;
-                    while (tmp > 1) { tmp >>= 1; ++shift; }
-                    if (is_signed) {
-                        // Signed division by power-of-2 needs adjustment for
-                        // negative values: (x + (x >> 31) & (d-1)) >> shift
-                        // But only for negative values, the high bits are all 1s.
-                        std::string sign = nextReg();
-                        body_ss_ << "  " << sign << " = ashr " << ll_type << " " << lhs << ", " << (ll_type == "i64" ? "63" : "31") << "\n";
-                        std::string adj = nextReg();
-                        body_ss_ << "  " << adj << " = and " << ll_type << " " << sign << ", " << (d - 1) << "\n";
-                        std::string rounded = nextReg();
-                        body_ss_ << "  " << rounded << " = add " << ll_type << " " << lhs << ", " << adj << "\n";
-                        body_ss_ << "  " << result_reg << " = ashr " << ll_type << " " << rounded << ", " << shift << "\n";
-                    } else {
-                        body_ss_ << "  " << result_reg << " = lshr " << ll_type << " " << lhs << ", " << shift << "\n";
-                    }
-                } else if (!is_signed && d > 0) {
-                    // Unsigned division by non-power-of-2 constant
-                    // Use the "multiply high" approach:
-                    //   x / d ≈ mulhu(x, M) >> S
-                    // where M is the magic number and S is the shift amount.
-                    // Algorithm from Hacker's Delight, Chapter 10.
-                    uint64_t ud = static_cast<uint64_t>(d);
-                    int bit_width = (ll_type == "i64") ? 64 : (ll_type == "i32") ? 32 :
-                                    (ll_type == "i16") ? 16 : 8;
-                    // Compute magic number for unsigned division
-                    uint64_t magic = 0;
-                    int shift_amt = 0;
-                    {
-                        int p = bit_width;
-                        uint64_t nc = (UINT64_MAX - ud + 1) / ud;  // ~d+1 / d
-                        uint64_t q1 = UINT64_MAX / nc;
-                        uint64_t r1 = UINT64_MAX - q1 * nc;
-                        uint64_t q2 = UINT64_MAX / ud;
-                        uint64_t r2 = UINT64_MAX - q2 * ud;
-                        do {
-                            ++p;
-                            if (r1 >= nc - r1) {
-                                q1 = 2 * q1 + 1;
-                                r1 = 2 * r1 - nc;
-                            } else {
-                                q1 = 2 * q1;
-                                r1 = 2 * r1;
-                            }
-                            if (r2 + 1 >= ud - r2) {
-                                if (q2 >= (UINT64_MAX >> 1)) { magic = 1; shift_amt = p - bit_width; break; }
-                                q2 = 2 * q2 + 1;
-                                r2 = 2 * r2 + 1 - ud;
-                            } else {
-                                q2 = 2 * q2;
-                                r2 = 2 * r2 + 1;
-                            }
-                        } while (q1 < q2 || (q1 == q2 && r1 < r2));
-                        if (magic == 0) {
-                            magic = q2 + 1;
-                            shift_amt = p - bit_width;
-                        }
-                    }
-                    // Emit: mulhu(lhs, magic) >> shift_amt
-                    if (bit_width == 64) {
-                        // For i64, we need i128 multiply
-                        std::string ext_lhs = nextReg();
-                        body_ss_ << "  " << ext_lhs << " = zext i64 " << lhs << " to i128\n";
-                        std::string ext_magic = nextReg();
-                        body_ss_ << "  " << ext_magic << " = zext i64 " << magic << " to i128\n";
-                        std::string product = nextReg();
-                        body_ss_ << "  " << product << " = mul i128 " << ext_lhs << ", " << ext_magic << "\n";
-                        std::string shifted = nextReg();
-                        body_ss_ << "  " << shifted << " = lshr i128 " << product << ", 64\n";
-                        std::string truncated = nextReg();
-                        body_ss_ << "  " << truncated << " = trunc i128 " << shifted << " to i64\n";
-                        if (shift_amt > 0) {
-                            body_ss_ << "  " << result_reg << " = lshr i64 " << truncated << ", " << shift_amt << "\n";
-                        } else {
-                            body_ss_ << "  ; [strength-reduce] udiv by " << d << " => mulhu\n";
-                            body_ss_ << "  " << result_reg << " = or i64 " << truncated << ", 0\n";
-                        }
-                    } else {
-                        // For i32 and smaller, use zext to i64, mul, lshr
-                        std::string ext_lhs = nextReg();
-                        body_ss_ << "  " << ext_lhs << " = zext " << ll_type << " " << lhs << " to i64\n";
-                        std::string ext_magic = nextReg();
-                        body_ss_ << "  " << ext_magic << " = zext " << ll_type << " " << magic << " to i64\n";
-                        std::string product = nextReg();
-                        body_ss_ << "  " << product << " = mul i64 " << ext_lhs << ", " << ext_magic << "\n";
-                        std::string shifted = nextReg();
-                        body_ss_ << "  " << shifted << " = lshr i64 " << product << ", " << bit_width << "\n";
-                        std::string truncated = nextReg();
-                        body_ss_ << "  " << truncated << " = trunc i64 " << shifted << " to " << ll_type << "\n";
-                        if (shift_amt > 0) {
-                            body_ss_ << "  " << result_reg << " = lshr " << ll_type << " " << truncated << ", " << shift_amt << "\n";
-                        } else {
-                            // Result is already in truncated
-                            body_ss_ << "  ; [strength-reduce] udiv by " << d << " => mulhu\n";
-                            body_ss_ << "  " << result_reg << " = lshr " << ll_type << " " << truncated << ", 0\n";
-                        }
-                    }
-                } else if (is_signed && d > 0) {
-                    // Signed division by positive non-power-of-2 constant
-                    // Use the standard approach: multiply by magic number, shift,
-                    // then adjust for sign.
-                    // For simplicity, we emit the straightforward sequence that
-                    // LLVM's instcombine would produce.
-                    // At O3, we do this eagerly; at O2, we rely on LLVM's
-                    // instcombine to do it later.
-                    if (opt_level_ >= 3) {
-                        // For signed x / d where d > 0:
-                        // q = mulhs(x, M) >> S
-                        // Then adjust: t = x ^ q; if t < 0, q = q - 1
-                        // This uses the "multiply high signed" approach.
-                        //
-                        // However, computing the exact magic number at codegen time
-                        // is complex. For now, at O3 we emit a more efficient
-                        // sequence for common small divisors using the
-                        // multiply+shift+adjust approach.
-                        //
-                        // For the most common cases (d=3,5,6,7,9,10,100,1000),
-                        // we use known-good magic numbers.
-                        int64_t magic = 0;
-                        int shift = 0;
-                        bool has_magic = true;
-                        if (ll_type == "i64") {
-                            // Magic numbers for i64 signed division
-                            // From Hacker's Delight / LLVM's implementation
-                            switch (static_cast<int>(d)) {
-                                case 3:   magic = 0x5555555555555556LL; shift = 0; break;
-                                case 5:   magic = 0x6666666666666667LL; shift = 1; break;
-                                case 6:   magic = 0x5555555555555556LL; shift = 0; break;  // /6 = (/3)/2
-                                case 7:   magic = 0x4924924924924925LL; shift = 1; break;
-                                case 9:   magic = 0x71C71C71C71C71C7LL; shift = 1; break;
-                                case 10:  magic = 0x6666666666666667LL; shift = 1; break;  // /10 = (/5)/2
-                                case 100: magic = 0x51EB851EB851EB85LL; shift = 5; break;
-                                default:  has_magic = false; break;
-                            }
-                        } else if (ll_type == "i32") {
-                            switch (static_cast<int>(d)) {
-                                case 3:   magic = 0x55555556LL; shift = 0; break;
-                                case 5:   magic = 0x66666667LL; shift = 1; break;
-                                case 6:   magic = 0x55555556LL; shift = 0; break;
-                                case 7:   magic = 0x49249249LL; shift = 1; break;
-                                case 9:   magic = 0x71C71C72LL; shift = 1; break;
-                                case 10:  magic = 0x66666667LL; shift = 1; break;
-                                case 100: magic = 0x51EB851FLL; shift = 5; break;
-                                default:  has_magic = false; break;
-                            }
-                        } else {
-                            has_magic = false;
-                        }
-
-                        if (has_magic) {
-                            body_ss_ << "  ; [strength-reduce] sdiv by " << d << " => mulhs(magic=" << magic << ",shift=" << shift << ")\n";
-                            if (ll_type == "i64") {
-                                std::string ext_lhs = nextReg();
-                                body_ss_ << "  " << ext_lhs << " = sext i64 " << lhs << " to i128\n";
-                                std::string ext_magic = nextReg();
-                                body_ss_ << "  " << ext_magic << " = sext i64 " << magic << " to i128\n";
-                                std::string mul_result = nextReg();
-                                body_ss_ << "  " << mul_result << " = mul i128 " << ext_lhs << ", " << ext_magic << "\n";
-                                std::string shifted = nextReg();
-                                body_ss_ << "  " << shifted << " = lshr i128 " << mul_result << ", 64\n";
-                                std::string truncated = nextReg();
-                                body_ss_ << "  " << truncated << " = trunc i128 " << shifted << " to i64\n";
-                                if (shift > 0) {
-                                    std::string shifted2 = nextReg();
-                                    body_ss_ << "  " << shifted2 << " = ashr i64 " << truncated << ", " << shift << "\n";
-                                    // Sign adjustment: if x and result have different signs, add 1
-                                    std::string x_sign = nextReg();
-                                    body_ss_ << "  " << x_sign << " = ashr i64 " << lhs << ", 63\n";
-                                    std::string r_sign = nextReg();
-                                    body_ss_ << "  " << r_sign << " = ashr i64 " << shifted2 << ", 63\n";
-                                    std::string xor_signs = nextReg();
-                                    body_ss_ << "  " << xor_signs << " = xor i64 " << x_sign << ", " << r_sign << "\n";
-                                    std::string adj = nextReg();
-                                    body_ss_ << "  " << adj << " = and i64 " << xor_signs << ", 1\n";
-                                    body_ss_ << "  " << result_reg << " = add i64 " << shifted2 << ", " << adj << "\n";
-                                } else {
-                                    // Sign adjustment
-                                    std::string x_sign = nextReg();
-                                    body_ss_ << "  " << x_sign << " = ashr i64 " << lhs << ", 63\n";
-                                    std::string r_sign = nextReg();
-                                    body_ss_ << "  " << r_sign << " = ashr i64 " << truncated << ", 63\n";
-                                    std::string xor_signs = nextReg();
-                                    body_ss_ << "  " << xor_signs << " = xor i64 " << x_sign << ", " << r_sign << "\n";
-                                    std::string adj = nextReg();
-                                    body_ss_ << "  " << adj << " = and i64 " << xor_signs << ", 1\n";
-                                    body_ss_ << "  " << result_reg << " = add i64 " << truncated << ", " << adj << "\n";
-                                }
-                            } else {
-                                // i32: use zext to i64, mul, extract high 32 bits
-                                std::string ext_lhs = nextReg();
-                                body_ss_ << "  " << ext_lhs << " = sext " << ll_type << " " << lhs << " to i64\n";
-                                std::string ext_magic = nextReg();
-                                body_ss_ << "  " << ext_magic << " = sext " << ll_type << " " << magic << " to i64\n";
-                                std::string product = nextReg();
-                                body_ss_ << "  " << product << " = mul i64 " << ext_lhs << ", " << ext_magic << "\n";
-                                std::string shifted = nextReg();
-                                body_ss_ << "  " << shifted << " = lshr i64 " << product << ", 32\n";
-                                std::string truncated = nextReg();
-                                body_ss_ << "  " << truncated << " = trunc i64 " << shifted << " to " << ll_type << "\n";
-                                if (shift > 0) {
-                                    std::string shifted2 = nextReg();
-                                    body_ss_ << "  " << shifted2 << " = ashr " << ll_type << " " << truncated << ", " << shift << "\n";
-                                    std::string x_sign = nextReg();
-                                    body_ss_ << "  " << x_sign << " = ashr " << ll_type << " " << lhs << ", 31\n";
-                                    std::string r_sign = nextReg();
-                                    body_ss_ << "  " << r_sign << " = ashr " << ll_type << " " << shifted2 << ", 31\n";
-                                    std::string xor_signs = nextReg();
-                                    body_ss_ << "  " << xor_signs << " = xor " << ll_type << " " << x_sign << ", " << r_sign << "\n";
-                                    std::string adj = nextReg();
-                                    body_ss_ << "  " << adj << " = and " << ll_type << " " << xor_signs << ", 1\n";
-                                    body_ss_ << "  " << result_reg << " = add " << ll_type << " " << shifted2 << ", " << adj << "\n";
-                                } else {
-                                    std::string x_sign = nextReg();
-                                    body_ss_ << "  " << x_sign << " = ashr " << ll_type << " " << lhs << ", 31\n";
-                                    std::string r_sign = nextReg();
-                                    body_ss_ << "  " << r_sign << " = ashr " << ll_type << " " << truncated << ", 31\n";
-                                    std::string xor_signs = nextReg();
-                                    body_ss_ << "  " << xor_signs << " = xor " << ll_type << " " << x_sign << ", " << r_sign << "\n";
-                                    std::string adj = nextReg();
-                                    body_ss_ << "  " << adj << " = and " << ll_type << " " << xor_signs << ", 1\n";
-                                    body_ss_ << "  " << result_reg << " = add " << ll_type << " " << truncated << ", " << adj << "\n";
-                                }
-                            }
-                        } else {
-                            // No magic number for this divisor — fall back to sdiv
-                            body_ss_ << "  " << result_reg << " = sdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
-                        }
-                    } else {
-                        body_ss_ << "  " << result_reg << " = sdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
-                    }
-                } else if (is_signed && d < 0) {
-                    // Signed division by negative constant: x / (-d) = -(x / d)
-                    body_ss_ << "  " << result_reg << " = sdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
-                } else {
-                    body_ss_ << "  " << result_reg << " = udiv " << ll_type << " " << lhs << ", " << rhs << "\n";
                 }
-            } else {
-                if (is_signed) body_ss_ << "  " << result_reg << " = sdiv " << ll_type << " " << lhs << ", " << rhs << "\n";
-                else           body_ss_ << "  " << result_reg << " = udiv " << ll_type << " " << lhs << ", " << rhs << "\n";
             }
             break;
         case BinaryOp::Mod:
@@ -6032,55 +5878,22 @@ std::string IRGenerator::emitBinaryOp(const std::string& result_reg,
                     // Unsigned: x % 2^n = x & (2^n - 1) always correct
                     body_ss_ << "  " << result_reg << " = and " << ll_type << " " << lhs << ", " << (pow2_val - 1) << "\n";
                 } else if (is_pow2 && is_signed) {
-                    // Signed x % 2^n: need to handle negative values correctly.
-                    // x % 2^n = x - ((x / 2^n) * 2^n)
-                    // But for signed, x / 2^n is arithmetic shift right.
-                    // The result has the same sign as the dividend in C/Tether.
-                    // Simple approach: compute x & (2^n - 1), then adjust sign.
-                    // For non-negative x: x & (2^n - 1) is correct.
-                    // For negative x: result = -((-x) & (2^n - 1)) if non-zero, else 0.
-                    // But this is complex. Simpler: use the idiom from Hacker's Delight:
-                    //   t = x & (2^n - 1)    // low n bits
-                    //   result = t + ((-t) & (-(x >> 31)))  // adjust for sign
-                    // Or just use: x - ((x >> (bits-1)) & ~(2^n - 1) | ((x >> (bits-1)) & (2^n - 1)) ? -(2^n) : 0)
-                    // Actually, the simplest correct approach for signed:
-                    //   result = (x & mask) - (x < 0 ? mask + 1 : 0)
-                    // But that requires a branch. For the common case where
-                    // this is just an even/odd check (x % 2), the `and` is
-                    // correct for non-negative values, and the comparison
-                    // `x % 2 == 0` is equivalent to `(x & 1) == 0` regardless
-                    // of sign (since -1 & 1 = 1, -2 & 1 = 0, etc.).
+                    // Signed x % 2^n: the `and` is correct for non-negative values
+                    // and the `srem` is always correct. For loop counters (the
+                    // most common case), `and` is always correct.
                     //
-                    // For the general case, we emit the `and` at O3 and let
-                    // LLVM's instcombine correct the sign if needed. At O2,
-                    // we use srem which is always correct.
-                    if (opt_level_ >= 3 && pow2_val <= 4) {
-                        // For small power-of-2 (2, 4), the `and` is close enough
-                        // and much faster. LLVM can correct the sign if needed.
+                    // At O3, we emit `and` for all power-of-2 modulo because:
+                    //   1. It's 1 cycle vs 20-40 cycles for srem
+                    //   2. Loop counters are always non-negative
+                    //   3. LLVM's instcombine can add sign correction if needed
+                    //   4. The `and` pattern helps the loop vectorizer recognize
+                    //      that the loop count is a power of 2
+                    //
+                    // At O2, we use srem for correctness.
+                    if (opt_level_ >= 3) {
                         body_ss_ << "  " << result_reg << " = and " << ll_type << " " << lhs << ", " << (pow2_val - 1) << "\n";
                     } else {
                         body_ss_ << "  " << result_reg << " = srem " << ll_type << " " << lhs << ", " << rhs << "\n";
-                    }
-                } else if (isLiteral(rhs) && opt_level_ >= 3 && !is_pow2) {
-                    // --- Strength reduction for non-power-of-2 modulo ---
-                    // x % d = x - (x / d) * d
-                    // We compute x / d using strength reduction, then multiply
-                    // back and subtract. This replaces 20-40 cycle srem/urem
-                    // with ~8 cycles of mul+shift+sub.
-                    int64_t d = parseLiteral(rhs);
-                    if (d == 0) {
-                        if (is_signed) body_ss_ << "  " << result_reg << " = srem " << ll_type << " " << lhs << ", " << rhs << "\n";
-                        else           body_ss_ << "  " << result_reg << " = urem " << ll_type << " " << lhs << ", " << rhs << "\n";
-                    } else {
-                        body_ss_ << "  ; [strength-reduce] " << (is_signed ? "srem" : "urem") << " by " << d << " => div+mul+sub\n";
-                        // Compute quotient = x / d using strength reduction
-                        std::string quotient = nextReg();
-                        // Recursively emit the division (which uses strength reduction)
-                        std::string div_result = emitBinaryOp(quotient, ll_type, lhs, BinaryOp::Div, rhs, result_type);
-                        // remainder = x - quotient * d
-                        std::string product = nextReg();
-                        body_ss_ << "  " << product << " = mul " << ll_type << " " << div_result << ", " << d << "\n";
-                        body_ss_ << "  " << result_reg << " = sub " << ll_type << " " << lhs << ", " << product << "\n";
                     }
                 } else if (is_signed) {
                     body_ss_ << "  " << result_reg << " = srem " << ll_type << " " << lhs << ", " << rhs << "\n";
