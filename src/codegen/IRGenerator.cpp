@@ -4548,14 +4548,156 @@ std::string IRGenerator::emitExpr(Expr* expr) {
     case NodeKind::ArrayInitExpr: {
         auto& ai = cast<ArrayInitExpr>(*expr);
         TypeId ty = expr->getType();
-        std::string ll = llvmType(ty);
-        std::string aname = nextReg();
-        alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
-
         TypeId elem_type;
         if (!ai.elements().empty() && ai.elements()[0]->hasType()) {
             elem_type = ai.elements()[0]->getType();
         }
+
+        // --- ArrayType: [N]T → { ptr, i64 } ---
+        // Heap-allocate the backing storage, initialize elements,
+        // then build the { ptr, i64 } struct.
+        if (ty && isa<ArrayType>(ty)) {
+            auto& arr_ty = cast<ArrayType>(ty);
+            TypeId actual_elem = arr_ty.element().isNull() ? elem_type : arr_ty.element();
+            if (!actual_elem) actual_elem = elem_type;
+
+            uint64_t count = arr_ty.count();
+            uint64_t elem_size = typeSizeBytes(actual_elem);
+            uint64_t total_bytes = count * (elem_size > 0 ? elem_size : 1);
+
+            // For small arrays (< 4096 bytes), use stack allocation
+            // For large arrays, use heap allocation
+            std::string data_ptr;
+            bool is_stack_alloc = arr_ty.isSmallArray();
+
+            if (is_stack_alloc) {
+                // Stack allocation: alloca the backing array directly
+                std::string ll_e = actual_elem ? llvmType(actual_elem) : "i8";
+                data_ptr = nextReg();
+                alloca_ss_ << "  " << data_ptr << " = alloca [" << count << " x " << ll_e << "]\n";
+            } else {
+                // Heap allocation: call tether_malloc (or malloc)
+                needed_runtime_.insert("malloc");
+                std::string size_reg = nextReg();
+                body_ss_ << "  " << size_reg << " = add i64 0, " << total_bytes << "\n";
+                data_ptr = nextReg();
+                body_ss_ << "  " << data_ptr << " = call ptr @malloc(i64 " << size_reg << ")\n";
+            }
+
+            // Initialize each element
+            if (actual_elem) {
+                std::string ll_e = llvmType(actual_elem);
+                for (size_t i = 0; i < ai.elementCount(); ++i) {
+                    std::string val = emitExpr(ai.elements()[i].get());
+                    std::string gep = nextReg();
+                    body_ss_ << "  " << gep << " = getelementptr " << ll_e
+                             << ", ptr " << data_ptr << ", i64 " << i << "\n";
+                    if (isAggregateType(actual_elem)) {
+                        body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << gep
+                                 << ", ptr " << val << ", i64 " << typeSizeBytes(actual_elem)
+                                 << ", i1 false)\n";
+                        needed_runtime_.insert("memcpy");
+                    } else {
+                        body_ss_ << "  store " << ll_e << " " << val << ", ptr " << gep << "\n";
+                    }
+                }
+                // Zero-fill remaining elements if initializer has fewer than count
+                if (ai.elementCount() < count) {
+                    uint64_t init_bytes = ai.elementCount() * (elem_size > 0 ? elem_size : 1);
+                    uint64_t remaining = total_bytes - init_bytes;
+                    if (remaining > 0) {
+                        std::string fill_ptr = nextReg();
+                        body_ss_ << "  " << fill_ptr << " = getelementptr i8, ptr " << data_ptr
+                                 << ", i64 " << init_bytes << "\n";
+                        body_ss_ << "  call void @llvm.memset.p0.i64(ptr " << fill_ptr
+                                 << ", i8 0, i64 " << remaining << ", i1 false)\n";
+                        needed_runtime_.insert("memset");
+                    }
+                }
+            }
+
+            // Build the { ptr, i64 } struct
+            std::string ll = llvmType(ty);
+            std::string arr_alloca = nextReg();
+            alloca_ss_ << "  " << arr_alloca << " = alloca " << ll << "\n";
+
+            // Store the data pointer (field 0)
+            std::string gep0 = nextReg();
+            body_ss_ << "  " << gep0 << " = getelementptr " << ll
+                     << ", ptr " << arr_alloca << ", i32 0, i32 0\n";
+            body_ss_ << "  store ptr " << data_ptr << ", ptr " << gep0 << "\n";
+
+            // Store the length (field 1)
+            std::string gep1 = nextReg();
+            body_ss_ << "  " << gep1 << " = getelementptr " << ll
+                     << ", ptr " << arr_alloca << ", i32 0, i32 1\n";
+            body_ss_ << "  store i64 " << count << ", ptr " << gep1 << "\n";
+
+            return arr_alloca;
+        }
+
+        // --- SliceType: []T → { ptr, i64 } ---
+        // Same as ArrayType but length comes from element count
+        if (ty && isa<SliceType>(ty)) {
+            auto& sl_ty = cast<SliceType>(ty);
+            TypeId actual_elem = sl_ty.element().isNull() ? elem_type : sl_ty.element();
+            if (!actual_elem) actual_elem = elem_type;
+
+            uint64_t count = ai.elementCount();
+            uint64_t elem_size = actual_elem ? typeSizeBytes(actual_elem) : 1;
+            uint64_t total_bytes = count * (elem_size > 0 ? elem_size : 1);
+
+            // Heap-allocate the backing storage
+            needed_runtime_.insert("malloc");
+            std::string size_reg = nextReg();
+            body_ss_ << "  " << size_reg << " = add i64 0, " << total_bytes << "\n";
+            std::string data_ptr = nextReg();
+            body_ss_ << "  " << data_ptr << " = call ptr @malloc(i64 " << size_reg << ")\n";
+
+            // Initialize each element
+            if (actual_elem) {
+                std::string ll_e = llvmType(actual_elem);
+                for (size_t i = 0; i < count; ++i) {
+                    std::string val = emitExpr(ai.elements()[i].get());
+                    std::string gep = nextReg();
+                    body_ss_ << "  " << gep << " = getelementptr " << ll_e
+                             << ", ptr " << data_ptr << ", i64 " << i << "\n";
+                    if (isAggregateType(actual_elem)) {
+                        body_ss_ << "  call void @llvm.memcpy.p0.p0.i64(ptr " << gep
+                                 << ", ptr " << val << ", i64 " << typeSizeBytes(actual_elem)
+                                 << ", i1 false)\n";
+                        needed_runtime_.insert("memcpy");
+                    } else {
+                        body_ss_ << "  store " << ll_e << " " << val << ", ptr " << gep << "\n";
+                    }
+                }
+            }
+
+            // Build the { ptr, i64 } struct
+            std::string ll = llvmType(ty);
+            std::string slice_alloca = nextReg();
+            alloca_ss_ << "  " << slice_alloca << " = alloca " << ll << "\n";
+
+            // Store the data pointer (field 0)
+            std::string gep0 = nextReg();
+            body_ss_ << "  " << gep0 << " = getelementptr " << ll
+                     << ", ptr " << slice_alloca << ", i32 0, i32 0\n";
+            body_ss_ << "  store ptr " << data_ptr << ", ptr " << gep0 << "\n";
+
+            // Store the length (field 1)
+            std::string gep1 = nextReg();
+            body_ss_ << "  " << gep1 << " = getelementptr " << ll
+                     << ", ptr " << slice_alloca << ", i32 0, i32 1\n";
+            body_ss_ << "  store i64 " << count << ", ptr " << gep1 << "\n";
+
+            return slice_alloca;
+        }
+
+        // --- Fallback: generic array init (no specific type info) ---
+        std::string ll = llvmType(ty);
+        std::string aname = nextReg();
+        alloca_ss_ << "  " << aname << " = alloca " << ll << "\n";
+
         if (elem_type) {
             std::string ll_e = llvmType(elem_type);
             for (size_t i = 0; i < ai.elementCount(); ++i) {
@@ -4574,6 +4716,94 @@ std::string IRGenerator::emitExpr(Expr* expr) {
             }
         }
         return aname;
+    }
+
+    // ========================================================================
+    // Slice expression (subslice): arr[start..end] → { ptr, i64 }
+    //
+    // Zero-copy: just adjusts the pointer (ptr + start * elem_size) and
+    // the length (end - start). No allocation needed.
+    // ========================================================================
+    case NodeKind::SliceExpr: {
+        auto& se = cast<SliceExpr>(*expr);
+        TypeId ty = expr->getType();
+        TypeId obj_type = se.object()->getType();
+
+        // Get the object as an lvalue (pointer to the { ptr, i64 } struct)
+        std::string obj_ptr = emitLValue(se.object());
+        std::string start_val = emitExpr(se.start());
+
+        // Extract the data pointer from the source slice/array
+        std::string obj_ll = llvmType(obj_type);
+        std::string data_ptr_gep = nextReg();
+        body_ss_ << "  " << data_ptr_gep << " = getelementptr " << obj_ll
+                 << ", ptr " << obj_ptr << ", i32 0, i32 0\n";
+        std::string data_ptr = nextReg();
+        body_ss_ << "  " << data_ptr << " = load ptr, ptr " << data_ptr_gep << "\n";
+
+        // Extract the length from the source slice/array
+        std::string len_ptr_gep = nextReg();
+        body_ss_ << "  " << len_ptr_gep << " = getelementptr " << obj_ll
+                 << ", ptr " << obj_ptr << ", i32 0, i32 1\n";
+        std::string src_len = nextReg();
+        body_ss_ << "  " << src_len << " = load i64, ptr " << len_ptr_gep << "\n";
+
+        // Compute the new data pointer: data_ptr + start * elem_size
+        // For GEP, we need the element type
+        TypeId elem_type;
+        if (obj_type && isa<SliceType>(obj_type)) {
+            elem_type = cast<SliceType>(obj_type).element();
+        } else if (obj_type && isa<ArrayType>(obj_type)) {
+            elem_type = cast<ArrayType>(obj_type).element();
+        }
+
+        std::string new_data_ptr;
+        if (elem_type) {
+            std::string ll_e = llvmType(elem_type);
+            new_data_ptr = nextReg();
+            body_ss_ << "  " << new_data_ptr << " = getelementptr " << ll_e
+                     << ", ptr " << data_ptr << ", i64 " << start_val << "\n";
+        } else {
+            // Fallback: byte-level pointer arithmetic
+            uint64_t elem_size = elem_type ? typeSizeBytes(elem_type) : 1;
+            std::string offset = nextReg();
+            body_ss_ << "  " << offset << " = mul i64 " << start_val << ", " << elem_size << "\n";
+            new_data_ptr = nextReg();
+            body_ss_ << "  " << new_data_ptr << " = getelementptr i8, ptr " << data_ptr
+                     << ", i64 " << offset << "\n";
+        }
+
+        // Compute the new length
+        std::string new_len;
+        if (se.hasEnd()) {
+            // len = end - start
+            std::string end_val = emitExpr(se.end());
+            new_len = nextReg();
+            body_ss_ << "  " << new_len << " = sub i64 " << end_val << ", " << start_val << "\n";
+        } else {
+            // Open-ended: len = src_len - start
+            new_len = nextReg();
+            body_ss_ << "  " << new_len << " = sub i64 " << src_len << ", " << start_val << "\n";
+        }
+
+        // Build the result { ptr, i64 } struct
+        std::string ll = llvmType(ty);
+        std::string result_alloca = nextReg();
+        alloca_ss_ << "  " << result_alloca << " = alloca " << ll << "\n";
+
+        // Store the new data pointer (field 0)
+        std::string gep0 = nextReg();
+        body_ss_ << "  " << gep0 << " = getelementptr " << ll
+                 << ", ptr " << result_alloca << ", i32 0, i32 0\n";
+        body_ss_ << "  store ptr " << new_data_ptr << ", ptr " << gep0 << "\n";
+
+        // Store the new length (field 1)
+        std::string gep1 = nextReg();
+        body_ss_ << "  " << gep1 << " = getelementptr " << ll
+                 << ", ptr " << result_alloca << ", i32 0, i32 1\n";
+        body_ss_ << "  store i64 " << new_len << ", ptr " << gep1 << "\n";
+
+        return result_alloca;
     }
 
     // ========================================================================
@@ -5132,6 +5362,7 @@ std::string IRGenerator::emitLValue(Expr* expr) {
 
         case NodeKind::StructInitExpr:
         case NodeKind::ArrayInitExpr:
+        case NodeKind::SliceExpr:
             return emitExpr(expr); // already returns a pointer
 
         default:

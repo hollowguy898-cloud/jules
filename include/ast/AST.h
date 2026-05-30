@@ -114,6 +114,7 @@ enum class NodeKind : uint16_t {
     CastExpr,
     StructInitExpr,
     ArrayInitExpr,
+    SliceExpr,
     SizeofExpr,
     UnsafeExpr,
     PoisonExpr,
@@ -673,6 +674,57 @@ public:
 
 private:
     std::vector<std::unique_ptr<Expr>> elements_;
+};
+
+// ---- SliceExpr ----
+// Creates a subslice from an existing slice/array: arr[start..end]
+// Produces a new { ptr, i64 } with ptr = arr.ptr + start, len = end - start
+// This is a zero-copy operation — it just adjusts the pointer and length.
+class SliceExpr : public Expr {
+public:
+    SliceExpr(SourceLocation loc,
+              std::unique_ptr<Expr> object,
+              std::unique_ptr<Expr> start,
+              std::unique_ptr<Expr> end)
+        : Expr(NodeKind::SliceExpr, std::move(loc))
+        , object_(std::move(object))
+        , start_(std::move(start))
+        , end_(std::move(end))
+    {}
+
+    // Slice with start only (open-ended): arr[start..]
+    SliceExpr(SourceLocation loc,
+              std::unique_ptr<Expr> object,
+              std::unique_ptr<Expr> start)
+        : Expr(NodeKind::SliceExpr, std::move(loc))
+        , object_(std::move(object))
+        , start_(std::move(start))
+        , end_(nullptr)
+    {}
+
+    Expr* object() { return object_.get(); }
+    const Expr* object() const { return object_.get(); }
+    Expr* start() { return start_.get(); }
+    const Expr* start() const { return start_.get(); }
+    Expr* end() { return end_.get(); }
+    const Expr* end() const { return end_.get(); }
+    bool hasEnd() const { return end_ != nullptr; }
+
+    std::unique_ptr<Expr> takeObject() { return std::move(object_); }
+    std::unique_ptr<Expr> takeStart() { return std::move(start_); }
+    std::unique_ptr<Expr> takeEnd() { return std::move(end_); }
+
+    static bool classof(const ASTNode* n) {
+        return n->getKind() == NodeKind::SliceExpr;
+    }
+
+    void accept(ASTVisitor& visitor) override;
+    void accept(ConstASTVisitor& visitor) const override;
+
+private:
+    std::unique_ptr<Expr> object_;
+    std::unique_ptr<Expr> start_;
+    std::unique_ptr<Expr> end_;  // nullptr = open-ended slice (to end of array)
 };
 
 // ---- SizeofExpr ----
@@ -1858,6 +1910,7 @@ public:
     virtual void visitAwaitExpr(AwaitExpr&) {}
     virtual void visitStructInitExpr(StructInitExpr&) {}
     virtual void visitArrayInitExpr(ArrayInitExpr&) {}
+    virtual void visitSliceExpr(SliceExpr&) {}
     virtual void visitSizeofExpr(SizeofExpr&) {}
     virtual void visitUnsafeExpr(UnsafeExpr&) {}
     virtual void visitPoisonExpr(PoisonExpr&) {}
@@ -1921,6 +1974,7 @@ public:
     virtual void visitAwaitExpr(const AwaitExpr&) {}
     virtual void visitStructInitExpr(const StructInitExpr&) {}
     virtual void visitArrayInitExpr(const ArrayInitExpr&) {}
+    virtual void visitSliceExpr(const SliceExpr&) {}
     virtual void visitSizeofExpr(const SizeofExpr&) {}
     virtual void visitUnsafeExpr(const UnsafeExpr&) {}
     virtual void visitPoisonExpr(const PoisonExpr&) {}
@@ -2020,6 +2074,8 @@ inline void StructInitExpr::accept(ConstASTVisitor& v) const { v.visitStructInit
 
 inline void ArrayInitExpr::accept(ASTVisitor& v) { v.visitArrayInitExpr(*this); }
 inline void ArrayInitExpr::accept(ConstASTVisitor& v) const { v.visitArrayInitExpr(*this); }
+inline void SliceExpr::accept(ASTVisitor& v) { v.visitSliceExpr(*this); }
+inline void SliceExpr::accept(ConstASTVisitor& v) const { v.visitSliceExpr(*this); }
 
 inline void SizeofExpr::accept(ASTVisitor& v) { v.visitSizeofExpr(*this); }
 inline void SizeofExpr::accept(ConstASTVisitor& v) const { v.visitSizeofExpr(*this); }

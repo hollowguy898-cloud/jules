@@ -484,6 +484,23 @@ private:
     // Returns true if the paths overlap (one is prefix of the other)
     bool pathsConflict(const PathExpr& a, const PathExpr& b) const;
 
+    // Helper: check if a type is trivially copyable (Copy semantics).
+    // Trivially-copyable types use copy semantics on assignment — the
+    // source variable remains valid. This includes:
+    //   - Primitive types (i32, f64, bool, etc.)
+    //   - Enums (discriminator is just an integer)
+    //   - Pointers and references (just an address)
+    //   - Slices (ptr + len — both are trivially copyable)
+    //   - Arrays of Copy types
+    //   - Structs where ALL fields are Copy (no ownership types)
+    //
+    // NOT trivially copyable (affine / move semantics):
+    //   - Box<T> (owns heap allocation)
+    //   - Rc<T> (owns refcount)
+    //   - Arc<T> (owns atomic refcount)
+    //   - Structs containing any non-Copy field
+    bool isTriviallyCopyable(TypeId type) const;
+
     // -----------------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------------

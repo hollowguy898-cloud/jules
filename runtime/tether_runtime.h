@@ -565,6 +565,32 @@ double tether_volatile_read_f64(const volatile double* ptr);
 void tether_volatile_write_i64(volatile int64_t* ptr, int64_t value);
 void tether_volatile_write_f64(volatile double* ptr, double value);
 
+/* ============================================================================
+ * Array/Slice runtime helpers
+ *
+ * These functions support array creation, slicing, and iteration in Tether.
+ * They are called by the code generator for array literal expressions,
+ * for-range loops, and slice operations.
+ * ============================================================================ */
+
+/* tether_array_new — allocate a new heap array with zero-initialized elements.
+ * Returns a { ptr, i64 } struct (data pointer and length).
+ * The returned memory is zero-filled. For small arrays (< 4096 bytes),
+ * consider stack allocation instead (the codegen handles this automatically). */
+TetherSlice_void tether_array_new(int64_t element_size, int64_t count);
+
+/* tether_array_new_filled — allocate a new heap array, filling all elements
+ * with a copy of the given initial value. Returns { ptr, i64 }.
+ * This is used for patterns like: val arr = [0; 1024]  (1024 zeros). */
+TetherSlice_void tether_array_new_filled(int64_t element_size, int64_t count,
+                                           const void* init_value);
+
+/* tether_slice_subslice — create a zero-copy subslice from a slice.
+ * Equivalent to Tether's arr[start..end] syntax.
+ * No allocation; just adjusts pointer and length. */
+TetherSlice_void tether_slice_subslice(const TetherSlice_void* src,
+                                         int64_t start, int64_t end);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
