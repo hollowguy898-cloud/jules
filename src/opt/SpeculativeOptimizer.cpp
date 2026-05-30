@@ -378,13 +378,15 @@ bool SpeculativeOptimizerPass::isWorthSpeculating(IfStmt& is) {
     auto* nm = meta_map_->get(&is);
     if (!nm) return false;
 
-    // Worth speculating if we have a strong branch probability
-    if (nm->branch_prob == BranchProbability::Likely ||
-        nm->branch_prob == BranchProbability::Unlikely) {
-        return true;
-    }
+    // In an AOT compiler, deoptimization guards are dangerous because there's
+    // no JIT to fall back to when the assumption is violated. Without PGO data,
+    // we should NOT insert deopt guards — only emit branch probability hints
+    // (!prof metadata) so LLVM's basic block layout is improved.
+    //
+    // Heuristic-based branch probabilities (Likely/Unlikely) are NOT reliable
+    // enough for deopt guards. Only PGO data with high confidence is safe.
 
-    // Worth speculating if we have PGO data showing skewed branch
+    // Only worth speculating with deopt guard if we have PGO data
     if (nm->profile.has_profile) {
         uint64_t total = nm->profile.branch_taken + nm->profile.branch_not_taken;
         if (total > 100) {  // Need enough samples
@@ -397,12 +399,10 @@ bool SpeculativeOptimizerPass::isWorthSpeculating(IfStmt& is) {
         }
     }
 
-    // Check if one path is marked cold
-    auto* then_nm = meta_map_->get(is.thenBlock());
-    auto* else_nm = is.hasElse() ? meta_map_->get(is.elseBlock()) : nullptr;
-
-    if (then_nm && then_nm->llvm_meta.cold_path) return true;
-    if (else_nm && else_nm->llvm_meta.cold_path) return true;
+    // Branch probability hints (Likely/Unlikely) and cold path markings
+    // are used for LLVM metadata emission only, NOT for deopt guards.
+    // The codegen will emit !prof metadata for branch hints, but will
+    // keep the original branch logic intact.
 
     return false;
 }

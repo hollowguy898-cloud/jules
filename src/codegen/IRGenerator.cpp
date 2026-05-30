@@ -1390,6 +1390,7 @@ void IRGenerator::emitTetherMetadata() {
 
         if (!tbaa_entries.empty()) {
             std::vector<int> tbaa_meta_ids;
+            const size_t tbaa_emit_start = metadata_entries_.size();
             for (const auto& [struct_name, field_name, offset, size] : tbaa_entries) {
                 int tbaa_id = metadata_counter_++;
                 tbaa_meta_ids.push_back(tbaa_id);
@@ -1399,13 +1400,10 @@ void IRGenerator::emitTetherMetadata() {
                     ", i64 " + std::to_string(size) + "}"});
             }
 
-            // Emit the entries
-            for (size_t i = start_idx; i < metadata_entries_.size(); ++i) {
+            // Emit the TBAA metadata entries that were just added
+            for (size_t i = tbaa_emit_start; i < metadata_entries_.size(); ++i) {
                 const auto& e = metadata_entries_[i];
-                // Only emit entries that haven't been emitted yet
-                if (e.id >= start_idx) {
-                    // Already emitted above, skip
-                }
+                module_out_ << "!" << e.id << " = " << e.content << "\n";
             }
 
             // Emit the named metadata
@@ -1733,6 +1731,7 @@ void IRGenerator::emitFnDecl(FnDecl* fn) {
     // a wrong fallback type like "{ i64, i1 }" instead of the actual type.
     current_fn_error_type_ = fn->errorType();
     current_fn_name_ = fn->name();
+    current_fn_ = fn;
     current_ret_alloca_.clear();
     current_err_slot_.clear();
     caller_err_slot_.clear();
@@ -2538,6 +2537,13 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             }
 
             std::string cond = emitExpr(is.condition());
+
+            // BUG FIX: If the condition expression already terminated the
+            // current block (e.g., error propagation or an explicit return
+            // inside the condition), skip the entire if/else — there is no
+            // live block to branch from.
+            if (isTerminated()) break;
+
             // Ensure i1
             if (is.condition()->getType() && !is.condition()->getType()->isBool()) {
                 std::string c = nextReg();
@@ -2787,6 +2793,15 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             emitBlockLabel(cond_l);
             setTerminated(false);
             std::string cond = emitExpr(ws.condition());
+
+            // BUG FIX: If the condition expression already terminated the
+            // block (unlikely but possible with error-returning calls),
+            // skip the rest of the loop.
+            if (isTerminated()) {
+                loop_stack_.pop_back();
+                break;
+            }
+
             if (ws.condition()->getType() && !ws.condition()->getType()->isBool()) {
                 std::string c = nextReg();
                 body_ss_ << "  " << c << " = icmp ne " << llvmType(ws.condition()->getType())
@@ -3121,6 +3136,12 @@ void IRGenerator::emitStmt(Stmt* stmt) {
             TypeId subject_type = ms.subject()->getType();
             std::string ll_subject = llvmType(subject_type);
 
+            // BUG FIX: If the subject expression already terminated the
+            // current block (e.g., error propagation inside the subject),
+            // skip the entire match body — there is no live block to
+            // branch from.
+            if (isTerminated()) break;
+
             // Take a snapshot before the match for phi node emission
             SSASnapshot entry_snap = takeSnapshot();
 
@@ -3130,9 +3151,17 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 arm_labels.push_back(nextLabel("match_arm"));
             }
 
-            // Branch from current block to the first arm
-            if (!isTerminated() && !arm_labels.empty()) {
+            // BUG FIX: Always emit a branch from the current block before
+            // creating any new block labels.  Every basic block must end
+            // with a terminator instruction (br/ret/unreachable).  If we
+            // emit a label while the current block has no terminator, LLVM
+            // will reject the IR with "expected instruction opcode".
+            if (!arm_labels.empty()) {
                 body_ss_ << "  br label %" << arm_labels[0] << "\n";
+            } else {
+                // Empty match: branch directly to the merge block so the
+                // entry block has a terminator before the merge label.
+                body_ss_ << "  br label %" << merge_label << "\n";
             }
 
             for (size_t i = 0; i < ms.armCount(); ++i) {
@@ -3164,7 +3193,13 @@ void IRGenerator::emitStmt(Stmt* stmt) {
                 }
             }
 
-            // Merge point
+            // BUG FIX: Always emit the merge block.  It is always reachable:
+            //  - When there are arms, the last arm's comparison
+            //    false-branches to merge.
+            //  - When there are no arms, we explicitly branched to merge
+            //    above.
+            // Not emitting the merge block would leave a branch to a
+            // non-existent label, producing invalid IR.
             emitBlockLabel(merge_label);
             setTerminated(false);
             break;
@@ -6030,10 +6065,36 @@ void IRGenerator::emitPrefetchIfAnnotated(WhileStmt* loop) {
             // Get the base address of the array variable
             std::string base_addr = getVarValue(var_name);
             if (!base_addr.empty()) {
+                // Check if this variable is a slice type — if so, we need to
+                // extract the pointer field from the slice struct before using
+                // it as an address for the prefetch.
+                // Slice layout: { ptr, i64 } — field 0 is the data pointer.
+                std::string effective_addr = base_addr;
+
+                // Look up the type via SSAVarInfo or function parameters
+                bool is_slice = false;
+                std::string slice_type_name;
+                SSAVarInfo* vi = lookupVar(var_name);
+                if (vi && vi->tether_type && isa<SliceType>(vi->tether_type)) {
+                    is_slice = true;
+                    slice_type_name = llvmType(vi->tether_type);
+                }
+
+                if (is_slice && !slice_type_name.empty()) {
+                    // Emit: %ptr_field = getelementptr %slice.T, ptr %slice.addr, i32 0, i32 0
+                    //        %data_ptr = load ptr, ptr %ptr_field
+                    std::string gep = nextReg();
+                    std::string data_ptr = nextReg();
+                    body_ss_ << "  " << gep << " = getelementptr " << slice_type_name
+                             << ", ptr " << base_addr << ".addr, i32 0, i32 0\n";
+                    body_ss_ << "  " << data_ptr << " = load ptr, ptr " << gep << "\n";
+                    effective_addr = data_ptr;
+                }
+
                 // Emit: prefetch(base + distance * cache_line_size)
                 std::string prefetch_addr = nextReg();
                 body_ss_ << "  " << prefetch_addr << " = getelementptr i8, ptr "
-                         << base_addr << ", i64 " << (distance * 64) << "\n";
+                         << effective_addr << ", i64 " << (distance * 64) << "\n";
                 body_ss_ << "  call void @llvm.prefetch.p0(ptr " << prefetch_addr
                          << ", i32 0, i32 3, i32 1)\n";
                 return;

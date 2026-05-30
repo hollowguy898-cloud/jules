@@ -408,8 +408,16 @@ private:
                            const PathExpr& path,
                            const SourceLocation& loc);
 
-    // Mark a variable as moved out
-    void markMoved(const std::string& var_name);
+    // Mark a variable as moved out (unless its type is Copy)
+    // Copy types (primitives, enums) are implicitly copied on assignment,
+    // so the original variable remains valid — no move semantics needed.
+    void markMoved(const std::string& var_name, TypeId type = TypeId());
+
+    // Check whether a type implements Copy semantics.
+    // Copy types are trivially copyable (primitives, enums) and do not
+    // have move semantics — assignment copies the value, leaving the
+    // source valid.
+    static bool isCopyType(TypeId type);
 
     // -----------------------------------------------------------------------
     // Phase 6: Solve lifetime constraints

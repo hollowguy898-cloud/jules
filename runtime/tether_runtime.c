@@ -1025,84 +1025,17 @@ void tether_volatile_write_f64(volatile double* ptr, double value) {
 }
 
 /* ============================================================================
- * Array/Slice runtime helpers
+ * Yield point support
+ *
+ * tether_yield is called at yield points inserted by the YieldPointInserter
+ * optimization pass. In the current AOT compilation model, yield points are
+ * no-ops — they exist so that a future coroutine/GC suspension mechanism can
+ * hook into them. For now, the parameter is consumed as a black_box to
+ * prevent the optimizer from eliminating yield-point side effects.
  * ============================================================================ */
-
-/* tether_array_new — allocate a new heap array with zero-initialized elements.
- * Returns a { ptr, i64 } struct (data pointer and length).
- * Uses calloc for zero-initialization, which is often faster than
- * malloc + memset because the OS can serve zero-pages lazily. */
-TetherSlice_void tether_array_new(int64_t element_size, int64_t count) {
-    TetherSlice_void result;
-    result.ptr = NULL;
-    result.len = 0;
-
-    if (element_size <= 0 || count <= 0) return result;
-
-    int64_t total = element_size * count;
-
-    /* Check for overflow */
-    if (count > 0 && element_size > INT64_MAX / count) return result;
-
-    /* Use calloc for zero-initialized memory — the OS can serve
-     * zero-pages lazily (much faster than malloc + memset for large arrays). */
-    result.ptr = tether_malloc((size_t)total);
-    if (result.ptr) {
-        memset(result.ptr, 0, (size_t)total);
-        result.len = count;
-    }
-
-    return result;
-}
-
-/* tether_array_new_filled — allocate a new heap array, filling all elements
- * with a copy of the given initial value.
- * Used for patterns like: val arr = [0; 1024]  (1024 zeros).
- * For zero-initialized arrays, prefer tether_array_new() which uses calloc. */
-TetherSlice_void tether_array_new_filled(int64_t element_size, int64_t count,
-                                           const void* init_value) {
-    TetherSlice_void result;
-    result.ptr = NULL;
-    result.len = 0;
-
-    if (element_size <= 0 || count <= 0 || !init_value) return result;
-
-    int64_t total = element_size * count;
-
-    /* Check for overflow */
-    if (count > 0 && element_size > INT64_MAX / count) return result;
-
-    result.ptr = tether_malloc((size_t)total);
-    if (result.ptr) {
-        /* Fill all elements with the initial value */
-        char* dst = (char*)result.ptr;
-        for (int64_t i = 0; i < count; ++i) {
-            memcpy(dst + i * element_size, init_value, (size_t)element_size);
-        }
-        result.len = count;
-    }
-
-    return result;
-}
-
-/* tether_slice_subslice — create a zero-copy subslice from a slice.
- * Equivalent to Tether's arr[start..end] syntax.
- * No allocation; just adjusts pointer and length.
- * Bounds checking is the caller's responsibility (the compiler inserts
- * bounds checks unless the borrow checker proved them unnecessary). */
-TetherSlice_void tether_slice_subslice(const TetherSlice_void* src,
-                                         int64_t start, int64_t end) {
-    TetherSlice_void result;
-    result.ptr = NULL;
-    result.len = 0;
-
-    if (!src || !src->ptr) return result;
-    if (start < 0 || end < start || end > src->len) return result;
-
-    result.ptr = (char*)src->ptr + start;  /* Byte-level offset — the compiler
-                                              emits the correct GEP with element
-                                              type info for typed slices */
-    result.len = end - start;
-
-    return result;
+void tether_yield(int64_t counter) {
+    /* Prevent the optimizer from eliminating the yield point and any
+     * computation that feeds into the counter value. */
+    __asm__ __volatile__("" : "+r"(counter) :: "memory");
+    (void)counter;
 }

@@ -575,6 +575,7 @@ public:
     bool        current_fn_has_simd_ = false;
     bool        current_fn_has_tailcall_ = false;  // @tailcall directive for current function
     bool        is_musttail_call_ = false;         // Next CallExpr should be emitted as musttail
+    FnDecl*     current_fn_ = nullptr;             // Current function being compiled (for type lookups)
     std::string current_fn_name_;
     std::string current_ret_alloca_; // alloca for the aggregate return value
     std::string current_err_slot_;   // callee-side: name of the ptr %err_slot parameter

@@ -6,7 +6,11 @@
 CXX       = g++
 CC        = gcc
 CXXFLAGS  = -std=c++17 -Wall -Wextra -O3 -march=native -flto -I include
-CFLAGS    = -std=c11 -Wall -Wextra -O3 -march=native -flto
+# NOTE: The C runtime is compiled WITHOUT -flto because it gets linked into
+# user programs compiled by clang (LLVM). GCC LTO bytecode in the runtime .a
+# is incompatible with LLVM and causes link errors when the linker tries to
+# perform cross-language LTO. The compiler itself (C++) still benefits from LTO.
+CFLAGS    = -std=c11 -Wall -Wextra -O3 -march=native
 
 # mimalloc — fast allocator (2-3x faster than glibc malloc)
 # Automatically detected: if libmimalloc is installed, use it.
@@ -138,8 +142,8 @@ clean:
 test: $(TARGET)
 	@echo "=== Testing compiler on examples ==="
 	@for f in examples/*.tth; do \
-		echo "  Compiling $$f ..."; \
-		./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
+	        echo "  Compiling $$f ..."; \
+	        ./$(TARGET) --emit-ir -o /tmp/test_output.ll $$f 2>&1 || echo "  FAILED: $$f"; \
 	done
 	@echo "=== Tests complete ==="
 
@@ -207,10 +211,10 @@ bench: $(BENCH_SPEED) $(BENCH_REAL) $(BENCH_ECS) $(TARGET)
 	@echo ""
 	@echo "--- 4. End-to-End Compilation ---"
 	@for f in benchmarks/real_workload/*.tth; do \
-		echo "  Compiling $$f (-O3) ..."; \
-		./$(TARGET) -O3 --emit-ir -v "$$f" -o /tmp/bench_out.ll 2>&1 | head -5; \
-		echo "  IR size: $$(wc -c < /tmp/bench_out.ll) bytes"; \
-		echo ""; \
+	        echo "  Compiling $$f (-O3) ..."; \
+	        ./$(TARGET) -O3 --emit-ir -v "$$f" -o /tmp/bench_out.ll 2>&1 | head -5; \
+	        echo "  IR size: $$(wc -c < /tmp/bench_out.ll) bytes"; \
+	        echo ""; \
 	done
 	@echo "=============================================="
 	@echo "  Benchmark Suite Complete"

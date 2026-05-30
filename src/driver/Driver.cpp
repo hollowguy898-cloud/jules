@@ -695,16 +695,41 @@ bool Driver::runLinker() {
     const char* exe_path_str = std::getenv("JULES_COMPILER_PATH");
     std::vector<std::string> search_paths;
 
+    // Determine the compiler's own directory (for finding the runtime .a)
+    std::string compiler_dir;
     if (exe_path_str) {
-        fs::path exe_dir = fs::path(exe_path_str).parent_path();
-        search_paths.push_back((exe_dir / ".." / "lib" / "libjules_runtime.a").string());
-        search_paths.push_back((exe_dir / "lib" / "libjules_runtime.a").string());
+        compiler_dir = fs::path(exe_path_str).parent_path().string();
+    } else {
+        // Try /proc/self/exe on Linux to find the compiler binary's directory
+        fs::path self_path;
+        try {
+            self_path = fs::read_symlink("/proc/self/exe");
+            compiler_dir = self_path.parent_path().string();
+        } catch (...) {
+            // Fallback: empty (will rely on CWD-relative paths)
+        }
+    }
+
+    if (!compiler_dir.empty()) {
+        fs::path exe_dir(compiler_dir);
+        search_paths.push_back((exe_dir / "build" / "libtether_runtime.a").string());
+        search_paths.push_back((exe_dir / ".." / "build" / "libtether_runtime.a").string());
+        search_paths.push_back((exe_dir / ".." / "lib" / "libtether_runtime.a").string());
+        search_paths.push_back((exe_dir / "lib" / "libtether_runtime.a").string());
+        // Legacy name
+        search_paths.push_back((exe_dir / "build" / "libjules_runtime.a").string());
+        search_paths.push_back((exe_dir / ".." / "build" / "libjules_runtime.a").string());
     }
 
     // Also search relative to current working directory
+    search_paths.push_back("build/libtether_runtime.a");
+    search_paths.push_back("runtime/libtether_runtime.a");
+    search_paths.push_back("../build/libtether_runtime.a");
+    search_paths.push_back("../runtime/libtether_runtime.a");
+    search_paths.push_back("lib/libtether_runtime.a");
+    // Legacy name
+    search_paths.push_back("build/libjules_runtime.a");
     search_paths.push_back("runtime/libjules_runtime.a");
-    search_paths.push_back("../runtime/libjules_runtime.a");
-    search_paths.push_back("lib/libjules_runtime.a");
 
     for (const auto& p : search_paths) {
         if (fs::exists(p)) {
