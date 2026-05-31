@@ -1262,7 +1262,21 @@ TypeId SemanticAnalyzer::analyzeUnaryExpr(UnaryExpr& ue) {
                           "arithmetic negation requires numeric type, got '" +
                           operand_type->toString() + "'");
             }
-            result_type = operand_type;
+            // BUG FIX: Negation of an unsigned value produces a signed result.
+            // Without this, `(-10) / 2` is typed as u64 (since the literal
+            // `10` defaults to u64), causing the codegen to emit unsigned
+            // division (`lshr` instead of the signed div-by-2 sequence),
+            // which produces garbage for negative values.
+            if (operand_type->isInteger() && operand_type->isUnsigned()) {
+                // Map unsigned to the same-width signed type
+                uint64_t bits = operand_type->bitWidth();
+                if (bits <= 8)       result_type = type_table_.getI8();
+                else if (bits <= 16) result_type = type_table_.getI16();
+                else if (bits <= 32) result_type = type_table_.getI32();
+                else                 result_type = type_table_.getI64();
+            } else {
+                result_type = operand_type;
+            }
             break;
 
         case UnaryOp::Not:
